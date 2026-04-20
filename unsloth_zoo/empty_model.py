@@ -780,15 +780,16 @@ def finalize_huggingface_model(
     if (quantization_config or {}) == {} and bnb_config is None:
         new_model = new_model.to(device = target_device, dtype = dtype)
         for module in new_model.modules():
-            rotary_emb = getattr(module, "rotary_emb", None)
-            if rotary_emb is None:
-                continue
-            for buffer_name, buffer in list(rotary_emb._buffers.items()):
-                if torch.is_tensor(buffer) and buffer.is_floating_point():
-                    rotary_emb._buffers[buffer_name] = buffer.to(
-                        device = target_device,
-                        dtype = torch.float32,
-                    )
+            for attr_name in ("rotary_emb", "rotary_emb_local", "rotary_pos_emb"):
+                rotary = getattr(module, attr_name, None)
+                if rotary is None or not hasattr(rotary, "_buffers"):
+                    continue
+                for buffer_name, buffer in list(rotary._buffers.items()):
+                    if torch.is_tensor(buffer) and buffer.is_floating_point():
+                        rotary._buffers[buffer_name] = buffer.to(
+                            device = target_device,
+                            dtype = torch.float32,
+                        )
     return new_model
 pass
 
@@ -981,12 +982,13 @@ def get_model_layer_config(return_non_layered=True):
             "model.visual.deepstack_merger_list.{kk}.linear_fc1",
             "model.visual.deepstack_merger_list.{kk}.linear_fc2",
 
+            "model.visual.merger.linear_fc1",
+            "model.visual.merger.linear_fc2",
+
         },
         "non_layered_components":{
             # we do not handle quantization for these layers yet
             # the set_additional_modules would process these layers
-            "model.visual.merger.linear_fc1",
-            "model.visual.merger.linear_fc2",
             "model.multi_modal_projector",
             "model.language_model.norm",
             'model.vision_model.layernorm_pre',
@@ -1118,8 +1120,8 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
         try:
             for k, v in quant_state.as_dict(packed=True).items():
                 state_dict[f"{name}.weight.{k}"] = v
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Unsloth: could not expand quant_state for {name}: {e}")
 
     if hasattr(gdn, "in_proj_qkvz"):
         proj = getattr(gdn.in_proj_qkvz, "base_layer", gdn.in_proj_qkvz)
@@ -1163,12 +1165,25 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
                 parts.append(dequantize_4bit(shard, quant_state=qs) if qs is not None else shard)
             store(f"{prefix}.in_proj_qkv.weight", torch.cat(parts, dim=0))
         else:
-            store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
-            if isinstance(qs_attr, dict):
-                _store_quant_state(f"{prefix}.in_proj_qkv", qkv_states[0])
-        store(f"{prefix}.in_proj_z.weight", z_weight)
-        if isinstance(qs_attr, dict):
-            _store_quant_state(f"{prefix}.in_proj_z", qs_attr.get(3))
+            qs0 = qkv_states[0]
+            qs0_shape = getattr(qs0, "shape", None)
+            if qs0 is not None and qs0_shape is not None and qs0_shape[0] != qkv_weight.shape[0]:
+                try:
+                    from bitsandbytes.functional import dequantize_4bit
+                except Exception:
+                    raise RuntimeError(
+                        "Unsloth: prequantized BnB Qwen3.5 GDN requires bitsandbytes for fused in_proj_qkvz reconstruction."
+                    )
+                full = dequantize_4bit(weight, quant_state=qs0)
+                store(f"{prefix}.in_proj_qkv.weight", full[offsets[0]:offsets[3]])
+                store(f"{prefix}.in_proj_z.weight", full[offsets[3]:offsets[4]])
+            else:
+                store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
+                if isinstance(qs_attr, dict):
+                    _store_quant_state(f"{prefix}.in_proj_qkv", qs0)
+                store(f"{prefix}.in_proj_z.weight", z_weight)
+                if isinstance(qs_attr, dict):
+                    _store_quant_state(f"{prefix}.in_proj_z", qs_attr.get(3))
 
         if weight.dtype == torch.float8_e4m3fn:
             scale_attr = None
