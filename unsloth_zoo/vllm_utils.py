@@ -1216,6 +1216,8 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
     def _normalize_state_dict_tensor(value):
         if isinstance(value, torch.nn.Parameter):
             value = value.detach()
+        if not isinstance(value, torch.Tensor):
+            return value
         if value.is_sparse:
             value = value.to_dense()
         return value.contiguous()

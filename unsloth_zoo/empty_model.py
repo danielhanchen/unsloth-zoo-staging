@@ -346,7 +346,7 @@ def patch_gemma4_vllm_lora_support():
         def patched_create_lora_manager(model, *args, **kwargs):
             if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
                 lora_manager_cls = kwargs.pop("lora_manager_cls", vllm_lora_model_manager.LoRAModelManager)
-                return lora_manager_cls(model = model, *args, **kwargs)
+                return lora_manager_cls(model, *args, **kwargs)
             return original_create_lora_manager(model, *args, **kwargs)
 
         patched_create_lora_manager._unsloth_gemma4_patch = True
