@@ -758,6 +758,8 @@ def get_model_layer_config(return_non_layered=True):
     layer_templates = {
         'standard_layers': {
             "model.language_model.layers.{kk}.layer_scalar",
+            "model.language_model.layers.{kk}.per_layer_input_gate",
+            "model.language_model.layers.{kk}.per_layer_projection",
             "model.language_model.layers.{kk}.self_attn.q_proj",
             "model.language_model.layers.{kk}.self_attn.k_proj",
             "model.language_model.layers.{kk}.self_attn.v_proj",
@@ -769,6 +771,8 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.mlp.down_proj",
 
             "model.layers.{kk}.layer_scalar",
+            "model.layers.{kk}.per_layer_input_gate",
+            "model.layers.{kk}.per_layer_projection",
             "model.layers.{kk}.self_attn.q_proj",
             "model.layers.{kk}.self_attn.k_proj",
             "model.layers.{kk}.self_attn.v_proj",
@@ -801,6 +805,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.post_attention_layernorm",
             "model.language_model.layers.{kk}.pre_feedforward_layernorm",
             "model.language_model.layers.{kk}.post_feedforward_layernorm",
+            "model.language_model.layers.{kk}.post_per_layer_input_norm",
             "model.language_model.layers.{kk}.self_attn.q_norm",
             "model.language_model.layers.{kk}.self_attn.k_norm",
             "model.language_model.layers.{kk}.cross_attn.q_norm",
@@ -809,6 +814,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.post_attention_layernorm",
             "model.layers.{kk}.pre_feedforward_layernorm",
             "model.layers.{kk}.post_feedforward_layernorm",
+            "model.layers.{kk}.post_per_layer_input_norm",
             "model.layers.{kk}.self_attn.q_norm",
             "model.layers.{kk}.self_attn.k_norm",
             "model.visual.blocks.{kk}.norm1",
@@ -1083,6 +1089,11 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
     store(f"{prefix}.conv1d.weight", gdn.conv1d.weight.data)
     store(f"{prefix}.dt_bias", gdn.dt_bias.data)
     store(f"{prefix}.A_log", gdn.A_log.data)
+
+    norm = getattr(gdn, "norm", None)
+    norm_weight = getattr(norm, "weight", None) if norm is not None else None
+    if norm_weight is not None:
+        store(f"{prefix}.norm.weight", norm_weight.data)
 
     get_state_dict(f"{prefix}.out_proj", 0, state_dict, gdn.out_proj)
 pass

@@ -1167,6 +1167,13 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         if hasattr(layer, "layer_scalar"):
             state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
             quant_state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
+        for per_layer_name in ("per_layer_input_gate", "per_layer_projection"):
+            per_layer_module = getattr(layer, per_layer_name, None)
+            if per_layer_module is not None and hasattr(per_layer_module, "weight"):
+                get_state_dict(
+                    f"{vllm_text_model_prefix}.layers.{kk}.{per_layer_name}",
+                    0, state_dict, per_layer_module,
+                )
     pass
 
     if len(skipped_layernorms) != 0:
@@ -1398,8 +1405,14 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             if layer_name in quant_state_dict:
                 # for attributes of type nn.Parameter, there's no .weight
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
-                layer = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
-                exec(f"new_model.{layer_name_br} = layer")
+                value = _unwrap_tensor(weight)
+                parent_expr, attr_name = layer_name_br.rsplit(".", 1)
+                parent_module = eval(f"new_model.{parent_expr}")
+                if attr_name in getattr(parent_module, "_buffers", {}):
+                    parent_module._buffers[attr_name] = value
+                else:
+                    layer = torch.nn.Parameter(value, requires_grad = False)
+                    exec(f"new_model.{layer_name_br} = layer")
                 continue
             elif fp8_weight_scale is not None:
                 if fp8_weight_scale.ndim == 1:
@@ -1450,9 +1463,23 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.weight = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
                 layer.bias = bias
             else:
-                # LayerNorms (including vision norms)
+                # LayerNorms (including vision norms) and depthwise Conv1d
                 weight_param = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad=False)
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
+                if layer_name.endswith(".conv1d") or layer_name.endswith(".conv1d.weight"):
+                    target = eval(f"new_model.{layer_name_br}")
+                    w = _unwrap_tensor(weight)
+                    out_channels = w.shape[0]
+                    kernel_size = w.shape[-1]
+                    target.out_channels = out_channels
+                    target.in_channels = out_channels
+                    target.groups = out_channels
+                    target.kernel_size = (kernel_size,)
+                    target.padding = (kernel_size - 1,)
+                    target.weight = weight_param
+                    if bias is not None:
+                        target.bias = bias
+                    continue
                 # Set weight
                 exec(f"new_model.{layer_name_br}.weight = None")
                 exec(f"new_model.{layer_name_br}.weight = weight_param")
