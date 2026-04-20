@@ -422,17 +422,20 @@ def test_gemma4_k_eq_v_set_hoists_constant_check():
     assert "gemma4_k_eq_v_layers = set()" in src
 
 
-def test_merger_linear_fc_moved_to_non_layered():
-    # Pre-fix: model.visual.merger.linear_fc1/linear_fc2 (no {kk} placeholder)
-    # sat in additional_layers and were reassigned once per layer iteration.
+def test_merger_linear_fc_routed_to_additional_layers():
+    # Pre-fix: model.visual.merger.linear_fc1/linear_fc2 sat in
+    # non_layered_components and were assigned by set_additional_modules
+    # via a plain exec, which drops BnB quant_state for quantized Qwen3-VL
+    # mergers. They now sit in additional_layers so the main quantized
+    # loop builds a proper Linear4bit / FP8Linear for them.
     from unsloth_zoo.empty_model import get_model_layer_config
     cfg = get_model_layer_config()
     additional = set(cfg["additional_layers"])
     non_layered = set(cfg["non_layered_components"])
-    assert "model.visual.merger.linear_fc1" not in additional
-    assert "model.visual.merger.linear_fc2" not in additional
-    assert "model.visual.merger.linear_fc1" in non_layered
-    assert "model.visual.merger.linear_fc2" in non_layered
+    assert "model.visual.merger.linear_fc1" in additional
+    assert "model.visual.merger.linear_fc2" in additional
+    assert "model.visual.merger.linear_fc1" not in non_layered
+    assert "model.visual.merger.linear_fc2" not in non_layered
 
 
 def test_finalize_does_not_overwrite_unrelated_submodule_config_dtype():
@@ -649,10 +652,11 @@ def test_gemma4_per_layer_extraction_emits_state_dict_entries():
     assert "model.language_model.layers.0.per_layer_projection.weight" in state_dict
 
 
-def test_set_additional_modules_loads_visual_merger_linear_fc():
-    # Regression: the "linear" filter in set_additional_modules dropped
-    # model.visual.merger.linear_fc1/2 after the PR moved them into
-    # non_layered_components. set_additional_modules must now restore them.
+def test_set_additional_modules_skips_visual_merger_linear_fc():
+    # model.visual.merger.linear_fc1/fc2 are now routed through the main
+    # quantized loop (additional_layers), so set_additional_modules must
+    # NOT also include them in its exec-assignment sweep (that path drops
+    # BnB quant_state for quantized Qwen3-VL mergers).
     from unsloth_zoo.empty_model import set_additional_modules
 
     class _LM(torch.nn.Module):
@@ -685,19 +689,21 @@ def test_set_additional_modules_loads_visual_merger_linear_fc():
             self.lm_head = torch.nn.Linear(1, 2, bias=False)
 
     model = _Model()
-    fc1_target = torch.full((1, 1), 7.0)
-    fc2_target = torch.full((1, 1), 9.0)
+    original_fc1 = model.model.visual.merger.linear_fc1.weight.data.clone()
+    original_fc2 = model.model.visual.merger.linear_fc2.weight.data.clone()
+    fc1_sentinel = torch.full((1, 1), 7.0)
+    fc2_sentinel = torch.full((1, 1), 9.0)
     quant_state_dict = {
         "model.language_model.embed_tokens.weight": torch.zeros(2, 1),
         "model.language_model.norm.weight": torch.ones(1),
         "lm_head.weight": torch.zeros(2, 1),
-        "model.visual.merger.linear_fc1.weight": fc1_target,
-        "model.visual.merger.linear_fc2.weight": fc2_target,
+        "model.visual.merger.linear_fc1.weight": fc1_sentinel,
+        "model.visual.merger.linear_fc2.weight": fc2_sentinel,
     }
     cfg = types.SimpleNamespace(pad_token_id=0, text_config=types.SimpleNamespace(tie_word_embeddings=False))
     set_additional_modules(model, quant_state_dict, cfg)
-    torch.testing.assert_close(model.model.visual.merger.linear_fc1.weight.data, fc1_target)
-    torch.testing.assert_close(model.model.visual.merger.linear_fc2.weight.data, fc2_target)
+    torch.testing.assert_close(model.model.visual.merger.linear_fc1.weight.data, original_fc1)
+    torch.testing.assert_close(model.model.visual.merger.linear_fc2.weight.data, original_fc2)
 
 
 def test_get_vllm_state_dict_extracts_layernorm_when_layer_lacks_mlp():
@@ -1368,3 +1374,288 @@ def test_patch_gemma4_vllm_k_eq_v_support_noop_when_private_attr_missing():
                 _sys.modules.pop(name, None)
             else:
                 _sys.modules[name] = prev
+
+
+# ----- Regression tests for review-iter-1 fixes on PR #8 -----
+
+
+class _ShapedQuantState:
+    def __init__(self, out_features, in_features, tag="qs"):
+        self.shape = (out_features, in_features)
+        self.tag = tag
+
+    def as_dict(self, packed=True):
+        return {"absmax": torch.tensor([float(self.shape[0])])}
+
+
+class _PackedParam(torch.nn.Parameter):
+    def __new__(cls, data, quant_states):
+        inst = torch.nn.Parameter.__new__(cls, data, requires_grad=False)
+        inst.bnb_quant_state = quant_states
+        return inst
+
+
+def test_extract_gdn_layers_fused_single_quant_state_dequantizes_and_splits():
+    from unsloth_zoo.empty_model import extract_gdn_layers
+
+    hidden_size = 4
+    num_k_heads = 2
+    num_v_heads = 2
+    head_k_dim = 2
+    head_v_dim = 4
+    key_dim = num_k_heads * head_k_dim
+    value_dim = num_v_heads * head_v_dim
+    qkvz_out = key_dim * 2 + value_dim * 2
+    qkv_rows = key_dim * 2 + value_dim
+    z_rows = value_dim
+
+    class _Proj(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            packed = torch.zeros(qkvz_out // 2, dtype=torch.uint8)
+            self.weight = _PackedParam(packed, {0: _ShapedQuantState(qkvz_out, hidden_size, "full")})
+
+    class _GDN(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hidden_size = hidden_size
+            self.num_k_heads = num_k_heads
+            self.num_v_heads = num_v_heads
+            self.head_k_dim = head_k_dim
+            self.head_v_dim = head_v_dim
+            self.key_dim = key_dim
+            self.value_dim = value_dim
+            self.in_proj_qkvz = _Proj()
+            self.in_proj_ba = _FakePlainProj(num_v_heads * 2, hidden_size)
+            self.conv1d = _FakePlainProj(key_dim * 2 + value_dim, 4)
+            self.dt_bias = torch.nn.Parameter(torch.randn(num_v_heads), requires_grad=False)
+            self.A_log = torch.nn.Parameter(torch.randn(num_v_heads), requires_grad=False)
+            self.norm = torch.nn.Module()
+            self.norm.weight = torch.nn.Parameter(torch.randn(head_v_dim), requires_grad=False)
+            self.out_proj = _FakePlainProj(hidden_size, value_dim)
+
+    sentinel = torch.arange(qkvz_out, dtype=torch.float32).reshape(qkvz_out, 1).expand(qkvz_out, hidden_size).contiguous()
+    bnb = sys.modules.setdefault("bitsandbytes", types.ModuleType("bitsandbytes"))
+    bnb_fn = types.ModuleType("bitsandbytes.functional")
+
+    calls = {"n": 0}
+
+    def fake_dequantize_4bit(data, quant_state=None):
+        calls["n"] += 1
+        return sentinel
+
+    bnb_fn.dequantize_4bit = fake_dequantize_4bit
+    sys.modules["bitsandbytes.functional"] = bnb_fn
+
+    state_dict, quant_state_dict = {}, {}
+    extract_gdn_layers(_GDN(), "prefix", state_dict, quant_state_dict, _fake_get_state_dict)
+
+    assert calls["n"] >= 1
+    torch.testing.assert_close(state_dict["prefix.in_proj_qkv.weight"], sentinel[:qkv_rows])
+    torch.testing.assert_close(state_dict["prefix.in_proj_z.weight"], sentinel[qkv_rows:qkv_rows + z_rows])
+    assert "prefix.in_proj_qkv.weight.quant_state" not in quant_state_dict
+    assert "prefix.in_proj_z.weight.quant_state" not in quant_state_dict
+
+
+def test_store_quant_state_logs_warning_when_as_dict_raises(caplog):
+    from unsloth_zoo.empty_model import extract_gdn_layers
+
+    class _ExplodingQS:
+        shape = (4, 4)
+
+        def as_dict(self, packed=True):
+            raise RuntimeError("simulated bitsandbytes version mismatch")
+
+    class _BAProj(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = _PackedParam(
+                torch.zeros(4, dtype=torch.uint8),
+                {0: _ExplodingQS(), 1: _ExplodingQS()},
+            )
+
+    class _GDN(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hidden_size = 4
+            self.num_k_heads = 2
+            self.num_v_heads = 2
+            self.head_k_dim = 2
+            self.head_v_dim = 4
+            self.key_dim = 4
+            self.value_dim = 8
+            self.in_proj_qkvz = _FakePlainProj(self.key_dim * 2 + self.value_dim * 2, self.hidden_size)
+            self.in_proj_ba = _BAProj()
+            self.conv1d = _FakePlainProj(self.key_dim * 2 + self.value_dim, 4)
+            self.dt_bias = torch.nn.Parameter(torch.randn(self.num_v_heads), requires_grad=False)
+            self.A_log = torch.nn.Parameter(torch.randn(self.num_v_heads), requires_grad=False)
+            self.norm = torch.nn.Module()
+            self.norm.weight = torch.nn.Parameter(torch.randn(self.head_v_dim), requires_grad=False)
+            self.out_proj = _FakePlainProj(self.hidden_size, self.value_dim)
+
+    import logging
+    with caplog.at_level(logging.WARNING, logger="unsloth"):
+        state_dict, quant_state_dict = {}, {}
+        extract_gdn_layers(_GDN(), "prefix", state_dict, quant_state_dict, _fake_get_state_dict)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("could not expand quant_state" in m and "simulated bitsandbytes version mismatch" in m for m in messages), messages
+
+
+def test_finalize_lifts_rotary_emb_local_to_fp32_after_dtype_cast():
+    from unsloth_zoo.empty_model import finalize_huggingface_model
+
+    class _Cfg:
+        pass
+
+    class _LocalRotary(torch.nn.Module):
+        def __init__(self, config=None, device=None):
+            super().__init__()
+            self.config = config if config is not None else _Cfg()
+            self.register_buffer("inv_freq", torch.arange(4, dtype=torch.float32))
+
+    class _Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_emb_local = _LocalRotary(config=_Cfg())
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_idx = -1
+            self.self_attn = _Attn()
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([_Layer()])
+
+    cfg = types.SimpleNamespace(model_type="gemma3")
+    cfg.text_config = cfg
+    cfg.rope_local_base_freq = 10000.0
+
+    model = _Model()
+    finalize_huggingface_model(
+        model, None, cfg, torch.bfloat16,
+        quantization_config={}, bnb_config=None,
+    )
+    rotary = model.model.layers[0].self_attn.rotary_emb_local
+    assert rotary.inv_freq.dtype == torch.float32
+
+
+def test_finalize_lifts_rotary_pos_emb_to_fp32_after_dtype_cast():
+    from unsloth_zoo.empty_model import finalize_huggingface_model
+
+    class _PosRotary(torch.nn.Module):
+        def __init__(self, head_dim_half):
+            super().__init__()
+            self.register_buffer("inv_freq", torch.arange(head_dim_half, dtype=torch.float32))
+
+    class _VisionBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_pos_emb = _PosRotary(2)
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList()
+            self.visual = _VisionBlock()
+
+    cfg = types.SimpleNamespace(model_type="qwen2_5_vl")
+    cfg.text_config = cfg
+    vc = types.SimpleNamespace(hidden_size=8, num_heads=2)
+    cfg.vision_config = vc
+
+    model = _Model()
+    finalize_huggingface_model(
+        model, None, cfg, torch.bfloat16,
+        quantization_config={}, bnb_config=None,
+    )
+    assert model.visual.rotary_pos_emb.inv_freq.dtype == torch.float32
+
+
+def _run_gdn_multi_quant_extract(z_quant_state):
+    from unsloth_zoo.empty_model import extract_gdn_layers
+
+    hidden_size = 4
+    num_k_heads = 2
+    num_v_heads = 2
+    head_k_dim = 2
+    head_v_dim = 4
+    key_dim = num_k_heads * head_k_dim
+    value_dim = num_v_heads * head_v_dim
+    qkvz_out = key_dim * 2 + value_dim * 2
+
+    class _Proj(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            packed = torch.zeros(qkvz_out // 2, dtype=torch.uint8)
+            states = {
+                0: _ShapedQuantState(key_dim, hidden_size, "q"),
+                1: _ShapedQuantState(key_dim, hidden_size, "k"),
+                2: _ShapedQuantState(value_dim, hidden_size, "v"),
+            }
+            if z_quant_state is not None:
+                states[3] = z_quant_state
+            self.weight = _PackedParam(packed, states)
+
+    class _GDN(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hidden_size = hidden_size
+            self.num_k_heads = num_k_heads
+            self.num_v_heads = num_v_heads
+            self.head_k_dim = head_k_dim
+            self.head_v_dim = head_v_dim
+            self.key_dim = key_dim
+            self.value_dim = value_dim
+            self.in_proj_qkvz = _Proj()
+            self.in_proj_ba = _FakePlainProj(num_v_heads * 2, hidden_size)
+            self.conv1d = _FakePlainProj(key_dim * 2 + value_dim, 4)
+            self.dt_bias = torch.nn.Parameter(torch.randn(num_v_heads), requires_grad=False)
+            self.A_log = torch.nn.Parameter(torch.randn(num_v_heads), requires_grad=False)
+            self.norm = torch.nn.Module()
+            self.norm.weight = torch.nn.Parameter(torch.randn(head_v_dim), requires_grad=False)
+            self.out_proj = _FakePlainProj(hidden_size, value_dim)
+
+    bnb = sys.modules.setdefault("bitsandbytes", types.ModuleType("bitsandbytes"))
+    bnb_fn = types.ModuleType("bitsandbytes.functional")
+
+    shards_per_out = {key_dim: "qkv_shard", value_dim: "z_or_v_shard"}
+
+    def fake_dequantize_4bit(data, quant_state=None):
+        tag = getattr(quant_state, "tag", None)
+        if tag == "q":
+            return torch.full((key_dim, hidden_size), 1.0)
+        if tag == "k":
+            return torch.full((key_dim, hidden_size), 2.0)
+        if tag == "v":
+            return torch.full((value_dim, hidden_size), 3.0)
+        if tag == "z":
+            return torch.full((value_dim, hidden_size), 7.0)
+        raise RuntimeError(f"unexpected fake dequantize call tag={tag}")
+
+    bnb_fn.dequantize_4bit = fake_dequantize_4bit
+    sys.modules["bitsandbytes.functional"] = bnb_fn
+
+    state_dict, quant_state_dict = {}, {}
+    extract_gdn_layers(_GDN(), "prefix", state_dict, quant_state_dict, _fake_get_state_dict)
+    return state_dict, quant_state_dict, key_dim, value_dim, hidden_size
+
+
+def test_extract_gdn_layers_multi_quant_branch_stores_in_proj_z_dequantized():
+    z_qs = _ShapedQuantState(8, 4, "z")
+    state_dict, _, key_dim, value_dim, hidden_size = _run_gdn_multi_quant_extract(z_qs)
+    assert "prefix.in_proj_z.weight" in state_dict
+    z_out = state_dict["prefix.in_proj_z.weight"]
+    torch.testing.assert_close(z_out, torch.full((value_dim, hidden_size), 7.0))
+    qkv_out = state_dict["prefix.in_proj_qkv.weight"]
+    assert qkv_out.shape == (2 * key_dim + value_dim, hidden_size)
+
+
+def test_extract_gdn_layers_multi_quant_branch_stores_in_proj_z_raw_when_no_z_state():
+    state_dict, _, _, _, _ = _run_gdn_multi_quant_extract(None)
+    assert "prefix.in_proj_z.weight" in state_dict
