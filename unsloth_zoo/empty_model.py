@@ -1152,7 +1152,28 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
 
         qs_attr = getattr(raw_weight, "bnb_quant_state", getattr(weight, "bnb_quant_state", None))
         qkv_states = [qs_attr.get(i) for i in (0, 1, 2)] if isinstance(qs_attr, dict) else [None, None, None]
-        if sum(qs is not None for qs in qkv_states) > 1:
+
+        fused_full_qs = None
+        if isinstance(qs_attr, dict) and sum(qs is not None for qs in qkv_states) == 1:
+            for qs in qkv_states:
+                if qs is None:
+                    continue
+                qs_shape = getattr(qs, "shape", None)
+                if qs_shape is not None and qs_shape[0] == offsets[4]:
+                    fused_full_qs = qs
+                break
+
+        if fused_full_qs is not None:
+            try:
+                from bitsandbytes.functional import dequantize_4bit
+            except Exception:
+                raise RuntimeError(
+                    "Unsloth: prequantized BnB Qwen3.5 GDN requires bitsandbytes for fused in_proj_qkvz reconstruction."
+                )
+            full = dequantize_4bit(weight, quant_state=fused_full_qs)
+            store(f"{prefix}.in_proj_qkv.weight", full[offsets[0]:offsets[3]])
+            store(f"{prefix}.in_proj_z.weight", full[offsets[3]:offsets[4]])
+        elif sum(qs is not None for qs in qkv_states) > 1:
             try:
                 from bitsandbytes.functional import dequantize_4bit
             except Exception:
@@ -1164,26 +1185,17 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
                 shard = weight[offsets[i]:offsets[i + 1]]
                 parts.append(dequantize_4bit(shard, quant_state=qs) if qs is not None else shard)
             store(f"{prefix}.in_proj_qkv.weight", torch.cat(parts, dim=0))
-        else:
-            qs0 = qkv_states[0]
-            qs0_shape = getattr(qs0, "shape", None)
-            if qs0 is not None and qs0_shape is not None and qs0_shape[0] != qkv_weight.shape[0]:
-                try:
-                    from bitsandbytes.functional import dequantize_4bit
-                except Exception:
-                    raise RuntimeError(
-                        "Unsloth: prequantized BnB Qwen3.5 GDN requires bitsandbytes for fused in_proj_qkvz reconstruction."
-                    )
-                full = dequantize_4bit(weight, quant_state=qs0)
-                store(f"{prefix}.in_proj_qkv.weight", full[offsets[0]:offsets[3]])
-                store(f"{prefix}.in_proj_z.weight", full[offsets[3]:offsets[4]])
+            z_qs = qs_attr.get(3) if isinstance(qs_attr, dict) else None
+            if z_qs is not None:
+                store(f"{prefix}.in_proj_z.weight", dequantize_4bit(z_weight, quant_state=z_qs))
             else:
-                store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
-                if isinstance(qs_attr, dict):
-                    _store_quant_state(f"{prefix}.in_proj_qkv", qs0)
                 store(f"{prefix}.in_proj_z.weight", z_weight)
-                if isinstance(qs_attr, dict):
-                    _store_quant_state(f"{prefix}.in_proj_z", qs_attr.get(3))
+        else:
+            store(f"{prefix}.in_proj_qkv.weight", qkv_weight)
+            store(f"{prefix}.in_proj_z.weight", z_weight)
+            if isinstance(qs_attr, dict):
+                _store_quant_state(f"{prefix}.in_proj_qkv", qkv_states[0])
+                _store_quant_state(f"{prefix}.in_proj_z", qs_attr.get(3))
 
         if weight.dtype == torch.float8_e4m3fn:
             scale_attr = None
