@@ -759,8 +759,10 @@ def grpo_accumulated_loss(
     unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
 
     for module in unwrapped_model.modules():
-        if hasattr(module, "_hf_hook") and hasattr(module._hf_hook, "io_same_decice"):
-            module._hf_hook.io_same_decice = False
+        if hasattr(module, "_hf_hook") and hasattr(module._hf_hook, "io_same_device"):
+            module._hf_hook.io_same_device = False
+        if hasattr(module, "rope_deltas"):
+            module.rope_deltas = None
     pass
 
     all_logprobs_list = []
