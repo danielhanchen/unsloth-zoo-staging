@@ -1466,7 +1466,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 # LayerNorms (including vision norms) and depthwise Conv1d
                 weight_param = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad=False)
                 layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
-                if layer_name.endswith(".conv1d") or layer_name.endswith(".conv1d.weight"):
+                if layer_name.endswith(".conv1d"):
                     target = eval(f"new_model.{layer_name_br}")
                     w = _unwrap_tensor(weight)
                     out_channels = w.shape[0]

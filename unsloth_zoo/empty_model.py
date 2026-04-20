@@ -30,6 +30,7 @@ __all__ = [
 import torch
 import re
 import os
+import functools
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
@@ -343,6 +344,7 @@ def patch_gemma4_vllm_lora_support():
     if not hasattr(vllm_lora_model_manager.create_lora_manager, "_unsloth_gemma4_patch"):
         original_create_lora_manager = vllm_lora_model_manager.create_lora_manager
 
+        @functools.wraps(original_create_lora_manager)
         def patched_create_lora_manager(model, *args, **kwargs):
             if model.__class__.__name__ == "Gemma4ForConditionalGeneration":
                 lora_manager_cls = kwargs.pop("lora_manager_cls", vllm_lora_model_manager.LoRAModelManager)
@@ -931,7 +933,6 @@ def get_model_layer_config(return_non_layered=True):
             # qwen 3 vl
             "model.visual.deepstack_merger_list.{kk}.linear_fc1",
             "model.visual.deepstack_merger_list.{kk}.linear_fc2",
-            "model.visual.merger.linear_fc{kk}",
 
         },
         "non_layered_components":{
@@ -971,6 +972,8 @@ def get_model_layer_config(return_non_layered=True):
             # qwen 3 vl
             "model.visual.pos_embed",
             "model.visual.merger.norm",
+            "model.visual.merger.linear_fc1",
+            "model.visual.merger.linear_fc2",
         }
     }
 
@@ -1083,8 +1086,12 @@ def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_sta
         get_state_dict(f"{prefix}.in_proj_qkv", 0, state_dict, gdn.in_proj_qkv, slice_weights=False)
         get_state_dict(f"{prefix}.in_proj_z", 0, state_dict, gdn.in_proj_z, slice_weights=False)
 
-    get_state_dict(f"{prefix}.in_proj_b", 0, state_dict, gdn.in_proj_ba)
-    get_state_dict(f"{prefix}.in_proj_a", 1, state_dict, gdn.in_proj_ba)
+    if hasattr(gdn, "in_proj_ba"):
+        get_state_dict(f"{prefix}.in_proj_b", 0, state_dict, gdn.in_proj_ba)
+        get_state_dict(f"{prefix}.in_proj_a", 1, state_dict, gdn.in_proj_ba)
+    else:
+        get_state_dict(f"{prefix}.in_proj_b", 0, state_dict, gdn.in_proj_b, slice_weights=False)
+        get_state_dict(f"{prefix}.in_proj_a", 0, state_dict, gdn.in_proj_a, slice_weights=False)
 
     store(f"{prefix}.conv1d.weight", gdn.conv1d.weight.data)
     store(f"{prefix}.dt_bias", gdn.dt_bias.data)
