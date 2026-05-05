@@ -92,24 +92,25 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 from importlib.util import find_spec
 import platform as _check_platform
 
-# Detect Apple Silicon MLX mode:
-# Either torch is absent (pure MLX), or unsloth already detected MLX
+# Detect Apple Silicon MLX mode. Require torch to be absent or an explicit
+# UNSLOTH_FORCE_MLX=1 opt-in so users with both torch (MPS) and mlx installed
+# can keep the GPU init path.
+_force_mlx = os.environ.get("UNSLOTH_FORCE_MLX", "").lower() in ("1", "true", "yes")
 _is_mlx_only = (
     _check_platform.system() == "Darwin"
     and _check_platform.machine() == "arm64"
     and find_spec("mlx") is not None
+    and (find_spec("torch") is None or _force_mlx)
 )
 
 if _is_mlx_only:
     # MLX mode: skip all CUDA/torch-specific initialization.
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
     UNSLOTH_ZOO_IS_PRESENT = True
-    del _is_mlx_only, _check_platform, find_spec
-    # Everything below this point is GPU-only. Use a flag to gate it.
     _SKIP_GPU_INIT = True
 else:
     _SKIP_GPU_INIT = False
-    del _is_mlx_only, _check_platform
+del _is_mlx_only, _check_platform, _force_mlx
 
 # Inject triton & bitsandbytes stubs on Apple Silicon with MLX so unsloth's
 # CUDA-only imports don't error at startup. _SKIP_GPU_INIT=True is set only
@@ -305,7 +306,7 @@ if not _SKIP_GPU_INIT:
     elif DEVICE_TYPE == "hip":
         # CCE also fails in HIP / AMD
         os.environ["UNSLOTH_ENABLE_CCE"] = "0"
-    del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_2_9_OR_NEWER, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
+    del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_2_9_OR_NEWER, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version
     del clean_expandable_segments_value
     del _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF, _ORIGINAL_PYTORCH_HIP_ALLOC_CONF, _HAS_ORIGINAL_PYTORCH_ALLOC_CONF
 
@@ -323,14 +324,6 @@ if not _SKIP_GPU_INIT:
     from .temporary_patches import (
         encode_conversations_with_harmony,
     )
-    from .rl_environments import (
-        check_python_modules,
-        create_locked_down_function,
-        execute_with_time_limit,
-        Benchmarker,
-        is_port_open,
-        launch_openenv,
-    )
 
     # Top some pydantic warnings
     try:
@@ -344,4 +337,17 @@ if not _SKIP_GPU_INIT:
     except:
         pass
 
-    del os, warnings, re
+# why: rl_environments and find_spec are torch-free; expose them on both the
+# GPU and MLX paths so previously public exports stay importable on Apple
+# Silicon. del cleanup runs unconditionally so os/warnings/re/_SKIP_GPU_INIT
+# don't leak as unsloth_zoo.os etc. on either path.
+from .rl_environments import (
+    check_python_modules,
+    create_locked_down_function,
+    execute_with_time_limit,
+    Benchmarker,
+    is_port_open,
+    launch_openenv,
+)
+
+del os, warnings, re, _SKIP_GPU_INIT, find_spec

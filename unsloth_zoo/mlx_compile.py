@@ -2933,7 +2933,18 @@ def _install_qwen3_family_compile_patches():
         _patch_method(qwen3moe_language_module.Qwen3VLMoEModel, "_deepstack_process", patched_qwen3_deepstack)
         _patch_method(qwen3moe_module.Model, "get_input_embeddings", patched_qwen3_get_input_embeddings)
         _PATCHED_ARCHES.add("qwen3_vl_moe")
-    _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe"})
+    # why: only mark qwen3_5_moe patched if its dedicated module actually
+    # loaded and was patched. Previously this added qwen3_5_moe unconditionally
+    # while the function only loaded qwen3_5 (dense), so build_compile_qualifications
+    # would enable mx.compile for an unpatched arch and blow up at runtime.
+    try:
+        qwen35moe_module = importlib.import_module("mlx_vlm.models.qwen3_5_moe.qwen3_5_moe")
+        _patch_staticmethod(qwen35moe_module.Model, "merge_input_ids_with_image_features", merge_qwen3)
+        _patch_method(qwen35moe_module.Model, "get_input_embeddings", patched_qwen35_get_input_embeddings)
+        _PATCHED_ARCHES.add("qwen3_5_moe")
+    except Exception:
+        pass
+    _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5"})
 
 
 def _install_glm_ocr_compile_patches():

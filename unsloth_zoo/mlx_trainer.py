@@ -1293,6 +1293,61 @@ class MLXTrainer:
             save_merged_model(self.model, self.tokenizer, output_dir)
 
 
+def _encode_marker(tokenizer, text):
+    if text is None:
+        return []
+    if hasattr(tokenizer, "encode"):
+        return list(tokenizer.encode(text, add_special_tokens=False))
+    encoded = tokenizer(text, add_special_tokens=False)
+    if isinstance(encoded, dict):
+        return list(encoded["input_ids"])
+    return list(encoded)
+
+
+def _find_subsequence(values, pattern, start=0):
+    if not pattern:
+        return -1
+    limit = len(values) - len(pattern) + 1
+    for idx in range(start, max(start, limit)):
+        if values[idx : idx + len(pattern)] == pattern:
+            return idx
+    return -1
+
+
+def _make_mlx_response_mask_fn(tokenizer, instruction_part, response_part):
+    """Torch-free response-only mask closure for MLX installs.
+
+    Mirrors `dataset_utils.train_on_responses_only`'s mask-fn return value:
+    a callable that accepts {"input_ids": [...]} and returns {"labels": [...]}
+    where instruction tokens are -100 and assistant-response tokens carry the
+    original ids.
+    """
+    instruction_ids = _encode_marker(tokenizer, instruction_part)
+    response_ids = _encode_marker(tokenizer, response_part)
+    if not response_ids:
+        raise ValueError("Unsloth MLX: response_part must tokenize to at least one token.")
+
+    def mask_fn(examples):
+        labels = []
+        for input_ids in examples["input_ids"]:
+            input_ids = list(input_ids)
+            row = [-100] * len(input_ids)
+            search_from = 0
+            while True:
+                response_at = _find_subsequence(input_ids, response_ids, search_from)
+                if response_at < 0:
+                    break
+                answer_start = response_at + len(response_ids)
+                next_instruction = _find_subsequence(input_ids, instruction_ids, answer_start)
+                answer_end = next_instruction if next_instruction >= 0 else len(input_ids)
+                row[answer_start:answer_end] = input_ids[answer_start:answer_end]
+                search_from = answer_end
+            labels.append(row)
+        return {"labels": labels}
+
+    return mask_fn
+
+
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             max_seq_length, formatting_func=None,
                             dataset_text_field="text", num_batches=None,
@@ -1319,7 +1374,11 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         strict=False,
     )
 
-    # 1. Gather all text strings (serial, fast)
+    # 1. Gather all text strings (serial, fast).
+    # why: when num_batches is known, oversample only ~3x the needed pool so
+    # the length-sorted batching still has variety while we don't pin the
+    # whole tokenized dataset in RAM for users with streaming-scale corpora.
+    text_cap = (num_batches * batch_size * 3) if num_batches else None
     all_texts = []
     for item in dataset:
         if formatting_func is not None:
@@ -1337,6 +1396,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         for text in texts:
             if text:
                 all_texts.append(text)
+        if text_cap is not None and len(all_texts) >= text_cap:
+            break
 
     # 2. Tokenize + mask in parallel (HF fast tokenizers are thread-safe;
     #    slow tokenizers degrade gracefully via the GIL)
@@ -1534,10 +1595,6 @@ def train_on_responses_only(
     Returns:
         The trainer (for chaining), or the masking closure if return_function=True.
     """
-    from .dataset_utils import (
-        train_on_responses_only as _hf_train_on_responses_only,
-    )
-
     # Resolve tokenizer: kwarg > trainer.tokenizer
     _tokenizer = tokenizer
     if _tokenizer is None and trainer is not None:
@@ -1556,15 +1613,30 @@ def train_on_responses_only(
     elif hasattr(_tokenizer, "tokenizer"):
         _tokenizer = _tokenizer.tokenizer
 
-    # Get masking closure from the HF/CUDA implementation
-    mask_fn = _hf_train_on_responses_only(
-        None,
-        instruction_part=instruction_part,
-        response_part=response_part,
-        force_match=force_match,
-        tokenizer=_tokenizer,
-        return_function=True,
-    )
+    # why: dataset_utils.train_on_responses_only top-imports torch; on a
+    # torch-free Apple Silicon install (mlx-only) the import would
+    # ModuleNotFoundError. Try the HF path first; fall back to a local
+    # tokenizer-only mask closure when torch isn't available.
+    try:
+        from .dataset_utils import (
+            train_on_responses_only as _hf_train_on_responses_only,
+        )
+        mask_fn = _hf_train_on_responses_only(
+            None,
+            instruction_part=instruction_part,
+            response_part=response_part,
+            force_match=force_match,
+            tokenizer=_tokenizer,
+            return_function=True,
+        )
+    except ModuleNotFoundError as exc:
+        if "torch" not in str(exc):
+            raise
+        mask_fn = _make_mlx_response_mask_fn(
+            _tokenizer,
+            instruction_part=instruction_part,
+            response_part=response_part,
+        )
 
     if return_function:
         return mask_fn

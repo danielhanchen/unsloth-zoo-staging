@@ -80,54 +80,69 @@ def _get_vision_encoder_layers(model):
     return None
 
 
-def _patch_layer_class_for_gc(layer_cls):
-    if getattr(layer_cls, '_orig_call', None) is not None:
-        return  # already applied
-    layer_cls._orig_call = layer_cls.__call__
-    fn = layer_cls.__call__
+def _patch_layer_instance_for_gc(layer):
+    # why: patching the class's __call__ leaks gradient checkpointing onto
+    # every other instance of the same TransformerBlock class in the process
+    # (RLHF reference model, eval-alongside-train, DPO). Patch per-instance
+    # via types.MethodType so each model owns its own checkpoint state.
+    import types as _types
+    if getattr(layer, "_unsloth_gc_patched", False):
+        return
+    orig = layer.__class__.__call__
 
-    def checkpointed_fn(self, *args, **kwargs):
-        def inner_fn(params, *args, **kwargs):
-            self.update(params)
-            return fn(self, *args, **kwargs)
-        return mx.checkpoint(inner_fn)(self.trainable_parameters(), *args, **kwargs)
+    def _make_cp(fn):
+        def checkpointed(self, *args, **kwargs):
+            def inner(params, *a, **kw):
+                self.update(params)
+                return fn(self, *a, **kw)
+            return mx.checkpoint(inner)(self.trainable_parameters(), *args, **kwargs)
+        return checkpointed
 
-    layer_cls.__call__ = checkpointed_fn
+    layer.__call__ = _types.MethodType(_make_cp(orig), layer)
+    layer._unsloth_gc_patched = True
+    layer._unsloth_gc_orig = orig
 
 
-def _unpatch_layer_class_gc(layer_cls):
-    orig = getattr(layer_cls, '_orig_call', None)
+def _unpatch_layer_instance_gc(layer):
+    if not getattr(layer, "_unsloth_gc_patched", False):
+        return
+    orig = getattr(layer, "_unsloth_gc_orig", None)
     if orig is not None:
-        layer_cls.__call__ = orig
-        del layer_cls._orig_call
+        try:
+            del layer.__call__
+        except AttributeError:
+            pass
+        layer._unsloth_gc_orig = None
+    layer._unsloth_gc_patched = False
 
 
 def apply_gradient_checkpointing(model):
     """Apply gradient checkpointing to language and vision tower layers.
 
-    Patches each layer class's ``__call__`` with ``mx.checkpoint`` so MLX
+    Patches each layer instance's ``__call__`` with ``mx.checkpoint`` so MLX
     recomputes the layer's forward during backward instead of storing
-    activations. Trades ~30% extra compute for substantial memory savings —
-    critical for VLMs where vision tower backward at native image
-    resolution can otherwise materialize tens of GB of activation tape.
+    activations.
     """
     lm_layers = _get_transformer_layers(model)
-    if lm_layers is not None and len(lm_layers) > 0:
-        _patch_layer_class_for_gc(type(lm_layers[0]))
-
+    if lm_layers is not None:
+        for layer in lm_layers:
+            _patch_layer_instance_for_gc(layer)
     vt_layers = _get_vision_encoder_layers(model)
-    if vt_layers is not None and len(vt_layers) > 0:
-        _patch_layer_class_for_gc(type(vt_layers[0]))
+    if vt_layers is not None:
+        for layer in vt_layers:
+            _patch_layer_instance_for_gc(layer)
 
 
 def remove_gradient_checkpointing(model):
     """Remove gradient checkpointing, restoring original layer __call__."""
     lm_layers = _get_transformer_layers(model)
-    if lm_layers is not None and len(lm_layers) > 0:
-        _unpatch_layer_class_gc(type(lm_layers[0]))
+    if lm_layers is not None:
+        for layer in lm_layers:
+            _unpatch_layer_instance_gc(layer)
     vt_layers = _get_vision_encoder_layers(model)
-    if vt_layers is not None and len(vt_layers) > 0:
-        _unpatch_layer_class_gc(type(vt_layers[0]))
+    if vt_layers is not None:
+        for layer in vt_layers:
+            _unpatch_layer_instance_gc(layer)
 
 
 def _get_text_model(model):
@@ -523,12 +538,13 @@ def _mask_prompt_tokens(targets, assistant_token_id):
     """
     if assistant_token_id <= 0:
         return targets
-    # Find the first occurrence of assistant_token_id in each row
     is_assistant = (targets == assistant_token_id)
-    # cumsum along seq dim: positions after first assistant token have cumsum > 0
     cumulative = mx.cumsum(is_assistant.astype(mx.int32), axis=1)
-    # Mask everything before first assistant token (cumsum == 0)
-    prompt_mask = (cumulative == 0)
+    # why: rows missing the assistant marker have cumsum == 0 everywhere; gate
+    # the prompt mask on `has_assistant` so those rows pass through unmasked
+    # instead of being entirely zeroed to -100.
+    has_assistant = mx.any(is_assistant, axis=1, keepdims=True)
+    prompt_mask = (cumulative == 0) & has_assistant
     return mx.where(prompt_mask, -100, targets)
 
 
@@ -916,6 +932,53 @@ def _expand_image_token_sequences(
     return mx.array(padded_ids), mx.array(padded_masks)
 
 
+def _expand_labels_for_token_runs(labels, replacements_by_batch):
+    """Expand a label tensor in lockstep with `_expand_token_runs`.
+
+    Inserted placeholder positions are filled with -100 so loss skips them.
+    """
+    if labels is None:
+        return None
+    labels_np = np.asarray(labels)
+    expanded = []
+    max_len = 0
+    for row_labels, replacements in zip(labels_np, replacements_by_batch):
+        replacements = sorted(replacements, key=lambda item: item[0])
+        row = row_labels.tolist()
+        new_labels = []
+        prev = 0
+        for start, end, _token_id, repeat in replacements:
+            start = int(start)
+            end = int(end)
+            repeat = int(repeat)
+            if start > prev:
+                new_labels.extend(row[prev:start])
+            new_labels.extend([-100] * repeat)
+            prev = end
+        if prev < len(row):
+            new_labels.extend(row[prev:])
+        expanded.append(new_labels)
+        max_len = max(max_len, len(new_labels))
+    padded = np.full((len(expanded), max_len), -100, dtype=np.int32)
+    for row_idx, row in enumerate(expanded):
+        padded[row_idx, :len(row)] = row
+    return mx.array(padded)
+
+
+def _expand_image_token_runs_for_labels(labels, image_token_id, image_token_positions, repeat_count):
+    """Build replacements_by_batch matching `_expand_image_token_sequences` and expand labels."""
+    if labels is None:
+        return None
+    replacements = tuple(
+        tuple(
+            (int(pos), int(pos) + 1, int(image_token_id), int(repeat_count))
+            for pos in positions
+        )
+        for positions in image_token_positions
+    )
+    return _expand_labels_for_token_runs(labels, replacements)
+
+
 def _expand_token_runs(
     input_ids,
     attention_mask,
@@ -1280,14 +1343,28 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
     if model_type == "multi_modality":
         input_ids = batch_dict.get("input_ids")
         if input_ids is not None:
+            image_token_id_mm = int(_config_get(config, "image_token_index"))
+            repeat_count_mm = int(_config_get(config, "num_image_tokens"))
+            input_ids_np_mm = np.asarray(input_ids)
+            image_positions_mm = tuple(
+                tuple(int(pos) for pos in np.where(row == image_token_id_mm)[0].tolist())
+                for row in input_ids_np_mm
+            )
             expanded_ids, expanded_mask = _expand_image_token_sequences(
                 input_ids=input_ids,
                 attention_mask=batch_dict.get("attention_mask"),
-                image_token_id=int(_config_get(config, "image_token_index")),
-                repeat_count=int(_config_get(config, "num_image_tokens")),
+                image_token_id=image_token_id_mm,
+                repeat_count=repeat_count_mm,
             )
             batch_dict["input_ids"] = expanded_ids
             batch_dict["attention_mask"] = expanded_mask
+            if "labels" in batch_dict:
+                batch_dict["labels"] = _expand_image_token_runs_for_labels(
+                    batch_dict["labels"],
+                    image_token_id_mm,
+                    image_positions_mm,
+                    repeat_count_mm,
+                )
 
     if model_type in {"phi4-siglip", "phi4_siglip"}:
         input_ids = batch_dict.get("input_ids")
@@ -1324,6 +1401,11 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                 )
                 batch_dict["input_ids"] = expanded_ids
                 batch_dict["attention_mask"] = expanded_mask
+                if "labels" in batch_dict:
+                    batch_dict["labels"] = _expand_labels_for_token_runs(
+                        batch_dict["labels"],
+                        tuple(replacements),
+                    )
 
     if model_type == "phi4mm":
         input_ids = batch_dict.get("input_ids")
@@ -1392,6 +1474,11 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                 )
                 batch_dict["input_ids"] = expanded_ids
                 batch_dict["attention_mask"] = expanded_mask
+                if "labels" in batch_dict:
+                    batch_dict["labels"] = _expand_labels_for_token_runs(
+                        batch_dict["labels"],
+                        tuple(replacements),
+                    )
 
     return batch_dict
 
@@ -2099,7 +2186,13 @@ def _to_mx_vlm_batch(inputs):
                     for x in value
                 ])
             except Exception:
-                batch[key] = mx.array(value[0]) if not isinstance(value[0], mx.array) else value[0]
+                # why: stack fails for ragged per-sample shapes; preserve every
+                # sample as a tuple of mx.arrays instead of silently keeping
+                # only sample 0.
+                batch[key] = tuple(
+                    x if isinstance(x, mx.array) else mx.array(x)
+                    for x in value
+                )
         else:
             batch[key] = value
 
@@ -2280,6 +2373,13 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
         for i in range(0, len(indices) - batch_size + 1, batch_size)
     ]
 
+    # why: VLM pixel_values are MB-scale per batch; pre-materializing the full
+    # max_steps*grad_accum schedule pins GBs of RAM before training starts.
+    # Use iterate_vlm_training_batches for streaming; cap eager prefetch when
+    # called for explicit num_batches.
+    _DEFAULT_VLM_PREFETCH_BATCHES = 200
+    batch_cap = num_batches if num_batches is not None else _DEFAULT_VLM_PREFETCH_BATCHES
+
     batch_list = []
     for bi in batch_indices:
         items = [dataset[idx] for idx in bi]
@@ -2291,7 +2391,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
         if response_mask_fn is not None:
             batch_dict = _apply_response_mask_to_vlm_batch(batch_dict, response_mask_fn)
         batch_list.append(batch_dict)
-        if num_batches is not None and len(batch_list) >= num_batches:
+        if len(batch_list) >= batch_cap:
             break
 
     # Evaluate all tensors
@@ -2645,6 +2745,41 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     if resolved_map and quant_source != "mlx_config":
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
+
+    # why: mlx_lm.tuner.utils.load_adapters reads config.num_layers and
+    # config.lora_parameters when reattaching LoRA to the base model. Populate
+    # these so save_pretrained_merged(save_method="lora") produces an
+    # adapter_config.json that mlx-lm can actually reload.
+    rank = adapter_config.get("rank") or adapter_config.get("r")
+    scale = adapter_config.get("scale")
+    dropout = adapter_config.get("dropout")
+    for _, module in model.named_modules():
+        if hasattr(module, "lora_a"):
+            try:
+                rank = rank or int(module.lora_a.shape[-1])
+            except Exception:
+                pass
+            if scale is None:
+                scale = float(getattr(module, "scale", 1.0))
+            if dropout is None:
+                drop = getattr(module, "dropout", None)
+                dropout = float(getattr(drop, "p", 0.0)) if drop is not None else 0.0
+            break
+    if rank is None:
+        rank = 8
+    if scale is None:
+        scale = 1.0
+    if dropout is None:
+        dropout = 0.0
+    adapter_config.setdefault(
+        "lora_parameters",
+        {"rank": int(rank), "scale": float(scale), "dropout": float(dropout)},
+    )
+    if "num_layers" not in adapter_config:
+        layers = _get_transformer_layers(model)
+        adapter_config["num_layers"] = len(layers) if layers is not None else -1
+    adapter_config.setdefault("fine_tune_type", "lora")
+    adapter_config.setdefault("peft_type", "LORA")
     return adapter_config
 
 
@@ -2935,18 +3070,20 @@ def save_pretrained_gguf(
     # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
     try:
         import torch  # noqa: F401
-    except ImportError:
+    except ImportError as exc:
         raise ImportError(
             "Unsloth: GGUF export requires PyTorch.\n"
-            "Install via: pip install torch\n"
-            "torch is only needed for GGUF export, not for training."
-        )
+            "Install the export extra with: pip install 'unsloth-zoo[mlx-export]'\n"
+            "torch is only needed for GGUF export, not for MLX training."
+        ) from exc
 
     # Step 1: Save merged model to a temp HF-format directory
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir) / "merged"
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
-        save_merged_model(model, tokenizer, tmp_path)
+        # why: convert_hf_to_gguf cannot consume MLX-quantized layouts; force
+        # dequantize so the temp HF dir is genuinely 16-bit.
+        save_merged_model(model, tokenizer, tmp_path, dequantize=True)
 
         # Step 2: Ensure llama.cpp is installed and gguf package is available
         llama_cpp_folder = "llama.cpp"
@@ -3001,7 +3138,7 @@ def save_pretrained_gguf(
             model_dtype=model_dtype,
             quantization_type=first_conversion,
             converter_location=converter,
-            is_vlm=False,
+            is_vlm=_is_vlm_model(model),
             is_gpt_oss=False,
             print_output=True,
         )
@@ -3120,14 +3257,15 @@ def push_to_hub_merged(
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
-    api.upload_folder(
+    # why: upload_large_folder is required for sharded merged models (multi-GB,
+    # many files); upload_folder lacks resume/chunking and times out. The
+    # signature drops commit_description / create_pr / revision, so callers
+    # that relied on those params will lose them — accepted trade-off because
+    # upload_folder simply did not work for the common 7B+/14GB case.
+    api.upload_large_folder(
         folder_path=str(save_directory),
         repo_id=repo_id,
         repo_type="model",
-        commit_message=commit_message,
-        commit_description=commit_description,
-        create_pr=create_pr,
-        revision=revision,
     )
     print(f"Unsloth: Pushed to https://huggingface.co/{repo_id}")
 
@@ -3161,7 +3299,24 @@ def push_to_hub_gguf(
 
     # Upload GGUF files
     api = HfApi(token=token)
-    api.create_repo(repo_id=repo_id, exist_ok=True, private=private)
+    api.create_repo(repo_id=repo_id, exist_ok=True, private=bool(private) if private is not None else False)
+    # why: create_repo(exist_ok=True) is a no-op when the repo already exists,
+    # so private=True won't flip an existing public repo private without an
+    # explicit update_repo_settings call. Refuse the upload if the visibility
+    # cannot be enforced rather than leaking artifacts to a public repo.
+    if private is not None:
+        try:
+            api.update_repo_settings(
+                repo_id=repo_id,
+                private=bool(private),
+                repo_type="model",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unsloth: refusing to upload GGUF because the requested "
+                f"repo visibility private={bool(private)} could not be applied "
+                f"to {repo_id} ({exc})."
+            ) from exc
 
     gguf_files = list(save_directory.glob("*.gguf"))
     for gguf_file in gguf_files:

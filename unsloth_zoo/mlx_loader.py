@@ -452,13 +452,14 @@ def _fix_qwen35_attention_cache(model):
     original_attn_call = attn_cls.__call__
 
     def patched_attn_call(self, x, mask=None, cache=None, position_ids=None):
-        # When training (cache=None) and position_ids=None, compute them
+        # When training (cache=None) and position_ids=None, compute them.
+        # m-RoPE expects shape (3, B, L); derive B from the input batch so
+        # batch_size > 1 doesn't silently broadcast row-0 positions everywhere.
         if cache is None and position_ids is None:
             import mlx.core as mx
-            L = x.shape[1]
-            position_ids = mx.arange(L)
-            position_ids = mx.expand_dims(position_ids, axis=0)
-            position_ids = mx.tile(position_ids, (3, 1, 1))
+            B, L = x.shape[0], x.shape[1]
+            pos = mx.broadcast_to(mx.arange(L).reshape(1, L), (B, L))
+            position_ids = mx.tile(mx.expand_dims(pos, axis=0), (3, 1, 1))
         return original_attn_call(self, x, mask=mask, cache=cache, position_ids=position_ids)
 
     attn_cls.__call__ = patched_attn_call
@@ -1753,21 +1754,43 @@ def _ensure_vlm_prompt_utils_patched():
         )
 
     prompt_utils.apply_chat_template = patched_apply_chat_template
+    _propagate_vlm_apply_chat_template(patched_apply_chat_template)
 
-    for modname in (
-        "mlx_vlm.chat",
-        "mlx_vlm.generate",
-        "mlx_vlm.server",
-        "mlx_vlm.evals.utils",
-    ):
+    _vlm_prompt_utils_patched = True
+
+
+_VLM_APPLY_CHAT_TEMPLATE_CONSUMERS = (
+    "mlx_vlm.chat",
+    "mlx_vlm.generate",
+    "mlx_vlm.server",
+    "mlx_vlm.evals.utils",
+)
+
+
+def _propagate_vlm_apply_chat_template(fn):
+    import importlib
+    for modname in _VLM_APPLY_CHAT_TEMPLATE_CONSUMERS:
         try:
             module = importlib.import_module(modname)
         except Exception:
             continue
         if hasattr(module, "apply_chat_template"):
-            module.apply_chat_template = patched_apply_chat_template
+            module.apply_chat_template = fn
 
-    _vlm_prompt_utils_patched = True
+
+def restore_vlm_prompt_utils():
+    """Undo the global mlx_vlm.prompt_utils.apply_chat_template patch."""
+    global _vlm_prompt_utils_patched, _original_vlm_apply_chat_template
+    if not _vlm_prompt_utils_patched or _original_vlm_apply_chat_template is None:
+        return
+    import importlib
+    try:
+        prompt_utils = importlib.import_module("mlx_vlm.prompt_utils")
+    except Exception:
+        return
+    prompt_utils.apply_chat_template = _original_vlm_apply_chat_template
+    _propagate_vlm_apply_chat_template(_original_vlm_apply_chat_template)
+    _vlm_prompt_utils_patched = False
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
@@ -1781,7 +1804,7 @@ def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
     from .mlx_utils import save_pretrained_gguf
     tokenizer = tokenizer or self._tokenizer
     save_pretrained_gguf(self, tokenizer, save_directory,
-                         quantization_method=quantization_method)
+                         quantization_method=quantization_method, **kwargs)
 
 
 def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, **kwargs):
@@ -2702,8 +2725,21 @@ class FastMLXModel:
         # was built from defaults, or was normalized from "all-linear" — so
         # toggling these flags always has effect.
         if isinstance(target_modules, list) and len(target_modules) > 0:
-            _ATTN = {"q_proj", "k_proj", "v_proj", "o_proj"}
-            _MLP = {"gate_proj", "up_proj", "down_proj"}
+            # why: include fused-QKV (qkv_proj/qkv/Wqkv/query_key_value/c_attn),
+            # MLA (q_a_proj/q_b_proj/kv_a_proj_with_mqa/kv_b_proj), and fused-MLP
+            # (gate_up_proj) aliases so finetune_attention_modules=False /
+            # finetune_mlp_modules=False actually filters those buckets on
+            # archs where target_modules='all-linear' returned the fused names.
+            _ATTN = {
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "qkv", "qkv_proj", "query_key_value", "Wqkv", "c_attn",
+                "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj",
+                "out_proj", "merged_q_proj",
+            }
+            _MLP = {
+                "gate_proj", "up_proj", "down_proj",
+                "gate_up_proj",
+            }
             filtered = []
             for m in target_modules:
                 if m in _ATTN and not finetune_attention_modules:
