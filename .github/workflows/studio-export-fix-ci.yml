@@ -53,8 +53,9 @@ jobs:
           python -m pip install --upgrade pip
           # No torch needed -- the patcher + quantize_gguf tests are pure
           # Python + monkeypatched subprocess. Keep installs slim so Windows
-          # cold starts stay under a minute.
-          python -m pip install pytest psutil requests
+          # cold starts stay under a minute. tqdm + psutil + requests are
+          # imported at module level by unsloth_zoo.llama_cpp.
+          python -m pip install pytest psutil requests tqdm
 
       - name: Run patcher + q2_k_l unit tests
         shell: bash
