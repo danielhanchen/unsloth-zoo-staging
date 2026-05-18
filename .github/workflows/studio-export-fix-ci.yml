@@ -1,0 +1,64 @@
+name: studio-export-fix-ci
+
+on:
+  push:
+    branches: [studio-export-q2kl-fix]
+    paths:
+      - "unsloth_zoo/llama_cpp.py"
+      - "tests/test_quantize_gguf_q2_k_l.py"
+      - "tests/test_convert_hf_to_gguf_patcher.py"
+      - ".github/workflows/studio-export-fix-ci.yml"
+  pull_request:
+    paths:
+      - "unsloth_zoo/llama_cpp.py"
+      - "tests/test_quantize_gguf_q2_k_l.py"
+      - "tests/test_convert_hf_to_gguf_patcher.py"
+      - ".github/workflows/studio-export-fix-ci.yml"
+
+concurrency:
+  group: studio-export-fix-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  studio-export-fix:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Cap Windows usage: 3 OS in flight at most, staying well below the
+      # 5-concurrent-Windows-runner repo limit.
+      max-parallel: 3
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      # Token bumps raw.githubusercontent.com rate limit (60/h -> 5000/h) for
+      # the live-upstream tests that fetch the current llama.cpp converter.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      UNSLOTH_COMPILE_DISABLE: '1'
+      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install minimal test deps
+        run: |
+          python -m pip install --upgrade pip
+          # No torch needed -- the patcher + quantize_gguf tests are pure
+          # Python + monkeypatched subprocess. Keep installs slim so Windows
+          # cold starts stay under a minute.
+          python -m pip install pytest psutil requests
+
+      - name: Run patcher + q2_k_l unit tests
+        shell: bash
+        run: |
+          pytest -v \
+            tests/test_quantize_gguf_q2_k_l.py \
+            tests/test_convert_hf_to_gguf_patcher.py
