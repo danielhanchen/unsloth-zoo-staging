@@ -1408,10 +1408,8 @@ class MLXTrainer:
 
 
             _lora_rank, _lora_scale, _lora_dropout = 8, 1.0, 0.0
-            # iter_mlx_lora_modules covers lower- and upper-case LoRA attr
-            # pairs; _infer_mlx_lora_rank handles MoE/SwitchLinear shapes.
-            for _, m, a_attr, b_attr in iter_mlx_lora_modules(self.model):
-                inferred_rank = _infer_mlx_lora_rank(m, a_attr, b_attr)
+            for _, m in iter_mlx_lora_modules(self.model):
+                inferred_rank = _infer_mlx_lora_rank(m)
                 if inferred_rank is None:
                     continue
                 _lora_rank = inferred_rank
