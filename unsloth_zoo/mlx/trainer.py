@@ -64,6 +64,7 @@ from .utils import (
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
     collect_mlx_texts,
+    save_lora_adapters,
     save_trainable_adapters,
     collect_mlx_lora_adapter_tensors,
     iter_mlx_lora_modules,
@@ -274,7 +275,10 @@ class MLXTrainer:
         other intentionally trainable non-LoRA parameters.
         """
         trainable = dict(tree_flatten(model.trainable_parameters()))
-        has_lora = any(name in trainable for name in collect_mlx_lora_adapter_tensors(model))
+        if not trainable:
+            return  # why safe: nothing trainable means nothing to suspect-freeze; also avoids requiring model.parameters() on stub models.
+        adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+        has_lora = any(name in trainable for name in adapter_tensors)
         if not has_lora:
             return  # Not a LoRA model — don't touch
 
@@ -289,9 +293,10 @@ class MLXTrainer:
             "multi_modal_projector", "mm_projector", "connector", "aligner",
             "vision_tower", "vision_model", "vision_encoder",
         )
+        adapter_keys = set(adapter_tensors)
         suspect = [
             k for k in trainable
-            if "lora" not in k
+            if k not in adapter_keys
             and any(frag in k for frag in _NORM_FRAGMENTS)
             and not any(comp in k for comp in _INTENTIONAL_COMPONENTS)
         ]
@@ -1237,8 +1242,12 @@ class MLXTrainer:
             # Checkpointing
             if args.save_steps > 0 and current_step % args.save_steps == 0:
                 ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
-                save_trainable_adapters(model, ckpt_dir)
-                print(f"  Saved checkpoint to {ckpt_dir}")
+                try:
+                    save_trainable_adapters(model, ckpt_dir)
+                except ValueError as e:
+                    print(f"  Unsloth: skipped checkpoint ({e})")
+                else:
+                    print(f"  Saved checkpoint to {ckpt_dir}")
 
         total_time = time.perf_counter() - start_time
         avg_loss = (
@@ -1389,24 +1398,10 @@ class MLXTrainer:
         )
         output_dir = output_dir or self.args.output_dir
 
-        # Reloaded LoRA: adapters live in parameters() but may be absent
-        # from trainable_parameters(); the old substring check fell through
-        # to save_merged_model(). Compute the trainable split here so we can
-        # also route mixed LoRA + non-LoRA fine-tunes to the right writer.
+        # Detect LoRA from module structure so reloaded / frozen adapters
+        # still take the adapter-save path.
         adapter_tensors = collect_mlx_lora_adapter_tensors(self.model)
-        adapter_keys = set(adapter_tensors)
-        trainable = dict(tree_flatten(self.model.trainable_parameters()))
-        trainable_keys = set(trainable)
-        has_trainable_lora = bool(adapter_keys & trainable_keys)
-        has_trainable_non_lora = bool(trainable_keys - adapter_keys)
-        # Treat as a LoRA save when adapters exist AND either LoRA is actively
-        # training, or there are no other trainables to preserve. Frozen LoRA
-        # with only non-LoRA trainables (norm-only fine-tune over a reloaded
-        # adapter) falls through to save_merged_model so trained non-LoRA
-        # state survives.
-        has_lora = bool(adapter_tensors) and (
-            has_trainable_lora or not has_trainable_non_lora
-        )
+        has_lora = bool(adapter_tensors)
 
         if has_lora:
             hf_repo = getattr(self.model, "_hf_repo", None) or ""
@@ -1425,7 +1420,6 @@ class MLXTrainer:
                     getattr(m, "dropout", None)
                 )
                 break
-
 
             from .utils import _get_transformer_layers
             layers = _get_transformer_layers(self.model)
@@ -1461,17 +1455,21 @@ class MLXTrainer:
                     self.model, "_unsloth_quantized_source", None,
                 ),
             }
-            # Preserve intentionally trainable non-LoRA tensors (embeddings,
-            # projector, vision, ...) by saving the full trainable tree when
-            # the trainer touched anything beyond LoRA. Pure LoRA runs keep
-            # the lean adapter-only artifact mlx-lm load_adapters() expects.
+
+            # Mixed fine-tunes (embeddings / projector / vision trained
+            # alongside LoRA) route through the trainable-tree writer so the
+            # extra tensors land in the artifact; pure LoRA stays lean.
+            trainable = dict(tree_flatten(self.model.trainable_parameters()))
+            adapter_keys = set(adapter_tensors)
+            has_trainable_non_lora = bool(set(trainable) - adapter_keys)
+
             if has_trainable_non_lora:
                 save_trainable_adapters(
                     self.model, output_dir, adapter_config=adapter_config,
                 )
             else:
-                self.model.save_lora_adapters(
-                    output_dir, adapter_config=adapter_config,
+                save_lora_adapters(
+                    self.model, output_dir, adapter_config=adapter_config,
                 )
             # why: VLM processors include the inner tokenizer; double-save
             # rewrites the same files. Skip when the processor will cover it.

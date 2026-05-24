@@ -2554,6 +2554,26 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
             json.dump(adapter_config, f, indent=2)
 
 
+def _extract_mlx_lora_parameters(model):
+    """Extract global rank, scale, and dropout from the model's first LoRA module."""
+    rank, scale, dropout = 8, 1.0, 0.0
+    for _, m, a_attr, _ in iter_mlx_lora_modules(model):
+        a_tensor = getattr(m, a_attr)
+        a_shape = tuple(getattr(a_tensor, "shape", ()))
+        # mlx-lm LoRASwitchLinear stores (num_experts, rank, in_dims);
+        # standard LoRALinear stores (in_dims, rank).
+        if len(a_shape) >= 3:
+            rank = int(a_shape[-2])
+        elif len(a_shape) >= 2:
+            rank = int(a_shape[-1])
+        scale = getattr(m, "scale", 1.0)
+
+        drop = getattr(m, "dropout", None)
+        dropout = getattr(drop, "p", 0.0) if drop else 0.0
+        break
+    return rank, scale, dropout
+
+
 # mlx-lm uses lowercase pair; PEFT-style adapters may expose uppercase.
 _MLX_LORA_ATTR_PAIRS = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
 
@@ -2582,7 +2602,7 @@ def collect_mlx_lora_adapter_tensors(model):
     """
     parameters = dict(mlx.utils.tree_flatten(model.parameters()))
     adapter_keys = set()
-    for module_name, _module, a_attr, b_attr in iter_mlx_lora_modules(model):
+    for module_name, _, a_attr, b_attr in iter_mlx_lora_modules(model):
         prefix = f"{module_name}." if module_name else ""
         adapter_keys.add(f"{prefix}{a_attr}")
         adapter_keys.add(f"{prefix}{b_attr}")
@@ -2590,9 +2610,20 @@ def collect_mlx_lora_adapter_tensors(model):
 
 
 def save_trainable_adapters(model, path, adapter_config=None):
-    """Save the current trainable parameter tree for training checkpoints."""
-    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
-    _save_adapter_artifacts(model, path, trainable, adapter_config=adapter_config)
+    """Save the current trainable parameter tree for training checkpoints.
+
+    Includes all LoRA adapter tensors (frozen or not) to ensure the
+    artifact remains a valid, reloadable adapter file.
+    """
+    tensors = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    tensors.update(collect_mlx_lora_adapter_tensors(model))
+
+    if not tensors:
+        raise ValueError(
+            "Unsloth: save_trainable_adapters() found no trainable or LoRA "
+            "parameters to save. The model may be fully frozen without LoRA."
+        )
+    _save_adapter_artifacts(model, path, tensors, adapter_config=adapter_config)
 
 
 def save_lora_adapters(model, path, adapter_config=None):
@@ -2854,6 +2885,9 @@ def _enrich_mlx_adapter_config(model, adapter_config):
 
     # why: persist module paths + rank/scale/dropout so reload reproduces logits;
     # missing scale silently defaults to 1.0 even when training used alpha/r > 1.
+    # The inline block below already covers the lora_parameters backfill via
+    # _infer_mlx_lora_rank and respects explicit caller path filters, so the
+    # PR #692 _extract_mlx_lora_parameters fast-path is redundant here.
     try:
         # distinguish "caller passed nothing" from "caller passed [] / None".
         explicit_paths = (
@@ -3057,12 +3091,19 @@ def save_pretrained_merged(
         )
 
     if method == "lora":
-        if not collect_mlx_lora_adapter_tensors(model):
+        adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+        if not adapter_tensors:
             raise ValueError(
                 "Unsloth: save_method='lora' but the model has no LoRA "
                 "layers — there's nothing to save. Use 'merged_16bit' instead."
             )
-        save_lora_adapters(model, save_directory)
+        trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+        has_trainable_non_lora = bool(set(trainable) - set(adapter_tensors))
+
+        if has_trainable_non_lora:
+            save_trainable_adapters(model, save_directory)
+        else:
+            save_lora_adapters(model, save_directory)
         try:
             tokenizer.save_pretrained(str(save_directory))
         except Exception:
