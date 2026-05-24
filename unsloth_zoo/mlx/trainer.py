@@ -64,7 +64,8 @@ from .utils import (
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
     collect_mlx_texts,
-    save_lora_adapters,
+    save_trainable_adapters,
+    collect_mlx_lora_adapter_tensors,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -272,7 +273,7 @@ class MLXTrainer:
         other intentionally trainable non-LoRA parameters.
         """
         trainable = dict(tree_flatten(model.trainable_parameters()))
-        has_lora = any("lora" in k for k in trainable)
+        has_lora = any(name in trainable for name in collect_mlx_lora_adapter_tensors(model))
         if not has_lora:
             return  # Not a LoRA model — don't touch
 
@@ -1235,7 +1236,7 @@ class MLXTrainer:
             # Checkpointing
             if args.save_steps > 0 and current_step % args.save_steps == 0:
                 ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
-                save_lora_adapters(model, ckpt_dir)
+                save_trainable_adapters(model, ckpt_dir)
                 print(f"  Saved checkpoint to {ckpt_dir}")
 
         total_time = time.perf_counter() - start_time
@@ -1387,8 +1388,10 @@ class MLXTrainer:
         )
         output_dir = output_dir or self.args.output_dir
 
-        trainable = dict(tree_flatten(self.model.trainable_parameters()))
-        has_lora = any("lora" in k for k in trainable)
+        # Reloaded LoRA: adapters live in parameters() but may be absent
+        # from trainable_parameters(); the old substring check fell through
+        # to save_merged_model().
+        has_lora = bool(collect_mlx_lora_adapter_tensors(self.model))
 
         if has_lora:
             hf_repo = getattr(self.model, "_hf_repo", None) or ""
