@@ -54,15 +54,20 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install CPU-only torch + unsloth_zoo[core]
+      - name: Install CPU-only torch + unsloth_zoo[core] + unsloth shim
         # MLX extras intentionally skipped -- mlx/mlx-lm/mlx-vlm have no
         # Linux wheel. The package's pyproject already gates these on
         # darwin+arm64 so `.[core]` resolves cleanly here.
+        #
+        # unsloth --no-deps satisfies the find_spec("unsloth") guard at
+        # unsloth_zoo/__init__.py:198 without dragging in unsloth's heavy
+        # deps. Mirror of the upstream consolidated-tests-ci.yml pattern.
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
           pip install pytest==9.0.3 safetensors
 
       - name: Import smoke — unsloth_zoo top-level + MLX runtime probe

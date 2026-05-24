@@ -65,9 +65,16 @@ jobs:
           print('OK: macOS arm64 confirmed')
           "
 
-      - name: Install unsloth_zoo with MLX extras
+      - name: Install unsloth_zoo with MLX extras (+ torch for tests)
+        # The .[mlx] extras intentionally skip torch (pyproject gates torch
+        # off on darwin+arm64 since MLX replaces it). But the new
+        # save_lora_adapters_filter test imports torch via the shim, so we
+        # explicitly pull the CPU-index Apple Silicon wheel (the same one
+        # danielhanchen/unsloth-staging-2/mlx-ci.yml uses).
         run: |
           python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch==2.10.0'
           pip install -e .[mlx]
           pip install pytest==9.0.3 safetensors
 
