@@ -2541,6 +2541,25 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
         yield batch, lengths_info, None
 
 
+def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+    if tensors:
+        mx.save_safetensors(str(path / "adapters.safetensors"), tensors)
+
+    adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
+    if adapter_config:
+        with open(path / "adapter_config.json", "w") as f:
+            json.dump(adapter_config, f, indent=2)
+
+
+def save_trainable_adapters(model, path, adapter_config=None):
+    """Save the current trainable parameter tree for training checkpoints."""
+    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    _save_adapter_artifacts(model, path, trainable, adapter_config=adapter_config)
+
+
 def save_lora_adapters(model, path, adapter_config=None):
     """Save LoRA adapter weights to disk.
 
@@ -2549,19 +2568,21 @@ def save_lora_adapters(model, path, adapter_config=None):
         path: Directory to save adapters.
         adapter_config: Optional dict with LoRA config metadata.
     """
-    path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
+    parameters = dict(mlx.utils.tree_flatten(model.parameters()))
+    adapter_tensors = {
+        name: value
+        for name, value in parameters.items()
+        if "lora_" in name.lower()
+    }
 
-    # Collect only trainable (LoRA) parameters — flatten nested dict for safetensors
-    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    if not adapter_tensors:
+        raise ValueError(
+            "Unsloth: no MLX LoRA adapter tensors were found to save."
+        )
 
-    if trainable:
-        mx.save_safetensors(str(path / "adapters.safetensors"), trainable)
-
-    adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
-    if adapter_config:
-        with open(path / "adapter_config.json", "w") as f:
-            json.dump(adapter_config, f, indent=2)
+    _save_adapter_artifacts(
+        model, path, adapter_tensors, adapter_config=adapter_config
+    )
 
 
 def _infer_snapshot_commit(path):
@@ -2664,6 +2685,31 @@ def _get_mlx_config_quantization(model):
     return config.get("quantization") or config.get("quantization_config")
 
 
+def _get_mlx_dropout_probability(drop):
+    if drop is None:
+        return 0.0
+    if hasattr(drop, "p"):
+        return float(drop.p)
+    keep_probability = getattr(drop, "_p_1", 1.0)
+    return float(1.0 - keep_probability)
+
+
+def _infer_mlx_lora_rank(module):
+    lora_a = getattr(module, "lora_a", None)
+    lora_b = getattr(module, "lora_b", None)
+    lora_a_shape = tuple(getattr(lora_a, "shape", ()) or ())
+    lora_b_shape = tuple(getattr(lora_b, "shape", ()) or ())
+    if len(lora_a_shape) >= 3:
+        rank = lora_a_shape[-2]
+        if not lora_b_shape or lora_b_shape[-1] == rank:
+            return int(rank)
+    if lora_a_shape and lora_b_shape and lora_a_shape[-1] == lora_b_shape[0]:
+        return int(lora_a_shape[-1])
+    if lora_a_shape:
+        return int(lora_a_shape[-1])
+    return None
+
+
 def _enrich_mlx_adapter_config(model, adapter_config):
     adapter_config = dict(adapter_config or {})
     hf_repo = getattr(model, "_hf_repo", None) or adapter_config.get("base_model_name_or_path")
@@ -2723,15 +2769,39 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
-    # why: record LoRA module paths so reload recreates vision/projector LoRA
-    # layers (mlx-lm.load_adapters only knows the language tower).
+    # why: record LoRA module paths and parameters so reload recreates the same
+    # adapter topology. Without scale metadata, reload falls back to scale=1.0
+    # even when training used alpha/r > 1, changing post-reload logits.
     try:
         lora_paths = []
+        lora_rank = None
+        lora_scale = None
+        lora_dropout = None
         for name, module in model.named_modules():
             if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
                 lora_paths.append(name)
-        if lora_paths:
+                if lora_rank is None:
+                    lora_rank = _infer_mlx_lora_rank(module)
+                    lora_scale = float(getattr(module, "scale", 1.0))
+                    lora_dropout = _get_mlx_dropout_probability(
+                        getattr(module, "dropout", None)
+                    )
+        if lora_paths and "unsloth_mlx_lora_module_paths" not in adapter_config:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
+        if lora_rank is not None:
+            lora_parameters = dict(adapter_config.get("lora_parameters") or {})
+            inferred_lora_parameters = {
+                "rank": lora_rank,
+                "scale": lora_scale,
+                "dropout": lora_dropout,
+            }
+            for key, value in inferred_lora_parameters.items():
+                lora_parameters[key] = value
+            adapter_config["lora_parameters"] = lora_parameters
+            adapter_config["rank"] = lora_parameters["rank"]
+            adapter_config["scale"] = lora_parameters["scale"]
+            adapter_config["dropout"] = lora_parameters["dropout"]
+            adapter_config.setdefault("peft_type", "LORA")
     except Exception:
         pass
     return adapter_config
