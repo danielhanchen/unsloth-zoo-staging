@@ -115,6 +115,24 @@ def _apply_softcap(logits: mx.array, logit_softcap: float) -> mx.array:
     return softcap * mx.tanh(logits / softcap)
 
 
+def _target_validity_masks(
+    targets: mx.array,
+    vocab_size: int,
+    ignore_index: int,
+) -> tuple[mx.array, mx.array]:
+    in_vocab = (targets >= 0) & (targets < vocab_size)
+    not_ignored = targets != ignore_index
+    return not_ignored & in_vocab, not_ignored & ~in_vocab
+
+
+def _poison_invalid_targets(values: mx.array, invalid: mx.array) -> mx.array:
+    return mx.where(
+        invalid,
+        mx.full(values.shape, float("nan"), dtype=values.dtype),
+        values,
+    )
+
+
 def _chunk_matmul(
     x: mx.array,
     weight: mx.array,
@@ -464,6 +482,9 @@ def _forward_chunked_fused_finalize(
 
     n, _ = hidden_compute.shape
     vocab_size = weight_compute.shape[0]
+    if n == 0:
+        empty = mx.zeros((0,), dtype=mx.float32)
+        return empty, empty
     compute_bytes = 2 if hidden_compute.dtype in (mx.float16, mx.bfloat16) else 4
     chunk_size = _resolve_chunk_size(
         chunk_size,
@@ -506,8 +527,10 @@ def _forward_chunked_fused_finalize(
             target_logit = mx.where(in_chunk, chunk_target, target_logit)
 
         lse = running_max + mx.log(running_sum_exp + 1e-9)
-        valid = targets != ignore_index
+        valid, invalid = _target_validity_masks(targets, vocab_size, ignore_index)
         loss = mx.where(valid, lse - target_logit, mx.zeros_like(lse))
+        loss = _poison_invalid_targets(loss, invalid)
+        lse = _poison_invalid_targets(lse, invalid)
         return loss, lse
 
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
@@ -548,6 +571,9 @@ def _forward_chunked_fused_finalize(
                 grid=(n * 256, 1, 1),
                 threadgroup=(256, 1, 1),
             )
+            _, invalid = _target_validity_masks(targets, vocab_size, ignore_index)
+            loss = _poison_invalid_targets(loss, invalid)
+            lse = _poison_invalid_targets(lse, invalid)
             return loss, lse
 
         running_max, running_sum_exp, target_logit = forward_update_kernel(
@@ -680,6 +706,14 @@ def make_runtime_cce_loss_fused_finalize(
             hidden_compute = hidden
             weight_compute = weight
             targets32 = targets.astype(mx.int32)
+            if hidden_compute.shape[0] == 0:
+                return (
+                    mx.zeros_like(hidden),
+                    mx.zeros_like(weight),
+                    mx.zeros_like(scales),
+                    mx.zeros_like(biases),
+                    mx.zeros_like(targets),
+                )
             if grad_output is None:
                 grad_output = mx.zeros_like(outputs[0])
             grad_output32 = grad_output.astype(mx.float32)
@@ -805,6 +839,8 @@ def make_runtime_cce_loss_fused_finalize(
         hidden_compute = hidden
         weight_compute = weight
         targets32 = targets.astype(mx.int32)
+        if hidden_compute.shape[0] == 0:
+            return mx.zeros_like(hidden), mx.zeros_like(weight), mx.zeros_like(targets)
         if grad_output is None:
             grad_output = mx.zeros_like(outputs[0])
         grad_output32 = grad_output.astype(mx.float32)
