@@ -271,6 +271,13 @@ def _build_forward_update_kernel() -> Callable:
     )
 
 
+# INVARIANT: this kernel emits finite lse_out and loss_out for every row,
+# including out-of-vocab targets (target < 0 or target >= vocab_size that
+# are not ignore_index). The kernel does not see vocab_size and cannot
+# classify invalid rows. Callers MUST apply _poison_invalid_targets(loss,
+# invalid) and _poison_invalid_targets(lse, invalid) immediately after
+# this kernel returns, before passing lse to the dlogits backward kernel.
+# Skipping the poison step produces finite wrong gradients silently.
 def _build_forward_update_finalize_kernel() -> Callable:
     source = """
         uint gid = thread_position_in_grid.x;
@@ -627,6 +634,10 @@ def _forward_chunked_fused_finalize(
     raise RuntimeError("Unreachable: fused finalize path did not return outputs.")
 
 
+# why: lse must arrive pre-poisoned with NaN for invalid-label rows
+# (targets outside [0, vocab_size) and not equal to ignore_index).
+# This function does not re-check vocab bounds; NaN propagation through
+# exp(capped - NaN) = NaN is what produces NaN gradients for those rows.
 def _fallback_dlogits(
     logits: mx.array,
     lse: mx.array,
