@@ -2554,8 +2554,25 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
             json.dump(adapter_config, f, indent=2)
 
 
+# mlx-lm uses lowercase pair; PEFT-style adapters may expose uppercase.
+_MLX_LORA_ATTR_PAIRS = (("lora_a", "lora_b"), ("lora_A", "lora_B"))
+
+
+def iter_mlx_lora_modules(model):
+    """Yield (module_name, module, a_attr, b_attr) for each complete LoRA module.
+
+    Skips half-built modules (only one side) to avoid producing adapter files
+    that cannot be reloaded.
+    """
+    for module_name, module in model.named_modules():
+        for a_attr, b_attr in _MLX_LORA_ATTR_PAIRS:
+            if hasattr(module, a_attr) and hasattr(module, b_attr):
+                yield module_name, module, a_attr, b_attr
+                break
+
+
 def collect_mlx_lora_adapter_tensors(model):
-    """Collect tensors for every module that exposes lora_a/lora_b.
+    """Collect tensors for every module exposing a complete LoRA attr pair.
 
     Anchors on the modules themselves, not a substring of the flattened
     parameter name, so unrelated paths containing 'lora_'
@@ -2565,11 +2582,10 @@ def collect_mlx_lora_adapter_tensors(model):
     """
     parameters = dict(mlx.utils.tree_flatten(model.parameters()))
     adapter_keys = set()
-    for module_name, module in model.named_modules():
-        for attr in ("lora_a", "lora_b", "lora_A", "lora_B"):
-            if hasattr(module, attr):
-                key = f"{module_name}.{attr}" if module_name else attr
-                adapter_keys.add(key)
+    for module_name, _module, a_attr, b_attr in iter_mlx_lora_modules(model):
+        prefix = f"{module_name}." if module_name else ""
+        adapter_keys.add(f"{prefix}{a_attr}")
+        adapter_keys.add(f"{prefix}{b_attr}")
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
 
@@ -2712,9 +2728,14 @@ def _get_mlx_dropout_probability(drop):
     return 0.0
 
 
-def _infer_mlx_lora_rank(module):
-    lora_a = getattr(module, "lora_a", None)
-    lora_b = getattr(module, "lora_b", None)
+def _infer_mlx_lora_rank(module, a_attr="lora_a", b_attr="lora_b"):
+    # accept uppercase pair (lora_A / lora_B) for PEFT-style adapters too.
+    lora_a = getattr(module, a_attr, None)
+    if lora_a is None and a_attr == "lora_a":
+        lora_a = getattr(module, "lora_A", None)
+    lora_b = getattr(module, b_attr, None)
+    if lora_b is None and b_attr == "lora_b":
+        lora_b = getattr(module, "lora_B", None)
     lora_a_shape = tuple(lora_a.shape) if lora_a is not None and hasattr(lora_a, "shape") else ()
     lora_b_shape = tuple(lora_b.shape) if lora_b is not None and hasattr(lora_b, "shape") else ()
     # MoE/switch: lora_a (..., rank, in_dims); lora_b (..., out_dims, rank).
@@ -2811,27 +2832,28 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             else None
         )
 
+        # iter_mlx_lora_modules covers lowercase lora_a/lora_b and uppercase
+        # lora_A/lora_B pairs so PEFT-style adapters get the same metadata.
         lora_paths = []
         lora_rank = None
         lora_scale = None
         lora_dropout = None
-        for name, module in model.named_modules():
-            if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
-                lora_paths.append(name)
-                inferred_rank = _infer_mlx_lora_rank(module)
-                if inferred_rank is None:
-                    continue
-                # only infer rank/scale/dropout from modules the caller
-                # actually selected; otherwise an earlier unrelated LoRA
-                # would write the wrong language-tower params.
-                if explicit_path_set is not None and name not in explicit_path_set:
-                    continue
-                if lora_rank is None:
-                    lora_rank = inferred_rank
-                    lora_scale = float(getattr(module, "scale", 1.0))
-                    lora_dropout = _get_mlx_dropout_probability(
-                        getattr(module, "dropout", None)
-                    )
+        for name, module, _a_attr, _b_attr in iter_mlx_lora_modules(model):
+            lora_paths.append(name)
+            inferred_rank = _infer_mlx_lora_rank(module)
+            if inferred_rank is None:
+                continue
+            # only infer rank/scale/dropout from modules the caller
+            # actually selected; otherwise an earlier unrelated LoRA
+            # would write the wrong language-tower params.
+            if explicit_path_set is not None and name not in explicit_path_set:
+                continue
+            if lora_rank is None:
+                lora_rank = inferred_rank
+                lora_scale = float(getattr(module, "scale", 1.0))
+                lora_dropout = _get_mlx_dropout_probability(
+                    getattr(module, "dropout", None)
+                )
 
         # only auto-fill when caller did not supply the key at all.
         if lora_paths and "unsloth_mlx_lora_module_paths" not in adapter_config:
