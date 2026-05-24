@@ -1454,21 +1454,16 @@ class MLXTrainer:
                 ),
             }
 
-            # Mixed fine-tunes (embeddings / projector / vision trained
-            # alongside LoRA) route through the trainable-tree writer so the
-            # extra tensors land in the artifact; pure LoRA stays lean.
-            trainable = dict(tree_flatten(self.model.trainable_parameters()))
-            adapter_keys = set(adapter_tensors)
-            has_trainable_non_lora = bool(set(trainable) - adapter_keys)
-
-            if has_trainable_non_lora:
-                save_trainable_adapters(
-                    self.model, output_dir, adapter_config=adapter_config,
-                )
-            else:
-                save_lora_adapters(
-                    self.model, output_dir, adapter_config=adapter_config,
-                )
+            # save_model() must always produce a clean LoRA-only artifact
+            # that mlx-lm.load_adapters() can reload; routing through
+            # save_trainable_adapters here would leak base tensors that get
+            # accidentally marked trainable after a checkpoint reload.
+            # Mixed LoRA + embedding / projector / vision trainables are
+            # already preserved in the in-loop save_trainable_adapters()
+            # checkpoints, and callers can also invoke that helper directly.
+            save_lora_adapters(
+                self.model, output_dir, adapter_config=adapter_config,
+            )
             # why: VLM processors include the inner tokenizer; double-save
             # rewrites the same files. Skip when the processor will cover it.
             _processor = self.processor or getattr(self.model, "_processor", None)
