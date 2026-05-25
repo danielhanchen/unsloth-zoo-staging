@@ -1517,6 +1517,12 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                 batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
             else:
                 batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
+                # The raw-ids carrier captured pre-expansion ids in
+                # _to_mx_vlm_batch and is now stale relative to the expanded
+                # sequence. Drop it so the labels-free loss paths fall back
+                # to the freshly expanded input_ids instead of misaligning
+                # targets against the longer hidden-state sequence.
+                batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
 
     if model_type in {"phi4-siglip", "phi4_siglip"}:
         input_ids = batch_dict.get("input_ids")
@@ -1557,6 +1563,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
+                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
 
     if model_type == "phi4mm":
         input_ids = batch_dict.get("input_ids")
@@ -1629,6 +1636,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
+                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
 
     return batch_dict
 
