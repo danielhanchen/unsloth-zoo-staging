@@ -1378,12 +1378,47 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
             lora_cls, module,
             _metadata["rank"], _metadata["scale"], _metadata["dropout"],
         )
-        parent_path, _, leaf = name.rpartition(".")
-        parent = by_name.get(parent_path) if parent_path else model
-        if parent is None or not hasattr(parent, leaf):
+        # Some VLM trees (e.g. Qwen2.5-VL's vision merger / projector
+        # `layers` list) install LoRA at a numeric path segment such as
+        # `vision_tower.merger.layers.0`. `by_name.get(parent_path)` is
+        # None for those because `named_modules()` does not emit list
+        # containers themselves, and a bare `setattr(parent, "0", ...)`
+        # silently no-ops because `hasattr(parent, "0")` is False;
+        # `load_weights(strict=False)` would then drop the saved
+        # `...layers.0.lora_{a,b}` tensors with no warning. Mirror the
+        # navigation pattern from `_lora_walk_module`: walk segments
+        # trying `parent[int(seg)]` first then `getattr` for attribute
+        # access, and apply the same try-int / fallback-setattr to the
+        # leaf so list-indexed wrappers install correctly.
+        parts = name.split(".")
+        parent = model
+        parent_reachable = True
+        for seg in parts[:-1]:
+            try:
+                parent = parent[int(seg)]
+            except (ValueError, TypeError):
+                next_parent = getattr(parent, seg, None)
+                if next_parent is None:
+                    parent_reachable = False
+                    break
+                parent = next_parent
+            except (IndexError, KeyError):
+                parent_reachable = False
+                break
+        if not parent_reachable or parent is None:
             _skipped_paths.append((name, "parent_unreachable"))
             continue
-        setattr(parent, leaf, wrapped)
+        leaf = parts[-1]
+        try:
+            parent[int(leaf)] = wrapped
+        except (ValueError, TypeError):
+            if not hasattr(parent, leaf):
+                _skipped_paths.append((name, "parent_unreachable"))
+                continue
+            setattr(parent, leaf, wrapped)
+        except (IndexError, KeyError):
+            _skipped_paths.append((name, "parent_unreachable"))
+            continue
         attached += 1
 
     if _skipped_paths:
