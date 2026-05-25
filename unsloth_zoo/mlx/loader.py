@@ -3297,6 +3297,16 @@ class FastMLXModel:
                     e, (ValueError, ImportError, RuntimeError)
                 ):
                     raise
+                # Re-raise namespaced Unsloth MLX RuntimeErrors too so
+                # the inner-handler's intentional re-raise (e.g. the
+                # DoRA-unavailable signal from _apply_lora_at_paths)
+                # is not swallowed back into the silent standard-load
+                # fallback below. Without this the DoRA adapter would
+                # silently drop and the user would get a base-only
+                # model with no warning that fine_tune_type='dora'
+                # was unsupported.
+                if isinstance(e, RuntimeError) and "Unsloth MLX:" in str(e):
+                    raise
                 print(f"Unsloth: LoRA adapter detection failed ({e}), falling back to standard load.")
 
         model_type = config_data.get("model_type", "")
