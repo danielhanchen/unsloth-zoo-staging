@@ -2824,6 +2824,14 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
     ".scales",
     ".biases",
     ".linear.weight",
+    # `.linear.bias` is the wrapped base bias of an mlx-lm `LoRALinear`
+    # whose inner `nn.Linear` was constructed with bias=True; without it
+    # `q_proj.linear.bias` / `lm_head.linear.bias` leak into adapter
+    # saves and `_is_lm_head_trainable()` reports True for adapter-only
+    # training. NOTE: a bare `.bias` is NOT in this list because
+    # `q_proj.bias` at the LoRA-module level is user-trained bias state
+    # that the existing filter intentionally preserves.
+    ".linear.bias",
     ".linear.scales",
     ".linear.biases",
     # LoRAEmbedding / DoRAEmbedding wraps an inner nn.Embedding at
@@ -2848,7 +2856,9 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
 # adapters.
 _ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
     "weight", "scales", "biases",
-    "linear.weight", "linear.scales", "linear.biases",
+    # Cover the wrapped inner bias for a root-level LoRALinear / DoRALinear
+    # the same way `.linear.bias` is filtered for non-root wrappers above.
+    "linear.weight", "linear.bias", "linear.scales", "linear.biases",
     "embedding.weight", "embedding.scales", "embedding.biases",
 })
 
@@ -3250,7 +3260,16 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         for _, module in iter_mlx_lora_modules(model)
     )
     if has_lora_modules or declared_lora_artifact:
-        if "lora_parameters" not in adapter_config:
+        # When the caller pinned `unsloth_mlx_lora_module_paths`, defer to
+        # the path-filtered walker below; `_extract_mlx_lora_parameters`
+        # reads `lora_a.shape[-1]` off the first LoRA module unconditionally,
+        # which would borrow rank from an unselected (or inconsistently-
+        # shaped) module before the explicit-filter path could reject it.
+        _has_explicit_paths_hint = "unsloth_mlx_lora_module_paths" in adapter_config
+        if (
+            "lora_parameters" not in adapter_config
+            and not _has_explicit_paths_hint
+        ):
             rank, scale, dropout = _extract_mlx_lora_parameters(model)
             adapter_config["lora_parameters"] = {
                 "rank": rank,
@@ -3263,10 +3282,11 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         # dict) cannot contradict the canonical values in
         # `lora_parameters`. Previously only absent keys were backfilled,
         # which let stale `rank=99` shadow the real `lora_parameters.rank=4`.
-        lora_parameters = adapter_config["lora_parameters"]
-        for key in ("rank", "scale", "dropout"):
-            if key in lora_parameters:
-                adapter_config[key] = lora_parameters[key]
+        if "lora_parameters" in adapter_config:
+            lora_parameters = adapter_config["lora_parameters"]
+            for key in ("rank", "scale", "dropout"):
+                if key in lora_parameters:
+                    adapter_config[key] = lora_parameters[key]
         # mlx-lm.load_adapters() reads num_layers off the adapter config to
         # decide how many transformer layers to wrap. Trainer.save_model
         # fills this in directly; backfill it here too so save_pretrained_merged
