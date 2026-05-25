@@ -2618,10 +2618,15 @@ def collect_mlx_lora_adapter_tensors(model):
     """
     parameters = dict(mlx.utils.tree_flatten(model.parameters()))
     adapter_keys = set()
-    for module_name, _ in iter_mlx_lora_modules(model):
+    for module_name, module in iter_mlx_lora_modules(model):
         prefix = f"{module_name}." if module_name else ""
         adapter_keys.add(f"{prefix}lora_a")
         adapter_keys.add(f"{prefix}lora_b")
+        # mlx-lm DoRA exposes lora_a / lora_b plus a trained magnitude
+        # vector m; include it when present so DoRA reload keeps the
+        # learned magnitudes.
+        if hasattr(module, "m"):
+            adapter_keys.add(f"{prefix}m")
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
 
@@ -2895,18 +2900,22 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
-    # mlx-lm.load_adapters() reads num_layers + fine_tune_type off the
-    # adapter config to wrap the right transformer layers. Trainer.save_model
-    # fills these in directly; backfill them here too so the public
-    # save_pretrained_merged path produces a loadable artifact.
-    if "num_layers" not in adapter_config:
-        try:
-            layers = _get_transformer_layers(model)
-            adapter_config["num_layers"] = len(layers) if layers else -1
-        except Exception:
-            adapter_config["num_layers"] = -1
-    adapter_config.setdefault("fine_tune_type", "lora")
-    adapter_config.setdefault("peft_type", "LORA")
+    # LoRA-flavoured fields must only land in adapter_config when the model
+    # actually carries LoRA modules (or the caller already declared a
+    # lora / dora artifact). Stamping fine_tune_type='lora' on a full
+    # fine-tune checkpoint causes mlx-lm.load_adapters() to inject LoRA
+    # wrappers before binding the saved full-precision weights.
+    has_lora_modules = any(True for _ in iter_mlx_lora_modules(model))
+    declared_lora_artifact = adapter_config.get("fine_tune_type") in {"lora", "dora"}
+    if has_lora_modules or declared_lora_artifact:
+        if "num_layers" not in adapter_config:
+            try:
+                layers = _get_transformer_layers(model)
+                adapter_config["num_layers"] = len(layers) if layers else -1
+            except Exception:
+                adapter_config["num_layers"] = -1
+        adapter_config.setdefault("fine_tune_type", "lora")
+        adapter_config.setdefault("peft_type", "LORA")
 
     # why: persist module paths + rank/scale/dropout so reload reproduces logits;
     # missing scale silently defaults to 1.0 even when training used alpha/r > 1.
@@ -3122,19 +3131,31 @@ def save_pretrained_merged(
         )
 
     if method == "lora":
-        # save_method='lora' must always produce a clean LoRA-only artifact
-        # that mlx-lm.load_adapters() can reload. Routing through
-        # save_trainable_adapters here would leak base tensors that get
-        # accidentally marked trainable after a checkpoint reload.
-        # Callers that intentionally save mixed LoRA + embedding /
-        # projector / vision trainables should call save_trainable_adapters
-        # directly.
-        if not collect_mlx_lora_adapter_tensors(model):
+        adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+        if not adapter_tensors:
             raise ValueError(
                 "Unsloth: save_method='lora' but the model has no LoRA "
                 "layers — there's nothing to save. Use 'merged_16bit' instead."
             )
-        save_lora_adapters(model, save_directory)
+        # Preserve intentionally trainable non-LoRA tensors (embeddings,
+        # lm_head, projector, vision, norm) that live OUTSIDE any
+        # LoRA-wrapped module. Base weights INSIDE a LoRA module are
+        # excluded so a reload-trainable q_proj.weight under a wrapped
+        # q_proj cannot leak back through the public save path.
+        trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+        adapter_keys = set(adapter_tensors)
+        lora_module_prefixes = tuple(
+            f"{name}." for name, _ in iter_mlx_lora_modules(model) if name
+        )
+        has_external_non_lora_trainable = any(
+            key not in adapter_keys
+            and not any(key.startswith(p) for p in lora_module_prefixes)
+            for key in trainable
+        )
+        if has_external_non_lora_trainable:
+            save_trainable_adapters(model, save_directory)
+        else:
+            save_lora_adapters(model, save_directory)
         try:
             tokenizer.save_pretrained(str(save_directory))
         except Exception:
@@ -3148,10 +3169,32 @@ def save_pretrained_merged(
         )
 
     if push_to_hub:
-        push_to_hub_merged(
-            model, tokenizer, save_directory,
-            token=token, private=private, tags=tags,
-        )
+        if method == "lora":
+            # Upload the LoRA adapter directory verbatim instead of routing
+            # through push_to_hub_merged, which would re-save a full merged
+            # model on top of the adapter-only artifact we just wrote.
+            from pathlib import Path
+            from huggingface_hub import HfApi
+
+            repo_id = Path(save_directory).name
+            api = HfApi(token=token)
+            api.create_repo(
+                repo_id=repo_id,
+                private=bool(private) if private is not None else False,
+                exist_ok=True,
+            )
+            api.upload_folder(
+                folder_path=str(save_directory),
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message="Upload LoRA adapters trained with Unsloth",
+            )
+            print(f"Unsloth: Pushed LoRA adapters to https://huggingface.co/{repo_id}")
+        else:
+            push_to_hub_merged(
+                model, tokenizer, save_directory,
+                token=token, private=private, tags=tags,
+            )
 
 
 def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
