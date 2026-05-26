@@ -2983,6 +2983,7 @@ class FastMLXModel:
             )
 
         adapter_cfg_path = os.path.join(local_path, "adapter_config.json") if local_path else None
+        adapter_cfg = None
         if adapter_cfg_path and os.path.exists(adapter_cfg_path):
             try:
                 with open(adapter_cfg_path, "r") as f:
@@ -3334,14 +3335,30 @@ class FastMLXModel:
                     raise
                 # Re-raise namespaced Unsloth MLX RuntimeErrors too so
                 # the inner-handler's intentional re-raise (e.g. the
-                # DoRA-unavailable signal from _apply_lora_at_paths)
-                # is not swallowed back into the silent standard-load
-                # fallback below. Without this the DoRA adapter would
-                # silently drop and the user would get a base-only
-                # model with no warning that fine_tune_type='dora'
-                # was unsupported.
+                # DoRA-unavailable signal from _apply_lora_at_paths) is
+                # not swallowed back into the silent standard-load
+                # fallback below.
                 if isinstance(e, RuntimeError) and "Unsloth MLX:" in str(e):
                     raise
+                # If adapter_config.json itself declared a LoRA/DoRA
+                # adapter, refuse to fall back to a base model load.
+                # Otherwise an ordinary exception (e.g. AttributeError on
+                # a malformed lora_parameters block, JSON shape drift,
+                # etc.) silently returns a model without adapter weights.
+                _is_lora_adapter = False
+                if isinstance(adapter_cfg, dict):
+                    _peft_type = str(adapter_cfg.get("peft_type", "")).upper()
+                    _ft_type = str(adapter_cfg.get("fine_tune_type", "")).lower()
+                    _is_lora_adapter = (
+                        _peft_type == "LORA"
+                        or _ft_type in {"lora", "dora"}
+                    )
+                if _is_lora_adapter:
+                    raise RuntimeError(
+                        "Unsloth MLX: failed to load the LoRA adapter declared "
+                        f"in adapter_config.json ({type(e).__name__}: {e}); "
+                        "refusing to silently fall back to a base model load."
+                    ) from e
                 print(f"Unsloth: LoRA adapter detection failed ({e}), falling back to standard load.")
 
         model_type = config_data.get("model_type", "")
