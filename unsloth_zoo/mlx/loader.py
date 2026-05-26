@@ -3129,6 +3129,25 @@ class FastMLXModel:
                     adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
                     _load_adapters_ok = False
                     _load_adapters_exc = None
+                    # Pre-validate DoRA capability before either reload path.
+                    # When _saved_lora_paths is empty, _apply_lora_at_paths
+                    # is essentially a no-op and load_adapters() rebuilds
+                    # plain LoRA wrappers, silently dropping saved DoRA `.m`
+                    # tensors via the strict=False reload. Mirror the
+                    # _apply_lora_at_paths DoRA guard so the user gets the
+                    # namespaced "install a DoRA-capable mlx-lm" error
+                    # regardless of whether the adapter saved module paths.
+                    if adapter_cfg.get("fine_tune_type") == "dora":
+                        try:
+                            import mlx_lm.tuner.dora  # noqa: F401
+                        except Exception as _dora_exc:
+                            raise RuntimeError(
+                                "Unsloth MLX: adapter_config declares "
+                                "fine_tune_type='dora' but mlx_lm.tuner.dora "
+                                "is unavailable; install a DoRA-capable "
+                                "mlx-lm or convert the adapter to plain "
+                                "LoRA before reload."
+                            ) from _dora_exc
                     try:
                         model = load_adapters(model, local_path)
                         _load_adapters_ok = True
