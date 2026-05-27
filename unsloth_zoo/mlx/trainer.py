@@ -276,7 +276,7 @@ class MLXTrainer:
         """
         trainable = dict(tree_flatten(model.trainable_parameters()))
         if not trainable:
-            return  # why safe: nothing trainable means nothing to suspect-freeze; also avoids requiring model.parameters() on stub models.
+            return  # safe: nothing trainable, and stub models may lack model.parameters().
         adapter_tensors = collect_mlx_lora_adapter_tensors(model)
         has_lora = any(name in trainable for name in adapter_tensors)
         if not has_lora:
@@ -779,14 +779,12 @@ class MLXTrainer:
             optimizer.update to promote params/m/v to fp32 too.
             """
             scale = mx.array(1.0, dtype=mx.float32) / safe_toks_f
-            # anchor on the parameter suffix so unrelated keys whose path
-            # merely contains "lora_b" (e.g. a routing layer literally named
-            # lora_b_router.weight) do not receive the LoRA+ multiplier.
+            # Suffix-anchor so a routing layer named lora_b_router.weight
+            # does not pick up the LoRA+ multiplier.
             if use_lora_plus and (name == "lora_b" or name.endswith(".lora_b")):
                 scale = scale * lora_plus_ratio
-            # Anchor on the path segment so unrelated names with these
-            # substrings (e.g. decoder.not_lm_head_router.weight or
-            # foo.embed_tokens_aux.weight) do not pick up the embedding LR.
+            # Segment-anchor so names like decoder.not_lm_head_router.weight
+            # do not pick up the embedding LR.
             if use_embedding_lr:
                 _segments = name.split(".")
                 _is_embed_or_lm_head = (
@@ -1420,21 +1418,18 @@ class MLXTrainer:
             hf_repo = getattr(self.model, "_hf_repo", None) or ""
 
 
-            # Infer rank/scale/dropout from the first reloadable LoRA module.
-            # Leave as None on failure so we never persist placeholder values
-            # (rank=8, scale=1.0, dropout=0.0) that silently mis-scale the
-            # adapter on reload; _enrich_mlx_adapter_config gets another shot
-            # at filling these in from the live module tree.
+            # Infer rank/scale/dropout from the first reloadable module.
+            # Leave None on failure so we never persist placeholders that
+            # mis-scale the adapter; _enrich_mlx_adapter_config gets a
+            # second shot at filling these in.
             _lora_rank = _lora_scale = _lora_dropout = None
             for _, m in iter_mlx_lora_modules(self.model):
                 inferred_rank = _infer_mlx_lora_rank(m)
                 if inferred_rank is None:
                     continue
                 _lora_rank = inferred_rank
-                # _coerce_mlx_lora_scale handles 0-D scalars AND LoRASwitchLinear's
-                # per-expert mx.array (where float()/.item() both raise). Reading
-                # the first broadcast value preserves the actual alpha/r instead
-                # of overwriting it with a silent placeholder 1.0.
+                # _coerce_mlx_lora_scale handles LoRASwitchLinear's per-expert
+                # mx.array where raw float()/.item() raise.
                 _lora_scale = _coerce_mlx_lora_scale(getattr(m, "scale", 1.0))
                 _lora_dropout = _get_mlx_dropout_probability(
                     getattr(m, "dropout", None)
@@ -1443,15 +1438,9 @@ class MLXTrainer:
 
             from .utils import _get_transformer_layers
             layers = _get_transformer_layers(self.model)
-            # mlx-lm's load_adapters() does `config.num_layers` (attr
-            # access on a SimpleNamespace built from adapter_config.json),
-            # so the key MUST be present or reload raises AttributeError.
-            # Pre-PR wrote -1 as the legacy "all layers" sentinel; keep
-            # that as the fallback when we can't detect a layer count so
-            # reload still works, even though some downstream variants
-            # of load_adapters treat `range(-1)` as "no layers". A clean
-            # positive count from `_get_transformer_layers()` is always
-            # preferred.
+            # mlx-lm.load_adapters() attr-accesses config.num_layers, so
+            # the key MUST be present. -1 is the legacy "all layers"
+            # sentinel for the no-detect case.
             try:
                 _num_layers = len(layers) if layers is not None else -1
             except TypeError:
@@ -1477,10 +1466,8 @@ class MLXTrainer:
                     self.model, "_unsloth_quantized_source", None,
                 ),
             }
-            # Always present so mlx-lm load_adapters() can attr-access it.
-            # PR #679 R15 restored writing -1 as the legacy "all layers"
-            # sentinel when layer detection fails; omitting raised
-            # AttributeError on reload.
+            # Always emit num_layers so mlx-lm.load_adapters() can attr-access
+            # it; -1 is the legacy "all layers" sentinel fallback.
             adapter_config["num_layers"] = _num_layers
             if _lora_rank is not None:
                 adapter_config["lora_parameters"] = {
@@ -1488,30 +1475,22 @@ class MLXTrainer:
                     "scale": _lora_scale,
                     "dropout": _lora_dropout,
                 }
-                # mlx-vlm reads these top-level keys instead of
-                # lora_parameters.{rank,scale,dropout}.
+                # mlx-vlm reads top-level rank/scale/dropout instead.
                 adapter_config["rank"] = _lora_rank
                 adapter_config["scale"] = _lora_scale
                 adapter_config["dropout"] = _lora_dropout
 
-            # Preserve intentionally trained non-LoRA tensors (embeddings,
-            # lm_head, projector, vision, norm) when they live OUTSIDE any
-            # LoRA-wrapped module, while still dropping accidentally trainable
-            # base weights INSIDE a LoRA module (q_proj.weight under a
-            # LoRA-wrapped q_proj would re-leak the original Studio reload
-            # bug). When the only non-LoRA trainables sit under a LoRA
-            # module, the artifact stays lean and LoRA-only.
+            # Preserve intentionally trained non-LoRA tensors OUTSIDE any
+            # LoRA module; drop wrapped base weights INSIDE one (else
+            # q_proj.weight under a LoRA-wrapped q_proj re-leaks the
+            # original Studio reload bug). Uses the shared filter so this
+            # matches save_trainable_adapters / save_pretrained_merged.
             trainable = dict(tree_flatten(self.model.trainable_parameters()))
             adapter_keys = set(adapter_tensors)
             lora_module_prefixes = tuple(
                 f"{name}." for name, _ in iter_mlx_lora_modules(self.model)
                 if name
             )
-            # Route via the shared filter in utils so the routing here
-            # stays in lockstep with save_trainable_adapters/save_pretrained_merged.
-            # That filter drops wrapped base `.weight`/`.scales`/`.biases`
-            # under LoRA prefixes as reload-leaks but preserves
-            # intentional trainables like `.bias`.
             from .utils import _is_base_tensor_inside_lora_module
             has_root_lora_module = any(
                 name == "" for name, _ in iter_mlx_lora_modules(self.model)

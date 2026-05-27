@@ -120,14 +120,10 @@ def _target_validity_masks(
     vocab_size: int,
     ignore_index: int,
 ) -> tuple[mx.array, mx.array]:
-    # Validate unsigned-integer labels through a signed dtype before any
-    # comparisons. Direct `targets >= 0` on uint16/uint32/uint64 crashes
-    # the torch-backed MLX simulation kernel ("ge_cpu" not implemented for
-    # UInt32 / UInt64). Casting to int64 keeps wide-int wraparound (e.g.
-    # 2**32-100 under uint32) classified as out-of-vocab rather than
-    # silently crashing the validity step itself. On real Apple-Metal MLX
-    # this is a defensive no-op cost; on the simulation path it preserves
-    # the PR's "validate before narrow" contract for wide invalid labels.
+    # Validate through a signed dtype: `targets >= 0` on uint16/32/64 crashes
+    # the torch-backed shim ("ge_cpu" not implemented for UInt*). int64 also
+    # keeps wide-int wraparound (e.g. uint32 2**32-100) classified as
+    # out-of-vocab instead of crashing validation itself.
     _unsigned_safe_to_i64 = tuple(
         dtype for dtype in (
             getattr(mx, "uint8", None),
@@ -138,17 +134,11 @@ def _target_validity_masks(
     )
     _uint64_dtype = getattr(mx, "uint64", None)
     if _uint64_dtype is not None and targets.dtype == _uint64_dtype:
-        # Avoid float-based validation here. MLX float64 arrays are
-        # CPU-only per the public docs (would break real Metal); float32
-        # cannot exactly represent labels above 2**24, so labels near
-        # vocab boundaries above that get misclassified. Validate
-        # through signed int64 instead: any uint64 value that does not
-        # fit in int64 wraps negative on cast, which `< 0` cleanly
-        # routes to the overflow sentinel before the in-vocab check.
-        # An overflowed uint64 such as 2**64-100 is an invalid
-        # out-of-range unsigned label, NOT an intentionally encoded
-        # ignore_index. Route it to the sentinel so runtime CCE
-        # NaN-poisons the row instead of silently ignoring it.
+        # float32 cannot represent labels above 2**24 and float64 is CPU-only,
+        # so validate through signed int64: uint64 values >= 2**63 wrap
+        # negative on cast and `< 0` routes them to the 1<<62 sentinel before
+        # the in-vocab check. An overflowed uint64 like 2**64-100 must reach
+        # the sentinel (NaN-poison the row), not collide with ignore_index.
         targets_i64 = targets.astype(mx.int64)
         overflow = targets_i64 < 0
         invalid_sentinel = mx.array(1 << 62, dtype=mx.int64)
@@ -172,9 +162,8 @@ def _target_validity_masks(
 
 
 def _poison_invalid_targets(values: mx.array, invalid: mx.array) -> mx.array:
-    # mx.full produces a real tensor; a 0-d scalar gets baked into the
-    # Metal kernel as the literal token `nan` which the Metal C++
-    # tokenizer rejects (use of undeclared identifier 'nan').
+    # mx.full (not a 0-d scalar): Metal C++ rejects the literal token `nan`
+    # that a scalar would get baked into the kernel as.
     return mx.where(
         invalid,
         mx.full(values.shape, float("nan"), dtype=values.dtype),
@@ -317,13 +306,10 @@ def _build_forward_update_kernel() -> Callable:
     )
 
 
-# INVARIANT: this kernel emits finite lse_out and loss_out for every row,
-# including out-of-vocab targets (target < 0 or target >= vocab_size that
-# are not ignore_index). The kernel does not see vocab_size and cannot
-# classify invalid rows. Callers MUST apply _poison_invalid_targets(loss,
-# invalid) and _poison_invalid_targets(lse, invalid) immediately after
-# this kernel returns, before passing lse to the dlogits backward kernel.
-# Skipping the poison step produces finite wrong gradients silently.
+# INVARIANT: this kernel emits finite lse_out / loss_out for every row
+# (it has no vocab_size to classify out-of-vocab targets). Callers MUST
+# call _poison_invalid_targets on both loss and lse before passing lse to
+# the dlogits backward, or invalid rows silently produce finite wrong grads.
 def _build_forward_update_finalize_kernel() -> Callable:
     source = """
         uint gid = thread_position_in_grid.x;
@@ -467,13 +453,11 @@ def _build_dlogits_kernel() -> Callable:
             uint col = elem % chunk_v;
             int target = targets[row];
 
-            // invalid-label rows arrive with lse[row]=NaN from
-            // _poison_invalid_targets. fast::exp() is not IEEE-754 strict
-            // (MSL spec 6.5.1) so NaN propagation is not guaranteed; emit
-            // an explicit NaN gradient via 0/0 (Metal C++ rejects the
-            // literal token 'nan'). MUST run before the ignore_index check
-            // so wider invalid labels that wrap to ignore_index after the
-            // int32 narrow still emit NaN instead of a zero gradient.
+            // Invalid rows arrive with lse[row]=NaN. fast::exp() is not
+            // IEEE-754 strict (MSL 6.5.1) so emit NaN explicitly via 0/0
+            // (Metal C++ rejects literal `nan`). MUST run before the
+            // ignore_index check so wider invalids that wrap to ignore_index
+            // after the int32 narrow still NaN instead of zero.
             if (isnan(lse[row])) {
                 d_logits[elem] = 0.0f / 0.0f;
                 continue;
@@ -547,28 +531,24 @@ def _forward_chunked_fused_finalize(
 ) -> tuple[mx.array, mx.array]:
     hidden_compute = hidden
     weight_compute = weight
-    # Validate the original dtype first so wider ints (int64/uint32) cannot
-    # silently wrap into a valid class id or ignore_index after narrowing.
+    # Keep the original dtype so validity can be computed before the int32
+    # narrow wraps wide ints into valid class ids or ignore_index.
     targets_raw = targets
 
     n, _ = hidden_compute.shape
     vocab_size = weight_compute.shape[0]
-    # targets must be a flat 1D vector; rank-2 inputs like (n, 1) would slip
-    # past the length check and explode later inside kernels.
     if len(targets_raw.shape) != 1:
         raise ValueError(
             "MLX CCE: targets must be a flat 1D vector "
             f"(hidden.shape={hidden_compute.shape}, targets.shape={targets_raw.shape})."
         )
     if n == 0:
-        # surface upstream shape mismatch instead of silently dropping labels.
         if targets_raw.shape[0] != 0:
             raise ValueError(
                 "MLX CCE: hidden has 0 tokens but targets is non-empty "
                 f"(targets.shape={targets_raw.shape})."
             )
-        # Separate allocations so downstream VJP / in-place views cannot
-        # alias loss into lse.
+        # Separate allocations so the VJP cannot alias loss into lse.
         return (
             mx.zeros((0,), dtype=mx.float32),
             mx.zeros((0,), dtype=mx.float32),
@@ -578,8 +558,6 @@ def _forward_chunked_fused_finalize(
             "MLX CCE: targets length does not match hidden token count "
             f"(hidden.shape={hidden_compute.shape}, targets.shape={targets_raw.shape})."
         )
-    # Compute validity in the original dtype before narrowing to int32, then
-    # cast for the kernels and downstream indexing.
     valid_pre, invalid_pre = _target_validity_masks(
         targets_raw, vocab_size, ignore_index,
     )
@@ -693,10 +671,9 @@ def _forward_chunked_fused_finalize(
     raise RuntimeError("Unreachable: fused finalize path did not return outputs.")
 
 
-# why: lse must arrive pre-poisoned with NaN for invalid-label rows
-# (targets outside [0, vocab_size) and not equal to ignore_index).
-# This function does not re-check vocab bounds; NaN propagation through
-# exp(capped - NaN) = NaN is what produces NaN gradients for those rows.
+# lse MUST arrive pre-poisoned with NaN for invalid-label rows; this
+# function does not re-check vocab bounds and relies on NaN propagation
+# through exp(capped - NaN) to produce NaN gradients.
 def _fallback_dlogits(
     logits: mx.array,
     lse: mx.array,
@@ -724,10 +701,8 @@ def _fallback_dlogits(
         t = mx.tanh(logits / softcap)
         d_capped = d_capped * (1.0 - t * t)
 
-    # Invalid-label rows arrive with lse=NaN from _poison_invalid_targets;
-    # force their gradient to NaN before the ignore_index mask zeroes them
-    # out, otherwise a wider invalid label that narrows to ignore_index
-    # would silently emit zeros.
+    # NaN-poison invalid rows BEFORE the ignore_index mask zeroes them,
+    # so a wide invalid label that narrowed to ignore_index still emits NaN.
     invalid_lse = mx.isnan(lse)
     nan_grad = mx.full(d_capped.shape, float("nan"), dtype=d_capped.dtype)
     d_capped = mx.where(mx.expand_dims(invalid_lse, -1), nan_grad, d_capped)
