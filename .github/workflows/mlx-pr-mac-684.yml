@@ -84,5 +84,15 @@ jobs:
         run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
 
       - name: Regression breadth, full MLX suite on real Metal
+        # One pytest process per file: each module's _install_shim fixture
+        # assumes mlx is not yet imported, so shim-backed and real-mlx test
+        # files cannot share a process.
         continue-on-error: true
-        run: python -m pytest tests/test_mlx_*.py -v -rs --deselect tests/test_mlx_training_e2e_metal.py
+        run: |
+          FAIL=0
+          for f in tests/test_mlx_*.py; do
+            case "$f" in *training_e2e_metal*) continue;; esac
+            echo "=== $f ==="
+            python -m pytest "$f" -v -rs || FAIL=1
+          done
+          exit $FAIL
