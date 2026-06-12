@@ -83,6 +83,9 @@ jobs:
       - name: Real LoRA training e2e (must pass)
         run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
 
+      - name: Deep validation, resume/completion-only/epochs/SGD/VLM (must pass)
+        run: python -m pytest tests/test_mlx_pr684_full_validation_metal.py -v -rs
+
       - name: Regression breadth, full MLX suite on real Metal
         # One pytest process per file: each module's _install_shim fixture
         # assumes mlx is not yet imported, so shim-backed and real-mlx test
@@ -91,7 +94,7 @@ jobs:
         run: |
           FAIL=0
           for f in tests/test_mlx_*.py; do
-            case "$f" in *training_e2e_metal*) continue;; esac
+            case "$f" in *training_e2e_metal*|*full_validation_metal*) continue;; esac
             echo "=== $f ==="
             python -m pytest "$f" -v -rs || FAIL=1
           done
