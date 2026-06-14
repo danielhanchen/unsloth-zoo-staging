@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+
+# Throwaway staging benchmark: global-norm vs per-leaf-norm vs value grad
+# clipping on real Apple Silicon, across model sizes. Answers whether the
+# per-leaf default is justified on memory/time and whether it tracks global
+# max_grad_norm at all. macos-14 is M1 with ~7 GB, so model size tops out
+# around 1.5-3B in 4-bit for LoRA; truly large models need a real Mac.
+
+name: MLX grad-clip benchmark (macOS Apple Silicon)
+
+on:
+  push:
+    branches: [staging/mlx-pr-684]
+    paths:
+      - tests/bench_grad_clip_metal.py
+      - .github/workflows/mlx-grad-clip-bench.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  grad-clip-bench:
+    name: grad-clip benchmark on Apple Silicon
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Confirm runner is real Apple Silicon
+        run: |
+          python -c "
+          import platform
+          assert platform.system() == 'Darwin', platform.system()
+          assert platform.machine() == 'arm64', platform.machine()
+          print('OK: macOS arm64 confirmed')
+          "
+
+      - name: Install unsloth_zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
+          pip install -e .[mlx]
+          pip install safetensors
+
+      - name: Run grad-clip benchmark matrix
+        run: |
+          set +e
+          RESULTS=bench_results.jsonl
+          : > "$RESULTS"
+          MODELS="mlx-community/SmolLM-135M-Instruct-4bit mlx-community/Qwen2.5-0.5B-Instruct-4bit mlx-community/Qwen2.5-1.5B-Instruct-4bit mlx-community/Qwen2.5-3B-Instruct-4bit"
+          for M in $MODELS; do
+            for MODE in global_norm leaf_norm value; do
+              echo "=== $M / $MODE ==="
+              # Fresh process per (model, mode): peak memory is process-global.
+              OUT=$(python -u tests/bench_grad_clip_metal.py --model "$M" --mode "$MODE" --steps 30 --lr 5e-4 2>&1)
+              echo "$OUT" | tail -3
+              echo "$OUT" | grep '^BENCH_JSON ' | sed 's/^BENCH_JSON //' >> "$RESULTS" || echo "  (no result: likely OOM or load failure for $M/$MODE)"
+            done
+          done
+          echo "=== RAW RESULTS ==="
+          cat "$RESULTS"
+
+      - name: Summarize (memory / time / binding / loss divergence)
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, collections
+          rows = []
+          try:
+              for line in open("bench_results.jsonl"):
+                  line = line.strip()
+                  if line:
+                      rows.append(json.loads(line))
+          except FileNotFoundError:
+              pass
+          by_model = collections.defaultdict(dict)
+          for r in rows:
+              by_model[r["model"]][r["mode"]] = r
+          short = lambda m: m.split("/")[-1].replace("-Instruct-4bit","")
+          print(f"{'model':<16} {'mode':<11} {'peak_gb':>8} {'s/step':>7} {'loss0':>7} {'lossN':>7}")
+          print("-"*64)
+          for model, modes in by_model.items():
+              for mode in ("global_norm","leaf_norm","value"):
+                  r = modes.get(mode)
+                  if not r: continue
+                  print(f"{short(model):<16} {mode:<11} {r['steady_peak_gb']:>8.3f} "
+                        f"{r['sec_per_step']:>7.3f} {str(r['loss_first']):>7} {str(r['loss_last']):>7}")
+              g, l = modes.get("global_norm"), modes.get("leaf_norm")
+              if g and l:
+                  dmem = (l["steady_peak_gb"] - g["steady_peak_gb"])
+                  dt = (g["sec_per_step"] - l["sec_per_step"])
+                  gn = g.get("preclip_global_grad_norms") or []
+                  binds = sum(1 for x in gn if x > 1.0)
+                  print(f"  -> leaf saves {dmem*1000:.0f} MB peak, costs {dt:.3f}s/step less; "
+                        f"global clip bound on {binds}/{len(gn)} steps "
+                        f"(grad norm range {min(gn) if gn else 0:.1f}-{max(gn) if gn else 0:.1f})")
+              print()
+          print("NOTE: loss0/lossN identical across modes => clipping not binding (inconclusive).")
+          print("Divergent loss columns => global and per-leaf train differently.")
+          PY
