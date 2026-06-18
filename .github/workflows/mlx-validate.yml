@@ -32,7 +32,10 @@ jobs:
         run: |
           python -c "import unsloth_zoo.mlx.trainer; print('trainer OK')"
           python -c "import unsloth_zoo.mlx.utils; print('utils OK')"
-      - name: Non-metal parity suites (run against real mlx)
-        run: python -m pytest tests/test_mlx_trainer_internals.py tests/test_mlx_vlm_label_masks.py tests/test_pr684_review_fixes_a.py -v -rs
-      - name: Metal VJP + full validation suites
+      # Simulation suites (test_mlx_trainer_internals / test_mlx_vlm_label_masks /
+      # test_pr684_review_fixes_a) call simulate_mlx_on_torch(), which injects
+      # torch-backed MLX stubs into sys.modules and would poison a later real-mlx
+      # model load in the same process. They are validated separately on the Linux
+      # simulation harness; here we run only the real-Metal suites.
+      - name: Metal VJP + full validation suites (real Apple Silicon)
         run: python -m pytest tests/test_qwen35_vjp_metal.py tests/test_mlx_pr684_full_validation_metal.py -v -rs
