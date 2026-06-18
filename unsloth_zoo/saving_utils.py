@@ -1781,6 +1781,9 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
 
             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
             lora_stats = converted_lora_weights.get(lora_key, None)
+            # Gemma4 ClippableLinear (.linear.weight -> .weight), mirror the standard merge loop
+            if lora_stats is None and lora_key.endswith(".linear"):
+                lora_stats = converted_lora_weights.get(lora_key[: -len(".linear")], None)
 
             if W is not None and lora_stats is not None and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                 if not action_logged:
@@ -2578,19 +2581,24 @@ def merge_and_overwrite_lora(
 
 
     # Step 7: Check for errors
-    effective_loras = len(lora_weights)
-    # For tied embeddings, PEFT can register both embed_tokens and lm_head as modules_to_save even
-    # though only one tensor exists on disk. If we see both logical modules but only one backing
-    # tensor key across shards, treat them as a single merged target to avoid an off-by-one on the
-    # sanity check while keeping the check meaningful for non-tied models.
-    has_embed = any(key.endswith("embed_tokens") for key in lora_weights)
-    has_head  = any(key.endswith("lm_head") for key in lora_weights)
-    if has_embed and has_head:
-        # Only count actual weight tensors; lm_head.bias alone should not mask tied-embedding cases.
-        has_embed_tensor = any(key.endswith("embed_tokens.weight") for key in safetensor_keys_seen)
-        has_head_tensor  = any(key.endswith("lm_head.weight")      for key in safetensor_keys_seen)
-        if has_embed_tensor ^ has_head_tensor:  # exactly one side present on disk
-            effective_loras -= 1
+    # Count only LoRA modules backed by a saved tensor, using the same key resolution
+    # as the merge loop above (remap, Gemma4 .linear, fused MoE experts, and the tied
+    # lm_head -> embed_tokens bridge with its embed-not-a-target guard). The count
+    # therefore equals the number of tensors the merge actually writes, so no separate
+    # tied discount is needed. A looser re-derivation drifts from the merge and raises
+    # false mismatches; len(lora_weights) over-counts unbacked targets such as a vision
+    # tower absent from the base safetensors.
+    _base = find_lora_base_model(model)
+    # Native mxfp4 save (save_method="mxfp4") preserves _blocks/_scales untouched instead of
+    # merging, so a LoRA on a packed tensor is not written; don't count it as backed there.
+    _count_packed_mxfp4 = not (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")
+    effective_loras = _count_backed_lora_modules(
+        lora_weights,
+        safetensor_keys_seen,
+        _base.__class__.__name__,
+        bool(getattr(_base.config, "tie_word_embeddings", False)),
+        count_packed_mxfp4 = _count_packed_mxfp4,
+    )
 
     if effective_loras != n_saved_modules:
         raise RuntimeError(
@@ -3125,6 +3133,92 @@ def detect_keys_format(keys_to_check, forward_mapping):
     return "new" # Default to current HF format
 pass
 
+def _safetensor_module_key(sf):
+    """The LoRA module path a safetensor key backs: strip .weight, then a trailing
+    .linear (Gemma4 ClippableLinear) so a reordered <module>.linear.weight tensor lines up
+    with its LoRA key in the prefix-substitution vote. Returns None for non-.weight keys."""
+    if not isinstance(sf, str) or not sf.endswith(".weight"):
+        return None
+    module_key = sf[: -len(".weight")]
+    if module_key.endswith(".linear"):
+        module_key = module_key[: -len(".linear")]
+    return module_key
+pass
+
+def _build_valid_prefixes(keys_set, count_packed_mxfp4 = True):
+    """Pre-compute every component-boundary parent prefix of the merge-backing tensors in
+    keys_set (keys ending in .weight, or mxfp4 _blocks paired with _scales). Lets the MoE
+    descendant check in _lora_key_has_backing do an O(1) `cand in prefixes` lookup instead
+    of an O(N) scan per key, which matters on large MoE checkpoints with tens of thousands
+    of tensors. Equivalent to `any(s.startswith(cand + '.') and <s is a backing tensor>)`.
+    """
+    valid_prefixes = set()
+    for s in keys_set:
+        if not isinstance(s, str):
+            continue
+        if s.endswith(".weight"):
+            pass
+        elif count_packed_mxfp4 and s.endswith("_blocks") and (s[: -len("_blocks")] + "_scales") in keys_set:
+            pass
+        else:
+            continue
+        parts = s.split(".")
+        for i in range(1, len(parts)):
+            valid_prefixes.add(".".join(parts[: i]))
+    return valid_prefixes
+pass
+
+def _lora_key_has_backing(key, keys_set, count_packed_mxfp4 = True, valid_prefixes = None):
+    """True if a converted LoRA module path is backed by a tensor the merge loop would
+    actually consume, mirroring _merge_and_overwrite_lora / _merge_moe_experts_file:
+      - direct <key>.weight,
+      - Gemma4 ClippableLinear <key>.linear.weight,
+      - mxfp4 packed <key>_blocks + <key>_scales (dequantized to <key> on save),
+      - per-expert MoE descendants <prefix>.<e>.<proj>.weight (or packed _blocks/_scales),
+      - fused 3D MoE <prefix>.gate_up_proj / <prefix>.down_proj (no .weight, GPT-OSS/Gemma4),
+      including the .moe -> .experts alias the merge applies.
+    Shared by the save-count check and the remap fallback so both agree with what the
+    merge writes (and never invent a key with no backing). count_packed_mxfp4=False mirrors
+    the native mxfp4 save path (save_method="mxfp4"), which preserves _blocks/_scales
+    untouched instead of merging, so a LoRA on a packed tensor is not written there.
+    """
+    if not isinstance(key, str):
+        return False
+    if (key + ".weight") in keys_set:
+        return True
+    if (key + ".linear.weight") in keys_set:                 # Gemma4 ClippableLinear
+        return True
+    if count_packed_mxfp4 and (key + "_blocks") in keys_set and (key + "_scales") in keys_set:
+        return True                                          # mxfp4 packed (dequantized on save)
+    if ".experts" in key or ".moe" in key:                   # fused / per-expert MoE
+        base = key.replace(".base_layer", "")
+        cands = set()
+        for b in (base, base.replace(".moe", ".experts")):
+            cands.add(b)
+            # A fused-named LoRA key (<experts>.gate_up_proj / .down_proj) is also backed by
+            # the per-expert descendants under <experts>, since the merge maps disk
+            # <experts>.<e>.<proj>.weight onto <experts>.gate_up_proj (saving_utils ~L663).
+            for suf in (".gate_up_proj", ".down_proj"):
+                if b.endswith(suf):
+                    cands.add(b[: -len(suf)])
+        for cand in cands:
+            if (cand + ".gate_up_proj") in keys_set or (cand + ".down_proj") in keys_set:
+                return True                                  # fused 3D (GPT-OSS / Gemma4)
+            if valid_prefixes is not None:
+                # O(1): cand is a parent prefix of some per-expert .weight (or packed) tensor.
+                if cand in valid_prefixes:
+                    return True
+            else:
+                for s in keys_set:
+                    if not (isinstance(s, str) and s.startswith(cand + ".")):
+                        continue
+                    if s.endswith(".weight"):                # per-expert 2D
+                        return True
+                    if count_packed_mxfp4 and s.endswith("_blocks") and (s[: -len("_blocks")] + "_scales") in keys_set:
+                        return True                          # per-expert packed mxfp4
+    return False
+pass
+
 def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     """Infer missing key prefixes by matching LoRA keys against safetensor keys.
 
@@ -3135,12 +3229,19 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     remapped; unmatched keys (e.g. fused MoE params) inherit the most common
     inferred prefix.
 
+    Also handles the case where LoRA keys and safetensor keys have differently
+    ordered path components (e.g. LoRA has ``model.language_model.`` but
+    safetensor has ``language_model.model.`` in Ministral 3 / Mistral 3 VLMs)
+    by discovering a dominant prefix substitution rule from common suffix
+    matches across all unmatched keys, and applying it globally.
+
     Returns the remapped ``defaultdict``, or ``None`` if nothing was remapped.
     """
     if not safetensor_keys:
         return None
 
     sf_key_set = set(safetensor_keys)
+    valid_prefixes = _build_valid_prefixes(sf_key_set)  # O(1) MoE backing lookups
     remapped = defaultdict(lora_weights.default_factory)
     changed = False
     inferred_prefixes = []  # track prefixes from successful per-key matches
@@ -3150,14 +3251,15 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
         if not isinstance(k, str):
             remapped[k] = v
             continue
-        # Already matches a safetensor key
-        if (k + ".weight") in sf_key_set:
+        # Already matches a safetensor key (direct, or Gemma4 ClippableLinear .linear.weight)
+        if (k + ".weight") in sf_key_set or (k + ".linear.weight") in sf_key_set:
             remapped[k] = v
             continue
-        # Unique non-empty prefix candidates for this key
-        suffix = k + ".weight"
+        # Unique non-empty prefix candidates for this key. Accept a .linear.weight shard
+        # (Gemma4 ClippableLinear) as well, so a prefix-add onto such a tensor is not dropped.
         candidates = list(dict.fromkeys(
             sf_key[: -len(suffix)]
+            for suffix in (k + ".weight", k + ".linear.weight")
             for sf_key in safetensor_keys
             if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
         ))
@@ -3166,20 +3268,133 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             inferred_prefixes.append(candidates[0])
             changed = True
         else:
-            # No match or ambiguous -- defer to fallback
+            # No exact/prefix match -- defer to global substitution below
             unmatched_keys.append((k, v))
+
+    # Discover a dominant prefix substitution by comparing unmatched LoRA
+    # key prefixes against safetensor key prefixes. This avoids per-key
+    # false matches when different sub-modules (e.g. vision vs language)
+    # share the same trailing path components.
+    if unmatched_keys:
+        from collections import Counter as _Counter2
+        substitution_votes = _Counter2()
+        # A vote is recorded only when the two prefixes are a true reordering of the same
+        # path components (the multiset guard below), so shorter trailing suffixes are safe
+        # to seed votes and cannot pull a key across namespaces. This lets a reordered short
+        # module (e.g. model.language_model.embed_tokens vs language_model.model.embed_tokens)
+        # learn its own reorder even on a shard that holds no longer layer keys to seed it.
+        # Group safetensor module keys by each trailing 1..3 component suffix so every
+        # unmatched key only scans plausible buckets (keeps this roughly O(n)).
+        sf_parts_by_suffix = defaultdict(list)
+        for sf in safetensor_keys:
+            module_key = _safetensor_module_key(sf)   # strips .weight and a trailing .linear
+            if module_key is None:
+                continue
+            sf_parts = module_key.split(".")
+            for sl in range(1, min(3, len(sf_parts)) + 1):
+                sf_parts_by_suffix[(sl, tuple(sf_parts[-sl:]))].append(sf_parts)
+        for k, _ in unmatched_keys:
+            if not isinstance(k, str):
+                continue
+            k_parts = k.split(".")
+            seen_sf = set()
+            for sl in range(min(3, len(k_parts)), 0, -1):
+                for sf_parts in sf_parts_by_suffix.get((sl, tuple(k_parts[-sl:])), ()):
+                    sf_id = tuple(sf_parts)
+                    if sf_id in seen_sf:        # process each sf once, at its longest match
+                        continue
+                    seen_sf.add(sf_id)
+                    # Extend the common suffix as far as it goes.
+                    common_suffix_len = sl
+                    for i in range(sl + 1, min(len(k_parts), len(sf_parts)) + 1):
+                        if k_parts[-i] == sf_parts[-i]:
+                            common_suffix_len = i
+                        else:
+                            break
+                    lora_prefix = ".".join(k_parts[: -common_suffix_len]) + "." if common_suffix_len < len(k_parts) else ""
+                    sf_prefix = ".".join(sf_parts[: -common_suffix_len]) + "." if common_suffix_len < len(sf_parts) else ""
+                    # Only a true reordering (same components, different order) seeds a vote.
+                    # sorted() equality is the multiset guard (cheaper than a Counter per pair).
+                    if (lora_prefix and sf_prefix and lora_prefix != sf_prefix
+                            and sorted(p for p in lora_prefix.split(".") if p)
+                                == sorted(p for p in sf_prefix.split(".") if p)):
+                        substitution_votes[(lora_prefix, sf_prefix)] += 1
+
+        # Apply prefix substitutions, but only true reorderings of the same path
+        # components (e.g. model.language_model. <-> language_model.model.), never
+        # cross-namespace rewrites. Only claim a target that exists on disk and is
+        # not already taken, so an unmatched vision key cannot overwrite a real
+        # language tensor.
+        if substitution_votes:
+            remaining_unmatched = list(unmatched_keys)
+            applied_prefixes = set()
+            for (lora_prefix, sf_prefix), _ in substitution_votes.most_common():
+                if lora_prefix in applied_prefixes:
+                    continue
+                if sorted(p for p in lora_prefix.split(".") if p) != \
+                   sorted(p for p in sf_prefix.split(".") if p):
+                    continue
+                applied_prefixes.add(lora_prefix)
+                still_unmatched = []
+                for k, v in remaining_unmatched:
+                    new_key = sf_prefix + k[len(lora_prefix):] if k.startswith(lora_prefix) else None
+                    if new_key is not None and new_key not in remapped and _lora_key_has_backing(new_key, sf_key_set, valid_prefixes = valid_prefixes):
+                        remapped[new_key] = v
+                        inferred_prefixes.append(sf_prefix)
+                        changed = True
+                    else:
+                        still_unmatched.append((k, v))
+                remaining_unmatched = still_unmatched
+            unmatched_keys = remaining_unmatched
+
+    from collections import Counter as _Counter
+    common_prefix = _Counter(inferred_prefixes).most_common(1)[0][0] if inferred_prefixes else None
+
+    # A LoRA target can carry an extra wrapper prefix the base tensor lacks (e.g.
+    # model.vision_tower.* vs vision_tower.* on a Mistral 3 VLM, where the language
+    # half reorders but the vision half only drops the leading model.). Strip only
+    # GENERIC wrapper components (model / base_model / module), never a semantic
+    # namespace such as vision_tower or language_model: otherwise an unbacked vision
+    # adapter could strip down to a bare language suffix (layers.0....) and be merged
+    # onto the wrong tensor. Accepts only an exact on-disk backing for the stripped key.
+    if unmatched_keys:
+        _WRAPPER_COMPONENTS = {"model", "base_model", "module"}
+        still_unmatched = []
+        for k, v in unmatched_keys:
+            target = None
+            if isinstance(k, str):
+                parts = k.split(".")
+                for i in range(1, len(parts)):
+                    if any(p not in _WRAPPER_COMPONENTS for p in parts[: i]):
+                        break  # would strip a semantic namespace -> stop
+                    cand = ".".join(parts[i:])
+                    if cand not in remapped and _lora_key_has_backing(cand, sf_key_set, valid_prefixes = valid_prefixes):
+                        target = cand
+                        break
+            if target is not None:
+                remapped[target] = v
+                changed = True
+            else:
+                still_unmatched.append((k, v))
+        unmatched_keys = still_unmatched
 
     if not changed:
         return None
 
-    # Unmatched keys (e.g. fused MoE params): use the most common inferred prefix
-    if unmatched_keys and inferred_prefixes:
-        from collections import Counter
-        common_prefix = Counter(inferred_prefixes).most_common(1)[0][0]
-        for k, v in unmatched_keys:
+    # Apply the most common inferred prefix to any remaining unmatched keys, but only
+    # when that lands on a real backing tensor; otherwise leave the key untouched so the
+    # merge skips a genuinely unbacked target (e.g. a vision adapter with no base tensor)
+    # instead of rewriting it onto a wrong or nonexistent key. Backing covers MoE experts
+    # (descendant / fused / packed) and Gemma4 .linear, not just a direct .weight, so a
+    # prefixed MoE LoRA key is not dropped.
+    for k, v in unmatched_keys:
+        if (
+            common_prefix is not None and isinstance(k, str)
+            and (common_prefix + k) not in remapped
+            and _lora_key_has_backing(common_prefix + k, sf_key_set, valid_prefixes = valid_prefixes)
+        ):
             remapped[common_prefix + k] = v
-    else:
-        for k, v in unmatched_keys:
+        else:
             remapped[k] = v
 
     return remapped
@@ -3241,6 +3456,55 @@ def _convert_lora_keys_to_safetensor_format(
 
         converted_lora_weights_output[converted_key_for_lookup] = lora_stats
     return converted_lora_weights_output
+pass
+
+def _count_backed_lora_modules(lora_weights, safetensor_keys_seen, model_class_name, tie_word_embeddings, count_packed_mxfp4 = True):
+    """Count LoRA modules backed by a saved tensor, mirroring the key resolution of
+    the merge loop in _merge_and_overwrite_lora (remap, Gemma4 .linear, fused MoE
+    experts, mxfp4 packed experts, and the tied lm_head -> embed_tokens bridge). The
+    tied bridge is keyed on the DISK embed prefix and only fires when that embed is not
+    itself a target, exactly like the merge, so the count equals the number of tensors
+    the merge writes and the Step-7 sanity check needs no extra tied discount. Genuinely
+    unbacked targets (e.g. a vision tower absent from the base safetensors, or a bare
+    lm_head whose composite-VLM embed lives at a deep prefix the merge cannot bridge) are
+    excluded. Known merge limitation, faithfully mirrored here: when only lm_head.weight
+    is on disk (not embed_tokens.weight), a tied embed_tokens target is dropped by the
+    merge and likewise not counted, so the save succeeds without that delta.
+    """
+    converted = _convert_lora_keys_to_safetensor_format(
+        lora_weights, safetensor_keys_seen, model_class_name = model_class_name,
+    )
+    # Pre-build parent prefixes once so the MoE backing check is O(1) per key, not O(N).
+    valid_prefixes = _build_valid_prefixes(safetensor_keys_seen, count_packed_mxfp4 = count_packed_mxfp4)
+
+    def _backed(key):
+        if not isinstance(key, str):
+            return False
+        # Direct, Gemma4 .linear, mxfp4 packed, and MoE (per-expert / fused 3D / .moe alias)
+        # backing all mirror the merge loop via the shared helper.
+        if _lora_key_has_backing(key, safetensor_keys_seen, count_packed_mxfp4 = count_packed_mxfp4, valid_prefixes = valid_prefixes):
+            return True
+        if tie_word_embeddings and key.endswith("lm_head"):    # tied: merged onto embed_tokens
+            # The merge folds an lm_head LoRA onto an on-disk embed_tokens.weight, but only
+            # when that embed module is not itself a LoRA target (else the merge writes the
+            # embed delta and drops lm_head). Mirror that exactly, keying off the DISK embed
+            # prefix with the same model. strip/add the merge uses, so a bare lm_head resolves
+            # onto model.embed_tokens.weight (standard) yet a deep composite-VLM prefix
+            # model.language_model.embed_tokens.weight does not claim a bare lm_head it can
+            # never reach.
+            for sf in safetensor_keys_seen:
+                if not (isinstance(sf, str) and sf.endswith("embed_tokens.weight")):
+                    continue
+                embed_key = sf[: -len(".weight")]
+                if embed_key in converted:           # embed is a target -> lm_head dropped
+                    continue
+                lm_head_key = embed_key[: -len("embed_tokens")] + "lm_head"
+                bridged = lm_head_key[len("model."):] if lm_head_key.startswith("model.") else "model." + lm_head_key
+                if key == lm_head_key or key == bridged:
+                    return True
+        return False
+
+    return sum(1 for key in converted if _backed(key))
 pass
 
 def find_lora_base_model(model_to_inspect):
