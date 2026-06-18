@@ -1,0 +1,62 @@
+name: mlx-pr782
+on:
+  push:
+    branches: ["mlx-pr782-validate"]
+  workflow_dispatch:
+concurrency:
+  group: mlx-pr782-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  mlx:
+    name: MLX PR 782 save_total_limit rotation (Apple Silicon)
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install "pytest==9.0.3"
+      - name: Import smoke
+        continue-on-error: true
+        run: |
+          python -c "import unsloth_zoo.mlx.trainer; print('trainer OK')"
+      - name: Rotation logic probe (_prune_stale_checkpoints)
+        run: |
+          python - <<'PY'
+          import os, tempfile
+          from pathlib import Path
+          from unsloth_zoo.mlx.trainer import _prune_stale_checkpoints
+          d = tempfile.mkdtemp()
+          for s in (10, 20, 5, 30):
+              os.makedirs(os.path.join(d, f"checkpoint-{s}"))
+          os.makedirs(os.path.join(d, "checkpoint-best"))      # non-numeric, keep
+          open(os.path.join(d, "checkpoint-file"), "w").close() # not a dir, ignore
+          _prune_stale_checkpoints(d, 2)
+          names = sorted(p.name for p in Path(d).glob("checkpoint-*"))
+          assert "checkpoint-30" in names and "checkpoint-20" in names, names
+          assert "checkpoint-10" not in names and "checkpoint-5" not in names, names
+          assert "checkpoint-best" in names, names
+          assert "checkpoint-file" in names, names
+          # None / 0 / -1 are no-ops
+          for s in (10, 5):
+              os.makedirs(os.path.join(d, f"checkpoint-{s}"), exist_ok=True)
+          before = sorted(p.name for p in Path(d).glob("checkpoint-*"))
+          for lim in (None, 0, -1):
+              _prune_stale_checkpoints(d, lim)
+          after = sorted(p.name for p in Path(d).glob("checkpoint-*"))
+          assert before == after, (before, after)
+          print("PR782 rotation OK:", names)
+          PY
+      - name: Metal e2e save-path regression
+        run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
