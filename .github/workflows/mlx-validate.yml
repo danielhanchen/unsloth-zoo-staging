@@ -1,0 +1,38 @@
+name: mlx-pr784
+on:
+  push:
+    branches: ["mlx-pr784-validate"]
+  workflow_dispatch:
+concurrency:
+  group: mlx-pr784-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  mlx:
+    name: MLX PR 784 response-mask parity (Apple Silicon)
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install "pytest==9.0.3"
+      - name: Import smoke
+        continue-on-error: true
+        run: |
+          python -c "import unsloth_zoo.mlx.trainer; print('trainer OK')"
+          python -c "import unsloth_zoo.mlx.utils; print('utils OK')"
+      - name: Non-metal parity suites (run against real mlx)
+        run: python -m pytest tests/test_mlx_trainer_internals.py tests/test_mlx_vlm_label_masks.py tests/test_pr684_review_fixes_a.py -v -rs
+      - name: Metal VJP + full validation suites
+        run: python -m pytest tests/test_qwen35_vjp_metal.py tests/test_mlx_pr684_full_validation_metal.py -v -rs
