@@ -30,8 +30,31 @@ import torch
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_shim():
+    import sys
+    shim_prefixes = ("mlx", "mlx_lm", "mlx_vlm")
+    real_mlx_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+    }
     from mlx_simulation import simulate_mlx_on_torch
+    from mlx_simulation.mlx_stub import _MLXFinder
     simulate_mlx_on_torch()
+    for name in list(sys.modules):
+        if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
+            sys.modules.pop(name, None)
+    yield
+    for name in list(sys.modules):
+        if (
+            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
+            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+        ):
+            sys.modules.pop(name, None)
+    sys.meta_path[:] = [
+        finder for finder in sys.meta_path
+        if not isinstance(finder, _MLXFinder)
+    ]
+    sys.modules.update(real_mlx_modules)
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +113,82 @@ def test_mlx_training_config_exposes_completion_only_loss():
     assert _text_completion_only_loss_arg(
         MLXTrainingConfig(train_on_completions=True)
     ) is True
+
+
+def test_mlx_trainer_distributed_defaults_world_size_one():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class DummyModel:
+        def trainable_parameters(self): return {}
+
+    trainer = MLXTrainer(DummyModel(), None, [], args=MLXTrainingConfig())
+
+    assert trainer._distributed_initialized is False
+    assert trainer.distributed_rank == 0
+    assert trainer.distributed_world_size == 1
+    assert trainer.is_main_process is True
+    assert trainer._distributed_result_fields() == {
+        "distributed_world_size": 1,
+        "distributed_rank": 0,
+        "distributed_is_main_process": True,
+    }
+
+
+def test_mlx_trainer_distributed_state_uses_cached_group(monkeypatch):
+    import unsloth_zoo.mlx.trainer as trainer_mod
+
+    class FakeWorld:
+        def rank(self): return 1
+        def size(self): return 2
+
+    calls = []
+    def fake_init():
+        calls.append("init")
+        return FakeWorld()
+
+    monkeypatch.setattr(trainer_mod.mx.distributed, "init", fake_init)
+    trainer = trainer_mod.MLXTrainer.__new__(trainer_mod.MLXTrainer)
+
+    assert trainer.distributed_world is trainer.distributed_world
+    assert calls == ["init"]
+    assert trainer.distributed_rank == 1
+    assert trainer.distributed_world_size == 2
+    assert trainer.is_main_process is False
+    assert trainer._distributed_result_fields() == {
+        "distributed_world_size": 2,
+        "distributed_rank": 1,
+        "distributed_is_main_process": False,
+    }
+
+
+def test_distributed_text_batches_use_tokenizer_pad_without_global_rng():
+    import numpy as np
+    from unsloth_zoo.mlx.utils import _create_distributed_text_batches
+
+    class FakeWorld:
+        def rank(self): return 0
+        def size(self): return 2
+
+    class Tokenizer:
+        pad_token_id = 99
+
+    dataset = [([5], 0), ([6, 7, 8], 0)]
+    np.random.seed(123)
+    expected = np.random.random(3)
+    np.random.seed(123)
+
+    batches = _create_distributed_text_batches(
+        dataset,
+        batch_size=2,
+        max_seq_length=8,
+        seed=7,
+        comm_group=FakeWorld(),
+        tokenizer=Tokenizer(),
+    )
+
+    assert np.random.random(3) == pytest.approx(expected)
+    rows = batches[0][0].tolist()
+    assert rows[0][1:] == [99] * (len(rows[0]) - 1)
 
 
 @pytest.mark.parametrize("optim_name", ["adamw", "adam", "sgd", "adafactor"])
