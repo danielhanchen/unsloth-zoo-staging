@@ -185,6 +185,7 @@ from .compile import (
     build_compile_policy,
     explain_compile_support,
     get_compile_qualification,
+    model_has_gated_delta_layers,
     normalize_mlx_patch_mode,
     resolve_training_compile,
     trace_compile_application,
@@ -1633,6 +1634,7 @@ class MLXTrainer:
             # Qwen3.5-specific fixes
             config = getattr(model, "_config", {})
             model_type = config.get("model_type", "") if isinstance(config, dict) else ""
+            gated_delta_patched = False
             if "qwen3_5" in model_type:
                 from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
                 _fix_qwen35_attention_cache(model)
@@ -1640,6 +1642,12 @@ class MLXTrainer:
                 from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
                 patch_gated_delta()
                 patch_gated_delta_vlm()
+                gated_delta_patched = True
+            # Structural, not model_type-based: qwen3_next / kimi_linear share
+            # the same gated_delta_update call sites and need the efficient VJP.
+            if not gated_delta_patched and model_has_gated_delta_layers(model):
+                from ..gated_delta_vjp import patch_gated_delta
+                patch_gated_delta()
             # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
             # no VJP; flip it off so training takes the differentiable fallback.
             if any(t in model_type for t in ("qwen3_vl", "qwen2_vl", "qwen2_5_vl")):
