@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Disposable staging-only workflow: run PR #918's NEW MLX suite on real Apple
+# Silicon (Metal), per-file (each test file in its own pytest process) to avoid
+# the opt-in simulate_mlx_on_torch() sys.modules['mlx'] cross-test contamination.
+# Compile is left at its default (enabled on Metal) so the shape-guard / bounded
+# compile-signature behavior under test is actually exercised. Not for upstream.
+
+name: PR918 MLX full suite (Apple Silicon)
+
+on:
+  push:
+    branches: [pr-918-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-full:
+    name: PR918 new MLX suite (macos-14 Metal, per-file)
+    runs-on: macos-14   # Apple Silicon (M1) hosted runner
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install zoo with MLX extras
+        # Mirror mlx-ci.yml: install the CPU torch wheel first (the torch-spoof
+        # shim in tests/mlx_simulation/__init__.py imports torch unconditionally),
+        # then .[mlx] for the native Apple-Silicon mlx / mlx-lm / mlx-vlm wheels.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+
+      - name: Versions
+        run: |
+          python -c "import mlx.core as mx; print('mlx', mx.__version__, 'device', mx.default_device())"
+          python -c "import mlx_lm, mlx_vlm; print('mlx_lm', mlx_lm.__version__, 'mlx_vlm', mlx_vlm.__version__)"
+
+      - name: test_mlx_shape_guard.py
+        if: ${{ !cancelled() }}
+        run: python -m pytest tests/test_mlx_shape_guard.py -v -rs
+
+      - name: test_mlx_batch_padding.py
+        if: ${{ !cancelled() }}
+        run: python -m pytest tests/test_mlx_batch_padding.py -v -rs
+
+      - name: test_mlx_trainer_internals.py
+        if: ${{ !cancelled() }}
+        run: python -m pytest tests/test_mlx_trainer_internals.py -v -rs
+
+      - name: test_mlx_cce_target_classification.py
+        if: ${{ !cancelled() }}
+        run: python -m pytest tests/test_mlx_cce_target_classification.py -v -rs
+
+      - name: test_mlx_runtime_cce_compile.py
+        if: ${{ !cancelled() }}
+        run: python -m pytest tests/test_mlx_runtime_cce_compile.py -v -rs
+
+      - name: test_mlx_ddp_metal.py
+        if: ${{ !cancelled() }}
+        run: python -m pytest tests/test_mlx_ddp_metal.py -v -rs
+
+      - name: PR684 validation cross-check (resume determinism, real LoRA)
+        if: ${{ !cancelled() }}
+        run: python -m pytest tests/test_mlx_pr684_full_validation_metal.py -v -rs
