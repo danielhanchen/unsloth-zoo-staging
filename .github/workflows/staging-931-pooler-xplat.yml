@@ -16,7 +16,14 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install torch (CPU) + zoo test deps
-        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu && python -m pip install -e .[core] pytest "transformers==5.5.0" && python -m pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main"
+        shell: bash
+        # Latest torch on triton-less mac builds crashes at import in
+        # flop_counter (_JITFunction is None); pin a known-good version there.
+        run: |
+          if [ "${{ matrix.os }}" = "macos-14" ]; then TORCH_SPEC="torch==2.8.0"; else TORCH_SPEC="torch"; fi
+          python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e .[core] pytest "transformers==5.5.0"
+          python -m pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main"
       - name: Run gemma4 vision pooler tests
         env:
           PYTHONPATH: .
