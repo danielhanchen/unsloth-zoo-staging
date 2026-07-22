@@ -20,4 +20,5 @@ jobs:
       - name: Run gemma4 vision pooler tests
         env:
           PYTHONPATH: .
+          UNSLOTH_IS_PRESENT: "1"
         run: python -m pytest tests/test_gemma4_vision_pooler_fp16.py -q -p no:cacheprovider
