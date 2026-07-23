@@ -36,7 +36,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install "torch>=2.4.0,<2.13.0"
           pip install -e .[mlx]
-          pip install pytest==9.0.3
+          pip install pytest==9.0.3 accelerate
           pip install bitsandbytes || echo "bitsandbytes unavailable on arm64 (metal e2e will skip, as designed)"
 
       - name: Show environment
