@@ -24,6 +24,11 @@ jobs:
     name: double-quant reject + metal (Apple Silicon)
     runs-on: macos-14
     timeout-minutes: 30
+    env:
+      # Hosted macos runners have a constrained/virtualized MPS allocator that
+      # refuses even small allocations; the OOM error names this exact remedy.
+      PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
+      PYTORCH_ENABLE_MPS_FALLBACK: "1"
     steps:
       - uses: actions/checkout@v4
 
