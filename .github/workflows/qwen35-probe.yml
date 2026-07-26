@@ -46,3 +46,6 @@ jobs:
           PY
       - name: Run the failing test verbosely
         run: python -m pytest tests/test_qwen35_vjp_metal.py -v -rA
+      - name: "tests/test_mlx_batching_and_decay.py (pre-existing check, on MAIN)"
+        if: always()
+        run: python -m pytest tests/test_mlx_batching_and_decay.py -v -rA
