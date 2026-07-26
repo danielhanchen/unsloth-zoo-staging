@@ -1,0 +1,50 @@
+# Disposable staging-only verification for upstream PR #939.
+# The repo's mlx-ci.yml aborts at tests/test_qwen35_vjp_metal.py, which fails on
+# upstream main independently of this PR, so its later steps never run. This runs
+# the PR's own MLX tests on Apple Silicon directly.
+
+name: "PR 939 MLX verify"
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: pr939-mlx-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: "PR 939 MLX verify (macos-14)"
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+
+      - name: Versions
+        run: |
+          python -c "import mlx.core as mx; print('mlx', mx.__version__ if hasattr(mx,'__version__') else '?'); print(mx.default_device())"
+          pip list | grep -Ei 'mlx|transformers|torch|numpy'
+
+      - name: "tests/test_mlx_training_e2e_metal.py"
+        if: always()
+        run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
+      - name: "tests/test_mlx_trainer_internals.py"
+        if: always()
+        run: python -m pytest tests/test_mlx_trainer_internals.py -v -rs
