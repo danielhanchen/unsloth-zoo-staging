@@ -318,12 +318,63 @@ jobs:
           else:
               print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0)")
           PY
+      - name: "tests/test_mlx_switch_lora.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_switch_lora.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_switch_lora.py"
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped (see SKIPLIST above; NOT a module-level skip)")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0)")
+          PY
 
       - name: "Remaining tests/test_mlx*.py sweep (known red on upstream main, excluded from the pass/fail verdict)"
         if: always()
         continue-on-error: true
         run: |
-          strict="tests/test_mlx_training_e2e_metal.py tests/test_mlx_adapter_metadata_persistence.py tests/test_mlx_save_lora_adapters_filter.py tests/test_mlx_save_export_regressions.py tests/test_mlx_trainer_internals.py"
+          strict="tests/test_mlx_training_e2e_metal.py tests/test_mlx_adapter_metadata_persistence.py tests/test_mlx_save_lora_adapters_filter.py tests/test_mlx_save_export_regressions.py tests/test_mlx_trainer_internals.py tests/test_mlx_switch_lora.py"
           rc=0
           for f in tests/test_mlx*.py; do
             case " $strict " in *" $f "*) echo "SWEEP-SKIP $f (covered by a strict step)"; continue ;; esac
