@@ -1,0 +1,1167 @@
+# Disposable staging-only verification for upstream PR #940.
+# The repo's mlx-ci.yml aborts at tests/test_qwen35_vjp_metal.py, which fails on upstream
+# main independently of this PR, so its later steps never run. This runs the PR's own MLX
+# tests on Apple Silicon directly, one pytest process per file so the mlx_simulation stub
+# installed by sibling test modules cannot mask the real mlx runtime.
+
+name: "PR 940 MLX verify"
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: pr940-mlx-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: "PR 940 MLX verify (macos-14)"
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+
+      - name: Versions and real-mlx probe
+        run: |
+          python -c "import platform; print('machine', platform.machine(), platform.platform())"
+          python -c "import mlx.core as mx; print('mlx.core', mx.__file__); print('device', mx.default_device())"
+          python -c "from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear; print('SwitchLinear', SwitchLinear)"
+          # tests/test_mlx_ddp_metal.py per-test-skips unless mlx.launch sits beside sys.executable,
+          # so record its presence explicitly: that decides whether the real 2-rank path can run.
+          python -c "import sys, pathlib; p = pathlib.Path(sys.executable).with_name('mlx.launch'); print('mlx.launch', p, 'exists=', p.exists())"
+          pip list | grep -Ei 'mlx|transformers|torch|numpy'
+
+      - name: "Real mlx-community quant load + forward (not a stub)"
+        if: always()
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          from mlx_lm import load
+          model, tok = load("mlx-community/SmolLM-135M-Instruct-4bit")
+          ids = mx.array([tok.encode("Unsloth makes finetuning fast")])
+          out = model(ids)
+          mx.eval(out)
+          print("REALQUANT class", type(model).__name__, "logits", out.shape, out.dtype)
+          print("REALQUANT device", mx.default_device(), "finite", bool(mx.isfinite(out).all()))
+          PY
+
+      - name: "tests/test_mlx_batching_and_decay.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_batching_and_decay.py -v -rs --junitxml=report.xml \
+            --deselect tests/test_mlx_batching_and_decay.py::test_compiler_review_guards_are_present || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_batching_and_decay.py"
+          EXPECT_TOTAL = 44
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_shape_guard.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_shape_guard.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_shape_guard.py"
+          EXPECT_TOTAL = 25
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_vlm_label_masks.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_vlm_label_masks.py"
+          EXPECT_TOTAL = 51
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_trainer_internals.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_trainer_internals.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_trainer_internals.py"
+          EXPECT_TOTAL = 147
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_training_e2e_metal.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_training_e2e_metal.py"
+          EXPECT_TOTAL = 13
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_ddp_metal.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_ddp_metal.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_ddp_metal.py"
+          EXPECT_TOTAL = 1
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "940 9a05e0a2/c3641eda: plan file descriptors under a 256 cap"
+        if: always()
+        run: |
+          export PROBE_EXPECT_ZOO_ROOT=$GITHUB_WORKSPACE
+          python - <<'PY'
+          """PR 940 probe (a): FILE DESCRIPTORS held by the finite VLM batch plan.
+
+          Drives the REAL plan builder, `unsloth_zoo.mlx.utils._create_vlm_batch_plan`, over a
+          dataset written the textbook way -- `__getitem__` returns `PIL.Image.open(path)` and
+          lets the raster decode later. The plan collects one row per scheduled slot before any
+          of them is processed, so on the pre-fix tree every one of those rows pins an open
+          descriptor for the life of the plan.
+
+          Why this can only be settled on macOS: Apple hands a process a soft RLIMIT_NOFILE of
+          256 by default, an order of magnitude below what this Linux box allows, so the failure
+          mode the fix exists for -- `OSError: [Errno 24] Too many open files` at plan BUILD --
+          is reachable there and effectively unreachable here.
+
+          Reported, in order:
+            PROBE-FD1  peak descriptors held while building a 300-row plan (natural limit)
+            PROBE-FD2  the same build with the soft limit pinned to macOS's default 256
+            PROBE-FD3  tuple-nested handles, {"images": (Image.open(path),)} -- c3641eda
+            PROBE-FD4  the released row still materializes, and keeps its tuple/namedtuple type
+
+          Exit code 0 == every behaviour holds.
+
+          A/B validated on Linux CPU before staging, by restoring the pre-fix bodies of
+          `_release_vlm_row_image_handles` / `_restore_vlm_row_image_handles` into a copied
+          tree (see REPORT_940.md for both sides of the run).
+          """
+          import gc
+          import os
+          import resource
+          import sys
+          import tempfile
+
+          import numpy as np
+          from PIL import Image
+
+          import unsloth_zoo
+          from unsloth_zoo.mlx.utils import (
+              _LazyVLMImage,
+              _create_vlm_batch_plan,
+              _release_vlm_row_image_handles,
+              _restore_vlm_row_image_handles,
+          )
+
+          # Never let this probe grade a DIFFERENT tree than the one under test: running
+          # `python probe.py` puts the probe's own directory on sys.path[0], so an installed
+          # unsloth_zoo could win over the checkout unless PYTHONPATH says otherwise.
+          print("PROBE-FD unsloth_zoo from", unsloth_zoo.__file__)
+          _EXPECT_ROOT = os.environ.get("PROBE_EXPECT_ZOO_ROOT")
+          if _EXPECT_ROOT:
+              _actual = os.path.realpath(unsloth_zoo.__file__)
+              if not _actual.startswith(os.path.realpath(_EXPECT_ROOT) + os.sep):
+                  sys.exit(
+                      f"PROBE-FD FAIL: imported unsloth_zoo from {_actual}, "
+                      f"expected it under {_EXPECT_ROOT}"
+                  )
+
+          import mlx.core as mx  # noqa: E402  (after the provenance guard, before any assertion)
+
+          print("PROBE-FD device", mx.default_device())
+          if "mlx_simulation" in str(getattr(mx, "__file__", "")):
+              sys.exit("PROBE-FD FAIL: mlx.core is the simulation stub, not the real runtime")
+
+          _SOFT, _HARD = resource.getrlimit(resource.RLIMIT_NOFILE)
+          print(f"PROBE-FD rlimit_nofile soft={_SOFT} hard={_HARD} platform={sys.platform}")
+
+          N_ROWS = 300  # > 254, the row count at which a 256 soft limit trips on the pre-fix tree
+
+
+          def _open_fd_count():
+              """Count this process's open descriptors, or None where we cannot."""
+              for probe in ("/proc/self/fd", "/dev/fd"):
+                  if os.path.isdir(probe):
+                      try:
+                          return len(os.listdir(probe))
+                      except OSError:
+                          pass
+              return None
+
+
+          if _open_fd_count() is None:
+              sys.exit("PROBE-FD FAIL: no portable descriptor count on this platform")
+
+
+          # ---- the stub processor the repo's own plan tests use: no model, no network ----
+          class _TinyTokenizer:
+              pad_token_id = 2
+              eos_token_id = 2
+              unk_token_id = -1
+              image_token_id = 200
+
+              def encode(self, text):
+                  return [int(part) for part in str(text).split()]
+
+              def convert_tokens_to_ids(self, token):
+                  if isinstance(token, list):
+                      return [self.convert_tokens_to_ids(item) for item in token]
+                  return {"<image>": 200, "<|image_pad|>": 201}.get(token, self.unk_token_id)
+
+
+          class _ContentProcessor:
+              tokenizer = _TinyTokenizer()
+              image_processor = object()
+
+              def __call__(self, text, **_kwargs):
+                  rows = [[int(item), 200, 2] for item in text]
+                  masks = [[1, 1, 1] for _ in rows]
+                  return {
+                      "input_ids": np.array(rows, dtype=np.int32),
+                      "attention_mask": np.array(masks, dtype=np.int32),
+                  }
+
+
+          CONFIG = {"image_size": 16, "image_token_id": 200}
+          ROOT = tempfile.mkdtemp(prefix="probe940fd_")
+          PATHS = []
+          for _i in range(N_ROWS):
+              _p = os.path.join(ROOT, f"row{_i}.png")
+              Image.fromarray(np.full((8, 8, 3), _i % 251, dtype=np.uint8)).save(_p)
+              PATHS.append(_p)
+          print(f"PROBE-FD wrote {N_ROWS} single-frame PNGs under {ROOT}")
+
+
+          class _LazyImageRows:
+              """The textbook dataset idiom: open in __getitem__, decode later.
+
+              Samples the live descriptor count on every read so what is reported is the PEAK
+              held during the build, not merely the residue afterwards.
+              """
+
+              def __init__(self, n_rows, peak):
+                  self.n_rows = n_rows
+                  self.peak = peak
+
+              def __len__(self):
+                  return self.n_rows
+
+              def __getitem__(self, index):
+                  self.peak.append(_open_fd_count())
+                  return {"text": str(index % 7), "images": [Image.open(PATHS[index])]}
+
+
+          def _build(n_rows):
+              """Build a real plan and return (peak growth, residual growth, plan)."""
+              gc.collect()
+              before = _open_fd_count()
+              samples = []
+              plan = _create_vlm_batch_plan(
+                  dataset=_LazyImageRows(n_rows, samples),
+                  processor=_ContentProcessor(),
+                  config=CONFIG,
+                  batch_size=2,
+                  max_seq_length=8,
+              )
+              gc.collect()
+              after = _open_fd_count()
+              peak = max(samples) if samples else before
+              return peak - before, after - before, plan, len(samples)
+
+
+          # ---------------- PROBE-FD1: peak descriptors at the natural limit ----------------
+          peak_growth, residual, plan, reads = _build(N_ROWS)
+          print(
+              f"PROBE-FD1 rows={N_ROWS} dataset_reads={reads} "
+              f"peak_fd_growth={peak_growth} residual_fd_growth={residual} "
+              f"batches={len(plan)}"
+          )
+          assert peak_growth <= 8, (
+              f"the plan pinned a peak of {peak_growth} descriptors across {N_ROWS} rows; "
+              "a stored row must not keep its image file open until materialization"
+          )
+          assert residual <= 8, f"{residual} descriptors survived the build"
+          assert len(plan) == N_ROWS // 2, len(plan)
+
+          # Structural corroboration, independent of descriptor arithmetic: the stored row
+          # holds a path stand-in, not a live PIL handle.
+          stored = plan._rows[0].item["images"][0]
+          print(f"PROBE-FD1 stored payload type={type(stored).__name__}")
+          assert isinstance(stored, _LazyVLMImage), (
+              f"stored row holds {type(stored).__name__}, expected _LazyVLMImage"
+          )
+          batch = plan[0]
+          print(f"PROBE-FD1 materialized batch input_ids={tuple(batch['input_ids'].shape)}")
+          assert batch["input_ids"].shape[0] == 2
+          print("PROBE-FD1 OK: descriptors stay flat and the released row still materializes")
+
+          # ------------- PROBE-FD2: the same build under macOS's default 256 cap -------------
+          live = _open_fd_count()
+          print(f"PROBE-FD2 descriptors currently open={live}; pinning soft RLIMIT_NOFILE to 256")
+          if live > 200:
+              sys.exit(f"PROBE-FD2 FAIL: {live} descriptors already open, cannot pin a 256 cap")
+          resource.setrlimit(resource.RLIMIT_NOFILE, (256, _HARD))
+          try:
+              capped_soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+              print(f"PROBE-FD2 soft limit now {capped_soft}, building {N_ROWS} rows")
+              try:
+                  peak2, residual2, plan2, _ = _build(N_ROWS)
+              except OSError as exc:
+                  sys.exit(
+                      f"PROBE-FD2 FAIL: plan build hit {type(exc).__name__} {exc} under a 256 "
+                      f"descriptor cap at {N_ROWS} rows -- this is the exact pre-fix failure"
+                  )
+              print(
+                  f"PROBE-FD2 rows={N_ROWS} soft_limit=256 peak_fd_growth={peak2} "
+                  f"residual_fd_growth={residual2} batches={len(plan2)}"
+              )
+              assert peak2 <= 8, peak2
+              assert len(plan2) == N_ROWS // 2
+              print(
+                  "PROBE-FD2 OK: a 300-row plan builds under the 256 cap that would have "
+                  "raised Errno 24 from ~254 rows before the fix"
+              )
+          finally:
+              resource.setrlimit(resource.RLIMIT_NOFILE, (_SOFT, _HARD))
+
+          # --------------- PROBE-FD3: handles nested in a TUPLE (c3641eda) ---------------
+          # _extract_vlm_images does not unwrap a tuple, so this shape is driven through the
+          # release/restore walkers directly -- exactly as the repo's own test does.
+          gc.collect()
+          before3 = _open_fd_count()
+          released = [
+              _release_vlm_row_image_handles({"images": (Image.open(p),)}) for p in PATHS
+          ]
+          held3 = _open_fd_count() - before3
+          print(f"PROBE-FD3 tuple-nested rows={len(PATHS)} fd_growth={held3}")
+          assert held3 <= 2, (
+              f"the release walker pinned {held3} descriptors for {len(PATHS)} tuple-nested "
+              "rows; the walkers must traverse tuples, not only dicts and lists"
+          )
+          assert isinstance(released[5]["images"][0], _LazyVLMImage), type(released[5]["images"][0])
+          print("PROBE-FD3 OK: tuple-nested handles are released, descriptors stay flat")
+
+          # --------------- PROBE-FD4: restore fidelity, types and identity ---------------
+          restored = _restore_vlm_row_image_handles(released[5])
+          first_pixel = int(np.asarray(restored["images"][0]).reshape(-1)[0])
+          print(
+              f"PROBE-FD4 restored container={type(restored['images']).__name__} "
+              f"first_pixel={first_pixel} expected={5 % 251}"
+          )
+          assert isinstance(restored["images"], tuple), type(restored["images"])
+          assert first_pixel == 5 % 251, first_pixel
+
+          import collections  # noqa: E402
+
+          holder = collections.namedtuple("holder", "left right")
+          row = {"media": holder(left=Image.open(PATHS[0]), right="caption")}
+          out = _release_vlm_row_image_handles(row)
+          back = _restore_vlm_row_image_handles(out)
+          print(
+              f"PROBE-FD4 namedtuple preserved={type(out['media']).__name__} "
+              f"payload_kept={out['media'].right!r} "
+              f"restored_pixel={int(np.asarray(back['media'].left).reshape(-1)[0])}"
+          )
+          assert type(out["media"]) is holder, type(out["media"])
+          assert out["media"].right == "caption"
+          assert int(np.asarray(back["media"].left).reshape(-1)[0]) == 0
+
+          plain = {"images": ("a", "b")}
+          same = _release_vlm_row_image_handles(plain)["images"] is plain["images"]
+          print(f"PROBE-FD4 tuple with nothing releasable keeps its identity={same}")
+          assert same, "a tuple holding nothing releasable must come back at its exact identity"
+          print("PROBE-FD4 OK: restore preserves tuple and namedtuple types and payloads")
+
+          print("PROBE-FD ALL OK")
+          PY
+      - name: "940 9a05e0a2/c3641eda: reused media buffers reported, not trained on"
+        if: always()
+        run: |
+          export PROBE_EXPECT_ZOO_ROOT=$GITHUB_WORKSPACE
+          python - <<'PY'
+          """PR 940 probe (b): MEDIA ALIASING reported instead of silently trained on.
+
+          The plan stores rows by reference, so a dataset that decodes into ONE reused buffer
+          rewrites rows it has already collected: every stored row ends up holding the last
+          image read. Copying every payload would cost one image per scheduled slot, so the
+          plan probes content and REPORTS the corruption with an actionable message.
+
+          Four reuse shapes are driven through the real `_create_vlm_batch_plan`:
+            1. numpy, the same ndarray object refilled per read
+            2. numpy, a fresh ndarray per read but a VIEW over one shared byte buffer
+            3. PIL, one image repainted in place
+            4. torch, one tensor refilled per read
+
+          Plus the two controls that keep the check honest:
+            PROBE-AL2  an OFF-STRIDE single-byte mutation -- invisible to the 16-sample probe
+                       that shipped at 9a05e0a2, caught by c3641eda's whole-payload digest
+            PROBE-AL3  a dataset returning a FRESH image per read must build, materialize and
+                       carry each row's own pixels through, with no false positive
+            PROBE-AL4  the probe must not COPY: the plan keeps referencing payloads it does
+                       not own
+
+          Exit code 0 == every behaviour holds.
+
+          A/B validated on Linux CPU before staging against the pre-fix bodies (see REPORT_940.md).
+          """
+          import os
+          import sys
+          import tempfile
+
+          import numpy as np
+          import torch  # imported before the plan build: the fingerprint dispatches on sys.modules
+          from PIL import Image
+
+          import unsloth_zoo
+          from unsloth_zoo.mlx.utils import _create_vlm_batch_plan, _vlm_media_fingerprint
+
+          print("PROBE-AL unsloth_zoo from", unsloth_zoo.__file__)
+          _EXPECT_ROOT = os.environ.get("PROBE_EXPECT_ZOO_ROOT")
+          if _EXPECT_ROOT:
+              _actual = os.path.realpath(unsloth_zoo.__file__)
+              if not _actual.startswith(os.path.realpath(_EXPECT_ROOT) + os.sep):
+                  sys.exit(
+                      f"PROBE-AL FAIL: imported unsloth_zoo from {_actual}, "
+                      f"expected it under {_EXPECT_ROOT}"
+                  )
+
+          import mlx.core as mx  # noqa: E402
+
+          print("PROBE-AL device", mx.default_device(), "torch", torch.__version__)
+          if "mlx_simulation" in str(getattr(mx, "__file__", "")):
+              sys.exit("PROBE-AL FAIL: mlx.core is the simulation stub, not the real runtime")
+
+          # The actionable message the plan must raise, verbatim from unsloth_zoo/mlx/utils.py.
+          EXPECTED_FRAGMENT = "changed after the row"
+          EXPECTED_ADVICE = "image.copy() or array.copy()"
+
+
+          class _TinyTokenizer:
+              pad_token_id = 2
+              eos_token_id = 2
+              unk_token_id = -1
+              image_token_id = 200
+
+              def encode(self, text):
+                  return [int(part) for part in str(text).split()]
+
+              def convert_tokens_to_ids(self, token):
+                  if isinstance(token, list):
+                      return [self.convert_tokens_to_ids(item) for item in token]
+                  return {"<image>": 200, "<|image_pad|>": 201}.get(token, self.unk_token_id)
+
+
+          class _ContentProcessor:
+              tokenizer = _TinyTokenizer()
+              image_processor = object()
+
+              def __call__(self, text, **_kwargs):
+                  rows = [[int(item), 200, 2] for item in text]
+                  masks = [[1, 1, 1] for _ in rows]
+                  return {
+                      "input_ids": np.array(rows, dtype=np.int32),
+                      "attention_mask": np.array(masks, dtype=np.int32),
+                  }
+
+
+          CONFIG = {"image_size": 16, "image_token_id": 200}
+
+
+          def build(dataset, **extra):
+              return _create_vlm_batch_plan(
+                  dataset=dataset,
+                  processor=_ContentProcessor(),
+                  config=CONFIG,
+                  batch_size=2,
+                  max_seq_length=8,
+                  num_batches=2,
+                  dataset_order="sequential",
+                  **extra,
+              )
+
+
+          # ------------------------- the four reuse shapes -------------------------
+          class _SameArray:
+              """Refills and returns one preallocated ndarray."""
+
+              def __init__(self):
+                  self.buffer = np.zeros((4, 4, 3), np.uint8)
+
+              def __len__(self):
+                  return 4
+
+              def __getitem__(self, index):
+                  self.buffer[:] = index + 1
+                  return {"text": str(index), "images": [self.buffer]}
+
+
+          class _SharedMemoryView:
+              """Fresh ndarray per read, but a view over one reused byte buffer."""
+
+              def __init__(self):
+                  self.raw = bytearray(4 * 4 * 3)
+
+              def __len__(self):
+                  return 4
+
+              def __getitem__(self, index):
+                  self.raw[:] = bytes([index + 1]) * len(self.raw)
+                  return {
+                      "text": str(index),
+                      "images": [
+                          np.frombuffer(memoryview(self.raw), np.uint8).reshape(4, 4, 3)
+                      ],
+                  }
+
+
+          class _MutatedImage:
+              """Repaints and returns one PIL image."""
+
+              def __init__(self):
+                  self.image = Image.new("RGB", (4, 4))
+
+              def __len__(self):
+                  return 4
+
+              def __getitem__(self, index):
+                  self.image.paste((index + 1,) * 3, (0, 0, 4, 4))
+                  return {"text": str(index), "images": [self.image]}
+
+
+          class _ReusedTorchTensor:
+              """Refills and returns one torch tensor."""
+
+              def __init__(self):
+                  self.buffer = torch.zeros((4, 4, 3), dtype=torch.uint8)
+
+              def __len__(self):
+                  return 4
+
+              def __getitem__(self, index):
+                  self.buffer.fill_(index + 1)
+                  return {"text": str(index), "images": [self.buffer]}
+
+
+          SHAPES = [
+              ("numpy same object", _SameArray()),
+              ("numpy view over shared memory", _SharedMemoryView()),
+              ("PIL mutated in place", _MutatedImage()),
+              ("torch tensor reuse", _ReusedTorchTensor()),
+          ]
+
+          failures = []
+          for label, dataset in SHAPES:
+              try:
+                  build(dataset)
+              except ValueError as exc:
+                  message = str(exc)
+                  ok = EXPECTED_FRAGMENT in message and EXPECTED_ADVICE in message
+                  print(
+                      f"PROBE-AL1 shape={label!r} raised=ValueError actionable={ok} "
+                      f"msg={message[:120]!r}"
+                  )
+                  if not ok:
+                      failures.append(f"{label}: message not actionable: {message!r}")
+              except Exception as exc:  # noqa: BLE001
+                  print(f"PROBE-AL1 shape={label!r} raised={type(exc).__name__}: {exc}")
+                  failures.append(f"{label}: raised {type(exc).__name__}, expected ValueError")
+              else:
+                  print(f"PROBE-AL1 shape={label!r} DID NOT RAISE -- aliasing went unreported")
+                  failures.append(f"{label}: no ValueError, the plan trained on the wrong images")
+
+          if failures:
+              sys.exit("PROBE-AL1 FAIL: " + "; ".join(failures))
+          print("PROBE-AL1 OK: all four reuse shapes report the aliasing with an actionable error")
+
+
+          # ------- PROBE-AL2: an off-stride mutation a 16-sample probe cannot see -------
+          # The probe that shipped at 9a05e0a2 read 16 positions at stride = size // 16, so a
+          # mutation landing between them was invisible and the plan kept the aliased buffer.
+          _SIDE = 64
+          _PIXELS = _SIDE * _SIDE * 3
+          _STRIDE = max(1, _PIXELS // 16)
+          _OFF_STRIDE = next(i for i in range(_PIXELS) if i % _STRIDE)
+
+
+          class _OffStrideMutation:
+              """Same buffer every read; only one off-stride byte changes between reads."""
+
+              def __init__(self):
+                  self.buffer = np.random.RandomState(0).randint(
+                      0, 255, (_SIDE, _SIDE, 3), dtype=np.uint8
+                  )
+
+              def __len__(self):
+                  return 4
+
+              def __getitem__(self, index):
+                  flat = self.buffer.reshape(-1)
+                  flat[_OFF_STRIDE] = (int(flat[_OFF_STRIDE]) + 7) % 256
+                  return {"text": str(index), "images": [self.buffer]}
+
+
+          _ds = _OffStrideMutation()
+          _before = _ds.buffer.copy()
+          _ds[0]
+          _sampled_blind = (
+              _before.reshape(-1)[::_STRIDE][:16].tobytes()
+              == _ds.buffer.reshape(-1)[::_STRIDE][:16].tobytes()
+          )
+          print(
+              f"PROBE-AL2 payload={_PIXELS}B stride={_STRIDE} mutated_index={_OFF_STRIDE} "
+              f"invisible_to_a_16_sample_probe={_sampled_blind}"
+          )
+          if not _sampled_blind:
+              sys.exit("PROBE-AL2 FAIL: the mutation is not off-stride, the case is not exercised")
+          print(
+              "PROBE-AL2 fingerprint differs across the mutation:",
+              _vlm_media_fingerprint(_before) != _vlm_media_fingerprint(_ds.buffer),
+          )
+          try:
+              build(_OffStrideMutation())
+          except ValueError as exc:
+              print(f"PROBE-AL2 plan raised ValueError: {str(exc)[:110]!r}")
+              assert EXPECTED_FRAGMENT in str(exc), str(exc)
+              print(
+                  "PROBE-AL2 OK: the whole-payload digest catches a change a sparse sample "
+                  "would have missed"
+              )
+          else:
+              sys.exit(
+                  "PROBE-AL2 FAIL: an off-stride mutation went unreported -- the content probe "
+                  "is still sampling rather than reducing every byte"
+              )
+
+          # A sum alone is blind to a change that cancels; the second reduction is not.
+          _orig = np.random.RandomState(1).randint(0, 255, (32, 32, 3), dtype=np.uint8)
+          _cancel = _orig.copy().reshape(-1)
+          _cancel[1] = (int(_cancel[1]) + 3) % 256
+          _cancel[2] = (int(_cancel[2]) - 3) % 256
+          _cancel = _cancel.reshape(_orig.shape)
+          print(
+              "PROBE-AL2 cancelling-change detected:",
+              _vlm_media_fingerprint(_orig) != _vlm_media_fingerprint(_cancel),
+          )
+          assert _vlm_media_fingerprint(_orig) != _vlm_media_fingerprint(_cancel), (
+              "two reductions are required: a change that cancels under a sum went unseen"
+          )
+
+
+          # ------- PROBE-AL3: the control -- a fresh image per read must work normally -------
+          ROOT = tempfile.mkdtemp(prefix="probe940al_")
+          N_CONTROL = 8
+          CONTROL_PATHS = []
+          for _i in range(N_CONTROL):
+              _p = os.path.join(ROOT, f"ctrl{_i}.png")
+              Image.fromarray(np.full((8, 8, 3), _i + 1, dtype=np.uint8)).save(_p)
+              CONTROL_PATHS.append(_p)
+
+
+          class _FreshImagePerRead:
+              """The correct dataset idiom: a new decode per read, nothing shared."""
+
+              def __len__(self):
+                  return N_CONTROL
+
+              def __getitem__(self, index):
+                  return {"text": str(index % 7), "images": [Image.open(CONTROL_PATHS[index])]}
+
+
+          control_plan = _create_vlm_batch_plan(
+              dataset=_FreshImagePerRead(),
+              processor=_ContentProcessor(),
+              config=CONFIG,
+              batch_size=2,
+              max_seq_length=8,
+              dataset_order="sequential",
+          )
+          print(f"PROBE-AL3 control plan built: batches={len(control_plan)}")
+          assert len(control_plan) == N_CONTROL // 2, len(control_plan)
+
+          seen = []
+          for _b in range(len(control_plan)):
+              batch = control_plan[_b]
+              assert batch["input_ids"].shape[0] == 2, batch["input_ids"].shape
+              seen.append(tuple(batch["input_ids"].shape))
+          print(f"PROBE-AL3 materialized every batch: shapes={seen}")
+
+          # Each stored row must still carry ITS OWN pixels, not the last row's.
+          from unsloth_zoo.mlx.utils import _restore_vlm_row_image_handles  # noqa: E402
+
+          pixels = [
+              int(
+                  np.asarray(
+                      _restore_vlm_row_image_handles(control_plan._rows[i].item)["images"][0]
+                  ).reshape(-1)[0]
+              )
+              for i in range(N_CONTROL)
+          ]
+          print(f"PROBE-AL3 per-row first pixel={pixels} expected={[i + 1 for i in range(N_CONTROL)]}")
+          assert pixels == [i + 1 for i in range(N_CONTROL)], pixels
+          print(
+              "PROBE-AL3 OK: a well-behaved dataset builds, materializes every batch and keeps "
+              "each row's own pixels -- no false positive from the content probe"
+          )
+
+
+          # ------- PROBE-AL4: the probe must REFERENCE, never copy, what it does not own -------
+          _owned = np.full((4, 4, 3), 5, dtype=np.uint8)
+
+
+          class _StablePayload:
+              """Hands back the same object every read WITHOUT mutating it -- legal."""
+
+              def __len__(self):
+                  return 4
+
+              def __getitem__(self, index):
+                  return {"text": str(index), "images": [_owned]}
+
+
+          stable_plan = build(_StablePayload())
+          stored = stable_plan._rows[0].item["images"][0]
+          print(
+              f"PROBE-AL4 stored payload is the caller's object: {stored is _owned} "
+              f"(id match, no defensive copy)"
+          )
+          assert stored is _owned, "the plan copied a payload it was only supposed to reference"
+          print("PROBE-AL4 OK: an unchanged shared payload is referenced, not copied or rejected")
+
+          print("PROBE-AL ALL OK")
+          PY
+
+      - name: "Remaining tests/test_mlx*.py sweep (known red on upstream main, excluded from the pass/fail verdict)"
+        if: always()
+        continue-on-error: true
+        run: |
+          strict="tests/test_mlx_batching_and_decay.py tests/test_mlx_shape_guard.py tests/test_mlx_vlm_label_masks.py tests/test_mlx_trainer_internals.py tests/test_mlx_training_e2e_metal.py tests/test_mlx_ddp_metal.py"
+          rc=0
+          for f in tests/test_mlx*.py; do
+            case " $strict " in *" $f "*) echo "SWEEP-SKIP $f (covered by a strict step)"; continue ;; esac
+            echo "::group::$f"
+            python -m pytest "$f" -q -rs \
+              --deselect tests/test_mlx_batching_and_decay.py::test_compiler_review_guards_are_present \
+              || { echo "SWEEP-RED $f"; rc=1; }
+            echo "::endgroup::"
+          done
+          echo "SWEEP-EXIT $rc (informational only; the strict steps above are the verdict)"
