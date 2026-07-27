@@ -1,0 +1,285 @@
+# Disposable staging-only verification for upstream PR #932.
+# The repo's mlx-ci.yml aborts at tests/test_qwen35_vjp_metal.py, which fails on upstream
+# main independently of this PR, so its later steps never run. This runs the PR's own MLX
+# tests on Apple Silicon directly, one pytest process per file so the mlx_simulation stub
+# installed by sibling test modules cannot mask the real mlx runtime.
+
+name: "PR 932 MLX verify"
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: pr932-mlx-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: "PR 932 MLX verify (macos-14)"
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+
+      - name: Versions and real-mlx probe
+        run: |
+          python -c "import platform; print('machine', platform.machine(), platform.platform())"
+          python -c "import mlx.core as mx; print('mlx.core', mx.__file__); print('device', mx.default_device())"
+          python -c "from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear; print('SwitchLinear', SwitchLinear)"
+          # tests/test_mlx_ddp_metal.py per-test-skips unless mlx.launch sits beside sys.executable,
+          # so record its presence explicitly: that decides whether the real 2-rank path can run.
+          python -c "import sys, pathlib; p = pathlib.Path(sys.executable).with_name('mlx.launch'); print('mlx.launch', p, 'exists=', p.exists())"
+          pip list | grep -Ei 'mlx|transformers|torch|numpy'
+
+      - name: "Real mlx-community quant load + forward (not a stub)"
+        if: always()
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          from mlx_lm import load
+          model, tok = load("mlx-community/SmolLM-135M-Instruct-4bit")
+          ids = mx.array([tok.encode("Unsloth makes finetuning fast")])
+          out = model(ids)
+          mx.eval(out)
+          print("REALQUANT class", type(model).__name__, "logits", out.shape, out.dtype)
+          print("REALQUANT device", mx.default_device(), "finite", bool(mx.isfinite(out).all()))
+          PY
+
+      - name: "tests/test_mlx_cpt_partition_metal.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_cpt_partition_metal.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_cpt_partition_metal.py"
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped (see SKIPLIST above; NOT a module-level skip)")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0)")
+          PY
+      - name: "tests/test_mlx_save_lora_adapters_filter.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_save_lora_adapters_filter.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_save_lora_adapters_filter.py"
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped (see SKIPLIST above; NOT a module-level skip)")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0)")
+          PY
+      - name: "tests/test_mlx_training_e2e_metal.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_training_e2e_metal.py"
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped (see SKIPLIST above; NOT a module-level skip)")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0)")
+          PY
+      - name: "tests/test_mlx_trainer_internals.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_trainer_internals.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_trainer_internals.py"
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped (see SKIPLIST above; NOT a module-level skip)")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0)")
+          PY
+
+      - name: "Remaining tests/test_mlx*.py sweep (known red on upstream main, excluded from the pass/fail verdict)"
+        if: always()
+        continue-on-error: true
+        run: |
+          strict="tests/test_mlx_cpt_partition_metal.py tests/test_mlx_save_lora_adapters_filter.py tests/test_mlx_training_e2e_metal.py tests/test_mlx_trainer_internals.py"
+          rc=0
+          for f in tests/test_mlx*.py; do
+            case " $strict " in *" $f "*) echo "SWEEP-SKIP $f (covered by a strict step)"; continue ;; esac
+            echo "::group::$f"
+            python -m pytest "$f" -q -rs \
+              --deselect tests/test_mlx_batching_and_decay.py::test_compiler_review_guards_are_present \
+              || { echo "SWEEP-RED $f"; rc=1; }
+            echo "::endgroup::"
+          done
+          echo "SWEEP-EXIT $rc (informational only; the strict steps above are the verdict)"
