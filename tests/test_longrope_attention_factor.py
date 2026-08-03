@@ -1,0 +1,169 @@
+"""A LongRoPE attention_factor that cannot be real must be ignored.
+
+For LongRoPE the attention scaling factor is, by construction,
+
+    sqrt(1 + log(factor) / log(original_max_position_embeddings))
+
+which is a number near 1 -- about 1.19 for a 32x extension of a 4096
+context. transformers derives exactly that when `attention_factor` is
+absent, but takes the config's word for it when present.
+
+Two published configs set `attention_factor` equal to `factor` (32.0),
+roughly 27x the real value. Nothing raises; the model just stops predicting
+well. Measured on identical text:
+
+    unsloth/Phi-3.5-mini-instruct   as published   4.74
+                                    value dropped  2.13
+    microsoft/Phi-3.5-mini-instruct                1.55
+
+Phi_3.5_Mini-Conversational fine-tunes from that base and logs ~9 loss,
+while Phi_3_Medium-Conversational -- the same notebook, same dataset, same
+chat template, one word different -- logs ~1. The sweep marked it PASS,
+because a model that trains badly raises nothing.
+
+The signature is exact on purpose: attention_factor == factor AND
+factor > 2. A real attention factor is never the extension ratio and never
+much above 1.5, so this cannot fire on a config that means what it says.
+"""
+
+import math
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from unsloth_zoo.temporary_patches.misc import (  # noqa: E402
+    patch_longrope_impossible_attention_factor,
+)
+from transformers import modeling_rope_utils as R  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def patched():
+    """Apply the patch, then put the originals back."""
+    before_attr = R._compute_longrope_parameters
+    before_dict = R.ROPE_INIT_FUNCTIONS.get("longrope")
+    patch_longrope_impossible_attention_factor()
+    yield
+    R._compute_longrope_parameters = before_attr
+    if before_dict is not None:
+        R.ROPE_INIT_FUNCTIONS["longrope"] = before_dict
+
+
+def _cfg(attention_factor=None, factor=32.0, original_max=4096,
+         max_pos=131072):
+    scaling = {"rope_type": "longrope", "factor": factor,
+               "short_factor": [1.0] * 48, "long_factor": [1.0] * 48}
+    if attention_factor is not None:
+        scaling["attention_factor"] = attention_factor
+    return types.SimpleNamespace(
+        rope_scaling=scaling, original_max_position_embeddings=original_max,
+        max_position_embeddings=max_pos, rope_theta=10000.0,
+        hidden_size=3072, num_attention_heads=32, head_dim=96)
+
+
+def _att(cfg):
+    return R.ROPE_INIT_FUNCTIONS["longrope"](cfg, "cpu")[1]
+
+
+DERIVED = math.sqrt(1 + math.log(32) / math.log(4096))   # ~1.1902
+
+
+# ---- the published configs ------------------------------------------------
+
+def test_impossible_value_is_replaced_by_the_derivation():
+    cfg = _cfg(attention_factor=32.0)
+    assert _att(cfg) == pytest.approx(DERIVED, rel=1e-6)
+
+
+def test_the_bad_key_is_removed_from_the_config():
+    cfg = _cfg(attention_factor=32.0)
+    _att(cfg)
+    assert "attention_factor" not in cfg.rope_scaling
+
+
+def test_applying_twice_is_stable():
+    cfg = _cfg(attention_factor=32.0)
+    first = _att(cfg)
+    assert _att(cfg) == pytest.approx(first)
+
+
+def test_the_dict_entry_is_patched_not_just_the_module_attribute():
+    """Models resolve the callable through ROPE_INIT_FUNCTIONS, so patching
+    only the module attribute would be a silent no-op."""
+    assert R.ROPE_INIT_FUNCTIONS["longrope"] is R._compute_longrope_parameters
+    assert getattr(R.ROPE_INIT_FUNCTIONS["longrope"], "_unsloth_patched", False)
+
+
+def test_patching_twice_does_not_stack():
+    first = R.ROPE_INIT_FUNCTIONS["longrope"]
+    patch_longrope_impossible_attention_factor()
+    assert R.ROPE_INIT_FUNCTIONS["longrope"] is first
+
+
+# ---- configs that mean what they say --------------------------------------
+
+def test_a_real_attention_factor_is_preserved():
+    assert _att(_cfg(attention_factor=1.19)) == pytest.approx(1.19)
+
+
+def test_a_value_equal_to_a_small_factor_is_preserved():
+    # factor <= 2 is not the signature; 2.0 could genuinely be both.
+    assert _att(_cfg(attention_factor=2.0, factor=2.0)) == pytest.approx(2.0)
+
+
+def test_a_large_value_that_differs_from_factor_is_preserved():
+    # Only the exact coincidence is suspicious; a lone odd number is the
+    # author's business, not ours.
+    assert _att(_cfg(attention_factor=8.0, factor=32.0)) == pytest.approx(8.0)
+
+
+def test_absent_attention_factor_behaves_as_before():
+    assert _att(_cfg(attention_factor=None)) == pytest.approx(DERIVED, rel=1e-6)
+
+
+# ---- the guard must never be the thing that breaks a load ----------------
+
+def test_a_config_without_rope_scaling_does_not_raise():
+    cfg = _cfg(attention_factor=32.0)
+    cfg.rope_scaling = None
+    with pytest.raises(Exception):
+        # The real function needs the dict; what matters is that OUR guard
+        # is not the thing that raised.
+        _att(cfg)
+
+
+def test_non_numeric_values_are_left_alone():
+    cfg = _cfg()
+    cfg.rope_scaling["attention_factor"] = "thirty two"
+    cfg.rope_scaling["factor"] = "thirty two"
+    # Unparseable: the guard declines rather than guessing.
+    try:
+        _att(cfg)
+    except Exception:
+        pass
+    assert cfg.rope_scaling["attention_factor"] == "thirty two"
+
+
+def test_missing_original_max_still_strips_the_bad_value():
+    cfg = _cfg(attention_factor=32.0)
+    del cfg.original_max_position_embeddings
+    _att(cfg)
+    assert "attention_factor" not in cfg.rope_scaling
+
+
+def test_other_rope_types_are_untouched():
+    assert "linear" in R.ROPE_INIT_FUNCTIONS
+    assert not getattr(R.ROPE_INIT_FUNCTIONS["linear"], "_unsloth_patched", False)
+
+
+def test_registered_as_a_temporary_patch():
+    from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
+    names = [getattr(f, "__name__", "") for f in TEMPORARY_PATCHES]
+    assert "patch_longrope_impossible_attention_factor" in names
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

@@ -1840,3 +1840,100 @@ def patch_deepseek_v2_moe_alias():
         m.DeepseekV2MoE = m.DeepseekV2Moe
 pass
 TEMPORARY_PATCHES.append(patch_deepseek_v2_moe_alias)
+
+
+def patch_longrope_impossible_attention_factor():
+    """Ignore a LongRoPE `attention_factor` that cannot be a real one.
+
+    For LongRoPE the attention scaling factor is, by construction,
+
+        sqrt(1 + log(factor) / log(original_max_position_embeddings))
+
+    which is a number near 1 -- about 1.19 for a 32x extension of a 4096
+    context. transformers derives exactly that when `attention_factor` is
+    absent, but uses the config's value verbatim when it is present.
+
+    Two published configs carry `attention_factor` equal to `factor` (32.0),
+    which is roughly 27x the real value and scales every cos/sin in the
+    attention by that much. The weights load without complaint and the model
+    simply stops predicting well:
+
+        unsloth/Phi-3.5-mini-instruct           4.74 -> 2.13 cross-entropy
+        unsloth/Phi-3.5-mini-instruct-bnb-4bit  (same config)
+
+    measured on the same text with the value dropped. Phi_3.5_Mini-
+    Conversational fine-tunes from that base and logs ~9 loss where its
+    Phi-3-medium sibling, same notebook and same data, logs ~1.
+
+    The signature is deliberately exact: `attention_factor == factor` AND
+    `factor > 2`. A genuine attention_factor is never the extension ratio,
+    and never exceeds about 1.5, so this cannot fire on a config that means
+    what it says. Eight other LongRoPE repos checked are untouched.
+
+    The real remedy is republishing those two configs; this only stops the
+    already-published ones from silently training badly.
+    """
+    try:
+        import functools
+        import math
+        from transformers import modeling_rope_utils as _rope
+    except Exception:
+        return
+    original = getattr(_rope, "_compute_longrope_parameters", None)
+    if original is None or getattr(original, "_unsloth_patched", False):
+        return
+
+    def _sanitise(config):
+        scaling = getattr(config, "rope_scaling", None)
+        if not isinstance(scaling, dict):
+            return
+        factor = scaling.get("factor")
+        attention_factor = scaling.get("attention_factor")
+        if attention_factor is None or factor is None:
+            return
+        try:
+            if float(attention_factor) != float(factor) or float(factor) <= 2.0:
+                return
+        except (TypeError, ValueError):
+            return
+        original_max = getattr(config, "original_max_position_embeddings", None) \
+            or getattr(config, "max_position_embeddings", None)
+        try:
+            correct = math.sqrt(1 + math.log(float(factor)) / math.log(float(original_max)))
+        except (TypeError, ValueError, ZeroDivisionError):
+            correct = None
+        cleaned = dict(scaling)
+        cleaned.pop("attention_factor", None)
+        try:
+            config.rope_scaling = cleaned
+        except Exception:
+            return
+        logger.warning(
+            f"Unsloth: This model's config sets a LongRoPE attention_factor of "
+            f"{attention_factor}, which equals its extension factor and cannot be "
+            f"a real attention factor"
+            + (f" (the derived value is {correct:.4f})" if correct else "")
+            + ". Ignoring it so attention is scaled correctly."
+        )
+
+    @functools.wraps(original)
+    def _compute_longrope_parameters(config, device, seq_len = None, **kwargs):
+        try:
+            _sanitise(config)
+        except Exception:
+            # Never let the guard itself break a model that would have loaded.
+            pass
+        return original(config, device, seq_len = seq_len, **kwargs)
+
+    _compute_longrope_parameters._unsloth_patched = True
+    try:
+        _rope._compute_longrope_parameters = _compute_longrope_parameters
+        # Models resolve the callable through this dict, not the module
+        # attribute, so patching only the attribute would be a no-op.
+        if getattr(_rope, "ROPE_INIT_FUNCTIONS", None) is not None:
+            if _rope.ROPE_INIT_FUNCTIONS.get("longrope") is original:
+                _rope.ROPE_INIT_FUNCTIONS["longrope"] = _compute_longrope_parameters
+    except Exception:
+        return
+pass
+TEMPORARY_PATCHES.append(patch_longrope_impossible_attention_factor)
