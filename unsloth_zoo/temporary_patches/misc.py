@@ -1032,6 +1032,94 @@ pass
 TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
 
+def patch_mamba_ssm_pre_ampere_fallback():
+    """Force the Mamba slow path on GPUs whose Triton cannot build mamba_ssm.
+
+    mamba_ssm's Triton kernels need Ampere (sm_80) or newer. On a Tesla T4
+    (sm_75) the package imports cleanly and `is_fast_path_available` is True,
+    so transformers routes the layer into `cuda_kernels_forward`; the failure
+    only appears once training starts, as an opaque
+
+        RuntimeError: PassManager::run failed
+
+    raised deep inside Triton's LLIR stage while compiling
+    `_chunk_state_fwd_kernel`. Granite4.0 dies this way on Colab's free T4,
+    with nothing in the message to suggest the GPU is the problem.
+
+    `is_fast_path_available` is computed at module import from the symbols
+    mamba_ssm exported, and 17 transformers model modules do this, so patch
+    the availability predicates (covers modules imported later) AND the
+    already-imported modules.
+
+    Unlike the causal_conv1d probe above this uses a capability check rather
+    than a trial kernel launch: probing would mean paying a Triton compile at
+    every import just to watch it fail. Restricted to real NVIDIA CUDA, so
+    ROCm, XPU, MPS and CPU builds are untouched.
+    """
+    if not torch.cuda.is_available():
+        return
+    if getattr(torch.version, "hip", None) is not None:
+        return  # ROCm: mamba_ssm's requirements are a different question
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        return
+    if (major, minor) >= (8, 0):
+        return  # Ampere or newer; the fast path is fine
+
+    try:
+        import mamba_ssm  # noqa: F401
+    except Exception:
+        return  # Not installed, so nothing routes into it anyway
+
+    import sys
+
+    # 1. Modules imported LATER see the package as unavailable, so their
+    #    `is_fast_path_available` evaluates to False at import time.
+    try:
+        import transformers.utils.import_utils as _iu
+        for _pred in ("is_mamba_ssm_available", "is_mamba_2_ssm_available"):
+            if hasattr(_iu, _pred):
+                setattr(_iu, _pred, lambda: False)
+    except Exception:
+        pass
+    pass
+
+    # 2. Modules ALREADY imported have baked the flag in; flip it directly.
+    #    Confined to transformers' own model modules so vLLM's independent
+    #    Triton kernels are left alone.
+    _touched = False
+    for _name, _mod in list(sys.modules.items()):
+        if not _name.startswith("transformers.models.") or _mod is None:
+            continue
+        if not getattr(_mod, "is_fast_path_available", False):
+            continue
+        try:
+            _mod.is_fast_path_available = False
+            for _sym in (
+                "selective_state_update",
+                "mamba_chunk_scan_combined",
+                "mamba_split_conv1d_scan_combined",
+            ):
+                if getattr(_mod, _sym, None) is not None:
+                    setattr(_mod, _sym, None)
+            _touched = True
+        except Exception:
+            pass
+        pass
+    pass
+
+    print(
+        f"Unsloth: mamba_ssm's Triton kernels need compute capability 8.0+ "
+        f"(this GPU is {major}.{minor}). Using the PyTorch slow path for "
+        f"Mamba models."
+    )
+    return _touched
+
+
+TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)
+
+
 def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     try:
         import transformers.models.granitemoehybrid.modeling_granitemoehybrid
