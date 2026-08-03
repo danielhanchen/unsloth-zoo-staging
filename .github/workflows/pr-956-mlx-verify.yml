@@ -1,0 +1,233 @@
+# Disposable staging-only verification for upstream PR #956
+# (Batched generation for MLX text and vision models).
+#
+# The repo's own mlx-ci.yml is opt-in on the `mlx` label, so the two test steps
+# that PR adds have never executed anywhere -- the PR's evidence is entirely the
+# author's local runs. This runs them on real Apple Silicon, and adds the two
+# version matrices the PR's compatibility claims rest on.
+#
+# Every test step is `if: always()` so one red step never hides the rest.
+
+name: "PR 956 MLX verify"
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: pr956-mlx-verify2-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- Job A ---
+  # The PR's own claim on the default stack: both new test files, plus the
+  # contract checks for the two review findings the author rejected.
+  default-stack:
+    name: "A: default stack (macos-14)"
+    runs-on: macos-14
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+          pip install timm
+
+      - name: Versions
+        run: |
+          python -c "import mlx.core as mx; print('metal available:', mx.metal.is_available()); print('device:', mx.default_device())"
+          pip list | grep -Ei 'mlx|transformers|torch|numpy|timm'
+
+      - name: "tests/test_mlx_generate.py (49 logic tests)"
+        if: always()
+        run: python -m pytest tests/test_mlx_generate.py -v -rs
+
+      - name: "tests/test_mlx_generate_metal.py (5 real-model Metal tests)"
+        if: always()
+        run: python -m pytest tests/test_mlx_generate_metal.py -v -rs
+
+      - name: "Contract checks (max_tokens, detokenizer, equivalence, order, kv_bits)"
+        if: always()
+        run: python ci_scripts/pr956_contracts.py
+
+      - name: "Batching sanity (not a benchmark)"
+        if: always()
+        run: python ci_scripts/pr956_batch_sanity.py
+
+  # ---------------------------------------------------------------- Job B ---
+  # The PR claims the vision adapter spans mlx-vlm 0.4.4 through 0.6.7 by
+  # capability detection. 0.6.8 was never tested by the author.
+  mlx-vlm-matrix:
+    name: "B: mlx-vlm ${{ matrix.mlx_vlm }} (macos-14)"
+    runs-on: macos-14
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        mlx_vlm: ['0.4.4', '0.5.0', '0.6.5', '0.6.7', '0.6.8']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+          pip install timm
+
+      - name: "Pin mlx-vlm==${{ matrix.mlx_vlm }}"
+        id: pin
+        continue-on-error: true
+        run: pip install "mlx-vlm==${{ matrix.mlx_vlm }}"
+
+      - name: Resolved environment
+        if: always()
+        run: |
+          echo "pin step outcome: ${{ steps.pin.outcome }}"
+          pip check || echo "pip check reports conflicts (recorded, not fatal)"
+          pip list | grep -Ei 'mlx|transformers|torch|timm'
+
+      - name: Adapter capability report
+        if: always()
+        run: |
+          python - <<'PY'
+          import importlib, json
+          from importlib.metadata import version
+          from unsloth_zoo.mlx.generate import (
+              _probe_vlm_api, _resolve_module_attr,
+              _VLM_BATCH_MODULES, _VLM_STREAM_MODULES,
+          )
+          report = {"mlx_vlm": version("mlx-vlm"), "transformers": version("transformers")}
+          module = _resolve_module_attr(_VLM_BATCH_MODULES, "BatchGenerator")
+          report["batch_module"] = getattr(module, "__name__", None)
+          stream = _resolve_module_attr(_VLM_STREAM_MODULES, "wired_limit")
+          report["wired_limit_module"] = getattr(stream, "__name__", None)
+          if module is not None:
+              report["defining_module"] = getattr(
+                  getattr(module, "BatchGenerator"), "__module__", None
+              )
+              try:
+                  ctor, insert, cancel = _probe_vlm_api(module)
+                  report["probe_vlm_api"] = "PASS"
+                  report["constructor_params"] = sorted(ctor)
+                  report["insert_params"] = sorted(insert)
+                  report["per_row_prompt_kwargs"] = "prompt_kwargs" in insert
+                  report["cancellation"] = cancel is not None
+              except Exception as exc:
+                  report["probe_vlm_api"] = f"FAIL: {type(exc).__name__}: {exc}"
+              defining = importlib.import_module(report.get("defining_module") or "mlx_vlm.generate")
+              for helper in ("_chunked_prefill_enabled", "_split_prompt_kwargs_per_row",
+                             "_is_mrope_position_ids_prompt_kwarg"):
+                  report[helper] = hasattr(defining, helper)
+          print(json.dumps(report, indent=2, default=str))
+          PY
+
+      - name: "tests/test_mlx_generate.py"
+        if: always()
+        run: python -m pytest tests/test_mlx_generate.py -v -rs
+
+      - name: "tests/test_mlx_generate_metal.py (newest releases only)"
+        if: always() && (matrix.mlx_vlm == '0.6.7' || matrix.mlx_vlm == '0.6.8')
+        run: python -m pytest tests/test_mlx_generate_metal.py -v -rs
+
+  # ---------------------------------------------------------------- Job C ---
+  # The PR leaves the declared floor at mlx-lm>=0.28.3 while _probe_text_api
+  # requires GenerationBatch.Response / next_generated / remove / close /
+  # max_kv_size. This says which versions actually satisfy that.
+  mlx-lm-floor:
+    name: "C: mlx-lm ${{ matrix.mlx_lm }} (macos-14)"
+    runs-on: macos-14
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mlx_lm: ['0.28.3', '0.30.7', '0.31.1', '0.31.2', '0.31.3']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+
+      - name: "Pin mlx-lm==${{ matrix.mlx_lm }}"
+        id: pin
+        continue-on-error: true
+        run: pip install "mlx-lm==${{ matrix.mlx_lm }}"
+
+      - name: Resolved environment
+        if: always()
+        run: |
+          echo "pin step outcome: ${{ steps.pin.outcome }}"
+          pip check || echo "pip check reports conflicts (recorded, not fatal)"
+          pip list | grep -Ei 'mlx|transformers|torch'
+
+      - name: "Probe report + real generate_batch"
+        if: always()
+        run: python ci_scripts/pr956_probe.py
+
+  # ---------------------------------------------------------------- Job E ---
+  # What a Linux developer sees. test_mlx_generate.py is the only mlx-dependent
+  # test file in the repo with no import guard.
+  linux-control:
+    name: "E: Linux control (ubuntu-latest)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install (no MLX extras -- mlx is darwin+arm64 only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest==9.0.3
+
+      - name: "tests/test_mlx_generate.py alone (no mlx installed)"
+        if: always()
+        run: python -m pytest tests/test_mlx_generate.py -v -rs
+
+      - name: "tests/test_mlx_generate_metal.py alone (expect module-level skip)"
+        if: always()
+        run: python -m pytest tests/test_mlx_generate_metal.py -v -rs
+
+      - name: "Order dependence: an earlier module installs the shim"
+        if: always()
+        run: python -m pytest tests/test_mlx_gated_delta_vjp.py tests/test_mlx_generate.py -q -rs
+
+      - name: "Whole-suite collection"
+        if: always()
+        run: python -m pytest tests/ --collect-only -q 2>&1 | tail -5
