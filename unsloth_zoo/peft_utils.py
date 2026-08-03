@@ -289,6 +289,39 @@ def get_lora_layer_modules():
 pass
 
 
+
+def _run_eagerly_under_compile(fn):
+    """Make `fn` opaque to TorchDynamo, so torch.compile runs it eagerly.
+
+    Gradient-enabling hooks mutate `requires_grad`, which Dynamo cannot trace:
+    tracing one raises
+
+        Unsupported: Unsupported Tensor.requires_grad_() call
+        Developer debug context: call_method TensorVariable() requires_grad_
+
+    (seen on Gemma3n audio/vision, where the hook sits on
+    Gemma3nMultimodalEmbedder inside the compiled module). These hooks are
+    autograd bookkeeping rather than compute, so running them eagerly and
+    graph-breaking around them is both correct and cheap -- they execute once
+    per forward on a single tensor.
+
+    Degrades to a no-op decorator on any torch without `_dynamo`, so eager
+    users and older torch builds are unaffected.
+    """
+    try:
+        import torch._dynamo as _torch_dynamo
+    except Exception:
+        return fn
+    disable = getattr(_torch_dynamo, "disable", None)
+    if disable is None:
+        return fn
+    try:
+        return disable(fn)
+    except Exception:
+        return fn
+pass
+
+
 def requires_grad_for_gradient_checkpointing(model):
     # All Unsloth Zoo code licensed under LGPLv3
     # Enables requires_grad to make gradient checkpointing work on
@@ -326,6 +359,7 @@ def requires_grad_for_gradient_checkpointing(model):
     pass
 
     # Add post forward hook
+    @_run_eagerly_under_compile
     def requires_grad_post_hook(module, input, output):
         type_output = type(output)
         if type_output is torch.Tensor:
@@ -348,6 +382,7 @@ def requires_grad_for_gradient_checkpointing(model):
                 raise RuntimeError(f"Unsloth: Failed to make output require gradients: {e}")
     pass
 
+    @_run_eagerly_under_compile
     def requires_grad_pre_hook(module, args, kwargs):
         # Try positional args first (normal text models)
         if args:
