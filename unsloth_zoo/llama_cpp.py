@@ -2440,7 +2440,7 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
-        runs_to_do.append((text_args, text_output, "text model"))
+        runs_to_do.append((text_args, text_output, "text model", True))
 
         # Vision projector conversion
         mmproj_args = {
@@ -2449,7 +2449,11 @@ def convert_to_gguf(
             "--mmproj"         : "",
             "--split-max-size" : max_shard_size,
         }
-        runs_to_do.append((mmproj_args, mmproj_output, "vision projector"))
+        # The projector is a BONUS artifact. The text GGUF above already
+        # converted; aborting the whole export because the projector
+        # failed throws away a working model (see the non-fatal handler
+        # in the run loop).
+        runs_to_do.append((mmproj_args, mmproj_output, "vision projector", False))
 
     else:
         if is_gpt_oss:
@@ -2475,7 +2479,7 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
-        runs_to_do.append((args, final_output, "model"))
+        runs_to_do.append((args, final_output, "model", True))
 
     # A bare --outfile lands in the process CWD. On Windows that CWD is often not writable
     # (app launched from a protected dir), so the final write failed with PermissionError
@@ -2493,7 +2497,8 @@ def convert_to_gguf(
     _cwd_writable = _dir_is_writable(os.getcwd())
 
     # Execute conversions
-    for args, output_file, description in runs_to_do:
+    skipped_optional = []
+    for args, output_file, description, required in runs_to_do:
         # Redirect only a bare filename under an unwritable CWD. Absolute paths and
         # relative paths with a directory are the caller's choice; input_folder is probed
         # too since it may be a read-only model source.
@@ -2518,6 +2523,7 @@ def convert_to_gguf(
         # is broken. No cost on the happy path.
         attempted_repair = False
         repair_note = ""
+        optional_failed = False
         while True:
             try:
                 # encoding/errors pinned so non-UTF8 output never crashes decoding.
@@ -2562,7 +2568,37 @@ def convert_to_gguf(
                     text = stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
                     text = text.strip()
                     if text: details += f"\n--- converter {label} ---\n{text}"
+                if not required:
+                    # Optional artifact (the vision projector). The text GGUF
+                    # is already written and usable, so a projector failure
+                    # must not discard it. Mirrors the existing
+                    # "Converting as text-only model" degradation for
+                    # unsupported architectures, but covers the case where the
+                    # architecture IS listed and the converter still fails --
+                    # e.g. KeyError 'image_mean' for deepseek-ocr, or an
+                    # unmappable audio-tower tensor for gemma-3n.
+                    reason = ""
+                    for line in reversed((details or "").splitlines()):
+                        line = line.strip()
+                        if line and ("Error" in line or "Exception" in line):
+                            reason = line
+                            break
+                    skipped_optional.append((description, reason or str(e)))
+                    optional_failed = True
+                    print(
+                        f"Unsloth: Could not convert the {description} to GGUF "
+                        f"({reason or e}). The text model was converted "
+                        f"successfully and is usable; only multimodal "
+                        f"(image/audio) input is unavailable in this GGUF."
+                    )
+                    break
                 raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}")
+
+        # An optional run that failed produced no file on purpose; validating
+        # it would raise "output file not created" and undo the whole point of
+        # treating it as optional.
+        if optional_failed:
+            continue
 
         # Simple validation using native Python - check for main file or sharded files
         if os.path.exists(output_file):
