@@ -1120,6 +1120,89 @@ def patch_mamba_ssm_pre_ampere_fallback():
 TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)
 
 
+def patch_datasets_map_worker_death_retry():
+    """Retry `Dataset.map` single-process when a worker is killed outright.
+
+    Dataset preparation is farmed out to `dataset_num_proc` fork workers,
+    sized from CPU count and free RAM on the assumption of roughly a gigabyte
+    each. Long-text corpora blow through that: on a Colab T4,
+    CodeForces-cot-Finetune_for_Reasoning_on_CodeForces has the kernel
+    OOM-kill a worker, and datasets turns that into
+
+        RuntimeError: One of the subprocesses has abruptly died during map
+        operation. To debug the error, disable multiprocessing.
+
+    which kills the whole run at SFTTrainer construction, before a single
+    training step. Doing exactly what the message says is both the obvious
+    recovery and one the user cannot apply themselves -- the map is issued
+    deep inside TRL, not from their notebook.
+
+    Deliberately narrow. "Abruptly died" means the worker process vanished
+    (OOM-kill, segfault); a genuine exception inside the map function is
+    re-raised by datasets as itself and still propagates untouched, so this
+    cannot mask a real bug. Single-process maps are left alone, and the retry
+    cannot recurse because num_proc is pinned to 1.
+    """
+    try:
+        from datasets import Dataset
+    except Exception:
+        return  # datasets not installed
+
+    original_map = getattr(Dataset, "map", None)
+    if original_map is None or getattr(original_map, "_unsloth_worker_death_retry", False):
+        return
+
+    import functools
+
+    @functools.wraps(original_map)
+    def map(self, *args, **kwargs):
+        try:
+            return original_map(self, *args, **kwargs)
+        except RuntimeError as exc:
+            if "abruptly died" not in str(exc):
+                raise
+            # num_proc has to end up as a keyword we can override, so a call
+            # that passed it positionally is re-expanded into keywords first.
+            call_args, call_kwargs = args, dict(kwargs)
+            num_proc = call_kwargs.get("num_proc", None)
+            if num_proc is None and args:
+                try:
+                    sig = inspect.signature(original_map)
+                    if any(p.kind is p.VAR_POSITIONAL for p in sig.parameters.values()):
+                        raise TypeError("cannot normalise *args")
+                    bound = sig.bind(self, *args, **kwargs)
+                    bound.apply_defaults()
+                    num_proc = bound.arguments.get("num_proc", None)
+                    var_kw = {}
+                    for p in sig.parameters.values():
+                        if p.kind is p.VAR_KEYWORD:
+                            var_kw = bound.arguments.pop(p.name, None) or {}
+                    bound.arguments.pop("self", None)
+                    call_args = ()
+                    call_kwargs = {**bound.arguments, **var_kw}
+                except Exception:
+                    call_args, call_kwargs = args, dict(kwargs)
+                    num_proc = None
+            if not isinstance(num_proc, int) or num_proc <= 1:
+                raise
+            print(
+                f"Unsloth: a dataset worker was killed with num_proc={num_proc} "
+                f"(most likely out of system RAM). Retrying single-process; "
+                f"this is slower but survives."
+            )
+            call_kwargs["num_proc"] = 1
+            return original_map(self, *call_args, **call_kwargs)
+        pass
+    pass
+
+    map._unsloth_worker_death_retry = True
+    Dataset.map = map
+    return True
+
+
+TEMPORARY_PATCHES.append(patch_datasets_map_worker_death_retry)
+
+
 def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     try:
         import transformers.models.granitemoehybrid.modeling_granitemoehybrid
