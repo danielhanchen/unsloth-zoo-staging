@@ -316,9 +316,22 @@ def _run_eagerly_under_compile(fn):
     if disable is None:
         return fn
     try:
-        return disable(fn)
+        wrapped = disable(fn)
     except Exception:
         return fn
+    # register_other_hooks() decides which hooks to keep by matching
+    # __name__/__qualname__ against "requires_grad_pre_hook" /
+    # "requires_grad_post_hook". torch 2.9 happens to carry those through
+    # disable(), but that is an implementation detail of a private module and
+    # this has to hold from torch 2.6 upward, so copy them explicitly. If the
+    # names were ever lost, the hooks would stop being recognised as ours and
+    # get re-registered on top of themselves.
+    for _attr in ("__name__", "__qualname__", "__doc__"):
+        try:
+            setattr(wrapped, _attr, getattr(fn, _attr))
+        except (AttributeError, TypeError):
+            pass
+    return wrapped
 pass
 
 
