@@ -2318,6 +2318,34 @@ def _has_mtp_weight_tensors(input_folder, num_layers):
     return False
 
 
+def _find_bitsandbytes_quantization(config, _path = "config.json"):
+    """Where a bitsandbytes `quantization_config` sits, or None.
+
+    Searched recursively because VLMs keep theirs under a sub-config
+    (`text_config`, `vision_config`), which is the same reason
+    `_remove_quantization_config` in saving_utils walks nested dicts rather
+    than only the top level.
+    """
+    if not isinstance(config, dict):
+        return None
+    quant = config.get("quantization_config")
+    if isinstance(quant, dict):
+        method = quant.get("quant_method")
+        # Older checkpoints omit quant_method and only carry the bnb flags.
+        if method == "bitsandbytes" or (
+            method is None
+            and ("load_in_4bit" in quant or "load_in_8bit" in quant)
+        ):
+            return _path
+    for key, value in config.items():
+        if key == "quantization_config" or not isinstance(value, dict):
+            continue
+        found = _find_bitsandbytes_quantization(value, f"{_path}[{key!r}]")
+        if found is not None:
+            return found
+    return None
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -2349,6 +2377,30 @@ def convert_to_gguf(
     # Load config.json
     with open(config_path, "r", encoding = "utf-8") as f:
         config_file = json.load(f)
+
+    _bnb_where = _find_bitsandbytes_quantization(config_file)
+    if _bnb_where is not None:
+        # llama.cpp has no bitsandbytes dequantizer. Left alone, its converter
+        # raises `NotImplementedError: Quant method is not yet supported:
+        # 'bitsandbytes'` only after reading the whole model, so the user pays
+        # a multi-GB download and a long conversion to reach a message that
+        # never mentions 4bit.
+        #
+        # The usual way to get here is save_pretrained_merged(save_method =
+        # "merged_16bit") on a model with NO LoRA adapter: that path only warns
+        # and returns without dequantizing, and 278 of the notebooks wrap their
+        # setup in %%capture, which swallows the warning. The 4bit weights are
+        # then handed to the converter as if they were 16bit.
+        raise RuntimeError(
+            f"Unsloth: `{input_folder}` still holds bitsandbytes 4bit weights "
+            f"(`quantization_config` at {_bnb_where}), and llama.cpp cannot "
+            f"convert those to GGUF.\n"
+            f"GGUF export needs dequantized 16bit weights. Either load the "
+            f"model with `load_in_4bit = False` before saving, or merge a LoRA "
+            f"adapter with `save_method = \"merged_16bit\"`, which downloads "
+            f"the original 16bit weights. Saving a 4bit model that has no "
+            f"adapter does not dequantize it."
+        )
 
     # The converter sizes block_count from the config, so keep `mtp_num_hidden_layers`
     # only when the weights still carry the MTP layer (else it crashes on the extra
