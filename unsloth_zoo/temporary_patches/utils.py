@@ -37,6 +37,7 @@ __all__ = [
     "_get_unique_storage_name",
     "dedent",
 ]
+import functools
 import inspect
 import typing as t
 import torch
@@ -661,6 +662,73 @@ def _get_unique_storage_name(
 pass
 
 
+def _recompile_limit_errors():
+    """Dynamo's cache-exhaustion exceptions, for whichever torch is installed.
+
+    Named defensively: 2.6 and 2.11 do not agree on which of these exist, and
+    a missing name must not stop the tuple from being built.
+    """
+    try:
+        import torch._dynamo.exc as _exc
+    except Exception:
+        return ()
+    found = []
+    for _n in ("FailOnRecompileLimitHit", "RecompileLimitExceeded",
+               "CacheLimitExceeded"):
+        _e = getattr(_exc, _n, None)
+        if isinstance(_e, type) and issubclass(_e, BaseException):
+            found.append(_e)
+    return tuple(found)
+
+
+def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
+    """Run eager instead of dying when the recompile cache is exhausted.
+
+    `fullgraph = True` makes Dynamo raise on cache exhaustion rather than
+    fall back, so a *performance* problem becomes a hard training failure:
+
+        FailOnRecompileLimitHit: recompile_limit reached with fullgraph=True
+
+    Gemma4_(E2B)-Vision dies this way inside patch_Gemma4RMSNorm, after
+    Unsloth has already raised the limit to 1024. Whatever drives that many
+    recompiles, a run that would merely have been slower should not stop.
+
+    The fallback latches: once exhausted, the cache stays exhausted, and
+    re-entering the compiler every call would cost more than eager. Only the
+    cache-exhaustion exceptions are caught, so a genuine graph break under
+    fullgraph still raises exactly as before.
+    """
+    errors = _recompile_limit_errors()
+    if not errors:
+        return compiled_func
+
+    state = {"eager": False}
+
+    @functools.wraps(eager_func)
+    def wrapper(*args, **kwargs):
+        if state["eager"]:
+            return eager_func(*args, **kwargs)
+        try:
+            return compiled_func(*args, **kwargs)
+        except errors as e:
+            state["eager"] = True
+            logger.warning(
+                f"Unsloth: torch.compile ran out of recompilation cache for "
+                f"{label}; continuing in eager mode. Training is unaffected "
+                f"apart from speed. ({type(e).__name__})"
+            )
+            return eager_func(*args, **kwargs)
+
+    # Keep the compiled callable reachable for anything that unwraps it, and
+    # keep `get_compiler_config` present so the unwrap check below still sees
+    # a compiled function and reaches `__wrapped__` (the eager original).
+    wrapper._unsloth_compiled_func = compiled_func
+    _gcc = getattr(compiled_func, "get_compiler_config", None)
+    if _gcc is not None:
+        wrapper.get_compiler_config = _gcc
+    return wrapper
+
+
 def patch_function(
     target_obj: Any,
     attr_name: str,
@@ -686,12 +754,20 @@ def patch_function(
             new_func = new_func.__wrapped__
         if hasattr(original_func, "get_compiler_config"):
             original_func = original_func.__wrapped__
+        _eager_func = new_func
         new_func = torch.compile(
             new_func,
             fullgraph = fullgraph,
             dynamic = dynamic,
             options = torch_compile_options,
         )
+        if fullgraph:
+            # Only fullgraph turns cache exhaustion into a raise; without it
+            # Dynamo already falls back on its own.
+            new_func = _fall_back_to_eager_on_recompile_limit(
+                new_func, _eager_func,
+                f"{getattr(target_obj, '__name__', target_obj)}.{attr_name}",
+            )
     pass
 
     # Stash original under a unique name for later restoration.
