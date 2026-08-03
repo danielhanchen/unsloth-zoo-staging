@@ -14,7 +14,7 @@ defaults:
 jobs:
   mlx-metal:
     runs-on: macos-14
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       UNSLOTH_COMPILE_DISABLE: '1'
       UNSLOTH_IS_PRESENT: '1'
@@ -59,7 +59,8 @@ jobs:
         run: python ci_probes/pr962_metal_probe.py
 
       - name: End-to-end LoRA training, adamw vs adamw_8bit
-        run: python ci_probes/pr962_metal_e2e.py --steps 200
+        # Same model/shape as the Linux CPU run so the two backends compare directly.
+        run: python ci_probes/pr962_metal_e2e.py --steps 200 --seq-len 256 --batch-size 1
 
       - uses: actions/upload-artifact@v4
         if: always()

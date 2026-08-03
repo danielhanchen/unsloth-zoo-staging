@@ -27,7 +27,7 @@ from mlx.utils import tree_flatten
 
 from unsloth_zoo.mlx.optimizers_quantized import QuantizedMomentAdamW
 
-DEFAULT_MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-bf16"
+DEFAULT_MODEL = "mlx-community/SmolLM2-135M-Instruct"
 
 
 def build_batches(tokenizer, n_batches, batch_size, seq_len, seed):
@@ -77,8 +77,8 @@ def make_model(model_name, rank, seed):
     mx.random.seed(seed)
     model, tokenizer = load(model_name)
     model.freeze()
-    n_layers = len(model.layers) if hasattr(model, "layers") else 8
-    linear_to_lora_layers(model, min(n_layers, 8), {"rank": rank, "scale": 20.0, "dropout": 0.0})
+    n_layers = len(model.model.layers) if hasattr(model, "model") else len(model.layers)
+    linear_to_lora_layers(model, n_layers, {"rank": rank, "scale": 20.0, "dropout": 0.0})
     model.train()
     mx.eval(model.parameters())
     return model, tokenizer
