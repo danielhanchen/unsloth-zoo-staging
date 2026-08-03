@@ -54,6 +54,8 @@ jobs:
           fi
 
       - name: Metal probes (zero-gradient invariant, dead zone, state bytes, peak memory)
+        # Expected to fail: it documents the defects. Do not gate the e2e on it.
+        continue-on-error: true
         run: python ci_probes/pr962_metal_probe.py
 
       - name: End-to-end LoRA training, adamw vs adamw_8bit

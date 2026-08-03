@@ -62,6 +62,7 @@ jobs:
           python -m pytest tests/test_mlx_gated_delta_vjp.py tests/test_mlx_quantized_optimizer_state.py -q -rs 2>&1 | tail -30
 
       - name: Metal-independent probes on the CPU backend
+        continue-on-error: true
         run: |
           pip install mlx mlx-cpu
           python ci_probes/pr962_metal_probe.py
