@@ -1,10 +1,10 @@
-name: "staging-962 ubuntu-latest"
+name: "staging-962 ubuntu-latest (mlx-cpu)"
+# Proof that the numeric half of PR 962 can be gated on Linux: mlx-cpu ships a
+# manylinux x86-64 wheel and mx.quantize / mx.dequantize / mx.compile all run on
+# it, so "the numeric tests need Apple Silicon" is no longer true.
 on:
   push:
     branches: ["pr-962-xplat-ci"]
-    paths:
-      - 'studio/**'
-      - '.github/workflows/staging-962-ubuntu-latest.yml'
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,7 +15,7 @@ defaults:
   run:
     shell: bash
 jobs:
-  test:
+  mlx-cpu:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -25,9 +25,43 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
-      - run: python -m pip install 'mlx>=0.22.0' 'mlx-lm>=0.28.3' 'mlx-vlm>=0.4.4'
-      - run: rc=0; PYTHONPATH=studio/backend python -m pytest tests/test_mlx_quantized_optimizer_routing.py tests/test_mlx_quantized_optimizer_state.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
+
+      - name: Install torch CPU + zoo + mlx-cpu
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.4.0,<2.11.0"
+          pip install -e .[core]
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          pip install pytest==9.0.3
+          pip install mlx mlx-cpu
+          python -c "import mlx.core as mx; print('device', mx.default_device()); a = mx.random.normal((128, 128)); q = mx.quantize(a, group_size=64, bits=8); print('quantize ok', [tuple(x.shape) for x in q])"
+
+      - name: PR numeric state tests on the CPU backend
+        # Run in isolation so the mlx-on-torch shim installed at module scope by
+        # tests/test_mlx_gated_delta_vjp.py can never leak into sys.modules first.
+        run: python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+
+      - name: Assert the numeric tests did not silently skip
+        run: |
+          python -m pytest tests/test_mlx_quantized_optimizer_state.py -q -rs 2>&1 | tee out.txt
+          if grep -qiE '[0-9]+ skipped' out.txt; then
+            echo "numeric state tests skipped on a real-MLX runner"; exit 1
+          fi
+
+      - name: Shim-leak reproduction (importorskip is not a real guard)
+        # test_mlx_gated_delta_vjp.py installs the torch shim at module scope and
+        # sorts before the new file, so on a runner WITHOUT real mlx the state
+        # test errors instead of skipping. Uninstall mlx to show it.
+        continue-on-error: true
+        run: |
+          pip uninstall -y mlx mlx-cpu
+          python -m pytest tests/test_mlx_gated_delta_vjp.py tests/test_mlx_quantized_optimizer_state.py -q -rs 2>&1 | tail -30
+
+      - name: Metal-independent probes on the CPU backend
+        run: |
+          pip install mlx mlx-cpu
+          python ci_probes/pr962_metal_probe.py
