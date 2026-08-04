@@ -1,33 +1,182 @@
-name: "staging-980 macos-14"
+name: "staging-980 MLX on Metal"
+
 on:
   push:
     branches: ["pr-980-xplat-ci"]
-    paths:
-      - 'studio/**'
-      - '.github/workflows/staging-980-macos-14.yml'
   workflow_dispatch:
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
 permissions:
   contents: read
+
 defaults:
   run:
     shell: bash
+
 jobs:
-  test:
+  metal:
+    name: MLX quantized optimizer on Apple Silicon
     runs-on: macos-14
-    timeout-minutes: 30
-    env:
-      UNSLOTH_COMPILE_DISABLE: '1'
-      UNSLOTH_IS_PRESENT: '1'
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
-      - run: python -m pip install mlx
-      - run: rc=0; PYTHONPATH=studio/backend python -m pytest tests/test_mlx_quantized_optimizer_state.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
+          cache: 'pip'
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+
+      - name: Confirm this is real Metal, not the shim or mlx-cpu
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          assert "mlx_simulation" not in (mx.__file__ or ""), "torch shim is active"
+          print("mlx from:", mx.__file__)
+          print("default device:", mx.default_device())
+          a = mx.random.normal((512, 512))
+          mx.eval(a @ a)
+          print("peak bytes:", mx.get_peak_memory())
+          assert mx.get_peak_memory() > 0, "get_peak_memory() reads 0, this is not the Metal backend"
+          PY
+
+      - name: Quantized optimizer state tests (must not skip)
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_mlx_quantized_optimizer_state.py -q --tb=short | tee /tmp/state.txt
+          grep -qE '^[0-9]+ passed' /tmp/state.txt || { echo "GATE FAIL: nothing passed"; exit 1; }
+          if grep -qE '[0-9]+ skipped' /tmp/state.txt; then echo "GATE FAIL: tests skipped on Metal"; exit 1; fi
+
+      - name: Routing tests
+        run: python -m pytest tests/test_mlx_quantized_optimizer_routing.py -q --tb=short
+
+      - name: Eligibility saving on Metal
+        run: |
+          python - <<'PY'
+          import mlx.core as mx, mlx.nn as nn, mlx.optimizers as optim
+          from mlx.utils import tree_flatten
+          from unsloth_zoo.mlx.optimizers_quantized import QuantizedMomentAdam
+
+          def nbytes(state):
+              return sum(v.nbytes for _, v in tree_flatten(state) if isinstance(v, mx.array))
+
+          def saving(build, w):
+              mx.random.seed(0)
+              x, y = mx.random.normal((8, w)), mx.random.normal((8, w))
+              out = {}
+              for name, mk in (("fp32", lambda: optim.Adam(learning_rate=1e-3)),
+                               ("int8", lambda: QuantizedMomentAdam(1e-3))):
+                  m, o = build(), mk()
+                  gf = nn.value_and_grad(m, lambda mm, a, b: ((mm(a) - b) ** 2).mean())
+                  _, g = gf(m, x, y); o.update(m, g); mx.eval(m.state, o.state)
+                  out[name] = nbytes(o.state)
+              return 1 - out["int8"] / out["fp32"]
+
+          cases = [
+              ("LoRA r=16", lambda: nn.Sequential(nn.Linear(2048, 16, bias=False), nn.Linear(16, 2048, bias=False)), 2048),
+              ("LoRA r=32", lambda: nn.Sequential(nn.Linear(2048, 32, bias=False), nn.Linear(32, 2048, bias=False)), 2048),
+              ("LoRA r=64", lambda: nn.Sequential(nn.Linear(2048, 64, bias=False), nn.Linear(64, 2048, bias=False)), 2048),
+              ("full FT",   lambda: nn.Sequential(nn.Linear(1024, 1024), nn.ReLU(), nn.Linear(1024, 1024)), 1024),
+          ]
+          bad = []
+          for label, build, w in cases:
+              s = saving(build, w)
+              print(f"{label:<12} optimizer state saved: {s:.1%}")
+              if s < 0.30: bad.append((label, round(s, 4)))
+          assert not bad, f"below the 30% floor on Metal: {bad}"
+          PY
+
+      - name: Peak Metal memory, fp32 vs quantized
+        run: |
+          python - <<'PY'
+          import mlx.core as mx, mlx.nn as nn, mlx.optimizers as optim
+          from unsloth_zoo.mlx.optimizers_quantized import QuantizedMomentAdam
+
+          def peak(mk):
+              mx.reset_peak_memory()
+              mx.random.seed(0)
+              model = nn.Sequential(nn.Linear(2048, 2048), nn.ReLU(), nn.Linear(2048, 2048))
+              mx.eval(model.parameters())
+              opt = mk()
+              gf = nn.value_and_grad(model, lambda m, a, b: ((m(a) - b) ** 2).mean())
+              x, y = mx.random.normal((32, 2048)), mx.random.normal((32, 2048))
+              for _ in range(5):
+                  _, g = gf(model, x, y); opt.update(model, g); mx.eval(model.state, opt.state)
+              return mx.get_peak_memory()
+
+          a = peak(lambda: optim.Adam(learning_rate=1e-3))
+          b = peak(lambda: QuantizedMomentAdam(1e-3))
+          print(f"peak fp32      : {a/2**20:9.2f} MiB")
+          print(f"peak quantized : {b/2**20:9.2f} MiB   ({(b-a)/a:+.1%})")
+          PY
+
+      - name: Quantizer cost on Metal, affine vs dynamic qmap
+        # Open review question: the bitsandbytes/torchao scheme packs BOTH moments
+        # (about 75% vs 36%) but has no fused MLX kernel, and measured 16x slower
+        # than mx.quantize on mlx-cpu. This decides whether that rewrite is viable.
+        run: |
+          python - <<'PY'
+          import time, numpy as np, mlx.core as mx
+
+          def dynamic_map(signed=True, mxb=7, total=8):
+              data, nsb = [], total - 1
+              extra = 2 ** (nsb - mxb) - 1
+              for i in range(mxb):
+                  n = int(2 ** (i + nsb - mxb) + 1) if signed else int(2 ** (i + nsb - mxb + 1) + 1)
+                  bd = np.linspace(0.1, 1, n); mn = (bd[:-1] + bd[1:]) / 2.0
+                  data += ((10 ** (-(mxb - 1) + i)) * mn).tolist()
+                  if signed: data += (-(10 ** (-(mxb - 1) + i)) * mn).tolist()
+              if extra > 0:
+                  bd = np.linspace(0.1, 1, extra + 1); mn = (bd[:-1] + bd[1:]) / 2.0
+                  data += ((10 ** (-(mxb - 1) + i)) * mn).tolist()
+                  if signed: data += (-(10 ** (-(mxb - 1) + i)) * mn).tolist()
+              data += [0, 1.0]
+              return mx.array(sorted(data), dtype=mx.float32)
+
+          QMAP, BLOCK = dynamic_map(True), 256
+
+          def bnb_rt(x):
+              flat = x.reshape(-1, BLOCK)
+              scale = mx.maximum(mx.abs(flat).max(-1), 1e-12)
+              y = (flat / scale[:, None]).reshape(x.shape)
+              codes = mx.where(y >= QMAP[128], 128, 0).astype(mx.int32)
+              for s in (64, 32, 16, 8, 4, 2, 1):
+                  codes = codes + mx.where(y >= QMAP[codes + s], s, 0).astype(mx.int32)
+              up = mx.minimum(codes + 1, 255)
+              lo, hi = QMAP[codes], QMAP[up]
+              codes = mx.where(y - lo >= (hi - lo) * 0.5, up, codes)
+              return (QMAP[codes].reshape(-1, BLOCK) * scale[:, None]).reshape(x.shape)
+
+          def affine_rt(x):
+              p = mx.quantize(x.reshape(1, -1), group_size=64, bits=8)
+              return mx.dequantize(*p, group_size=64, bits=8).reshape(x.shape)
+
+          x = mx.random.normal((2048, 2048)); mx.eval(x)
+
+          def bench(fn, n=50):
+              r = fn(); mx.eval(r)
+              t = time.perf_counter()
+              for _ in range(n):
+                  r = fn(); mx.eval(r)
+              return (time.perf_counter() - t) / n * 1e3
+
+          rows = [("affine mx.quantize (shipping)", bench(affine_rt)),
+                  ("affine, mx.compile",            bench(mx.compile(affine_rt))),
+                  ("dynamic qmap (bnb/torchao)",    bench(bnb_rt)),
+                  ("dynamic qmap, mx.compile",      bench(mx.compile(bnb_rt)))]
+          base = rows[0][1]
+          print("2048x2048 quantize+dequantize round trip, Metal\n")
+          for name, ms in rows:
+              print(f"  {name:<32}{ms:8.3f} ms   {ms/base:6.1f}x")
+          PY
