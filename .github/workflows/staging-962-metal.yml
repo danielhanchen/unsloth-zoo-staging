@@ -1,0 +1,55 @@
+name: "staging-962 macos-14 (real MLX / Metal)"
+on:
+  push:
+    branches: ["pr-962-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  mlx-metal:
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install real MLX + zoo
+        # torch is force-installed because pyproject gates it off on darwin+arm64
+        # while tests/mlx_simulation/__init__.py imports it unconditionally.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          pip install pytest==9.0.3
+          python -c "import mlx.core as mx; print('device', mx.default_device()); print('metal', mx.metal.is_available())"
+
+      - name: Routing tests
+        run: python -m pytest tests/test_mlx_quantized_optimizer_routing.py -v -rs
+
+      - name: Numeric state tests on Metal
+        run: python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+
+      - name: Fail if the numeric tests skipped
+        run: |
+          python -m pytest tests/test_mlx_quantized_optimizer_state.py -q -rs | tee out.txt
+          if grep -qiE '[0-9]+ skipped' out.txt; then
+            echo "real mlx is installed but the numeric tests skipped"; exit 1
+          fi
+
+      - name: Metal verification of the fixes
+        run: python ci_probes/pr962_metal_probe.py
