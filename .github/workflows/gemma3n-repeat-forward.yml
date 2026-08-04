@@ -4,15 +4,22 @@
 # Staging-only experiment, not for the upstream repo.
 #
 # The control for the Gemma 4 repeat-forward result. On Metal, four identical
-# Gemma 4 clips gave three different losses (spread 1.576); on Linux CPU MLX
-# the same check is exact. Before that can be called a fact about Gemma 4, the
-# same question has to be asked of a family that is already qualified and
-# shipping.
+# Gemma 4 audio clips gave three different losses (spread 1.576); on Linux CPU
+# MLX the same check is exact. Before that is called a fact about Gemma 4 audio,
+# the same question has to be asked with one variable changed.
 #
-# gemma3n is that family: it has been in _AUDIO_QUALIFIED_FAMILIES since the
-# gate shipped, and PR 981 widened it to 0.4.4 - 0.6.4 on the strength of a
-# byte-identical processor. If it drifts the same way, the drift predates every
-# entry in the gate and is a property of MLX on Metal, not of Gemma 4.
+# The first attempt used gemma3n as the control and never ran: zoo refused the
+# batch because mlx-community/gemma-3n-E2B-it-4bit ships no audio feature
+# extractor in its processor config, so the processor returns nothing behind the
+# placeholders. A real finding, but not this experiment.
+#
+# So the control holds the model fixed and removes the audio instead. Same
+# checkpoint, same mlx-vlm, same script, text-only batches:
+#
+#   text-only exact, audio drifts  -> the audio path is implicated
+#   both drift                     -> Metal forwards are not reproducible at
+#                                     all, which is not a fact about Gemma 4
+#                                     and not about audio
 #
 # Runs on the second staging repo on purpose, to keep the macOS queue on the
 # first one free.
@@ -33,7 +40,7 @@ permissions:
 
 jobs:
   control:
-    name: "repeat forward, gemma3n @ mlx-vlm 0.6.3"
+    name: "repeat forward, text-only @ mlx-vlm 0.6.3"
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'gemma3n-repeat'
@@ -62,8 +69,15 @@ jobs:
           pip install -e .[mlx] "mlx-vlm==0.6.3"
           python -c "import mlx_vlm; print('mlx-vlm', mlx_vlm.__version__)"
 
-      - name: Repeat the same forward
+      - name: Repeat the same forward, no audio
         run: |
           python tests/gemma4_repeat_forward_check.py \
-            --model mlx-community/gemma-3n-E2B-it-4bit \
-            --family gemma3n
+            --model mlx-community/gemma-4-e2b-it-4bit --no-audio
+
+      - name: Repeat the same forward, with audio
+        # The paired arm, in the same process-per-step environment, so the two
+        # results differ only in whether audio is present.
+        if: always()
+        run: |
+          python tests/gemma4_repeat_forward_check.py \
+            --model mlx-community/gemma-4-e2b-it-4bit

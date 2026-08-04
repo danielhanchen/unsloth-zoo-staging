@@ -40,6 +40,9 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--family", default="gemma4",
                     help="audio family key to open the gate for")
+    ap.add_argument("--no-audio", action="store_true",
+                    help="text-only batches, same model. Isolates whether the "
+                         "drift is about audio or about the forward itself.")
     args = ap.parse_args()
 
     import mlx_vlm
@@ -60,15 +63,21 @@ def main():
         model_name=args.model, max_seq_length=512,
     )
 
-    audio_token_id = model.config.audio_token_id
-    held = U.install_audio_merge_patch(model, audio_token_id)
+    held = False
+    if not args.no_audio:
+        held = U.install_audio_merge_patch(model, model.config.audio_token_id)
     try:
         def loss_for(hz):
-            clip = {"array": tone(1.0, hz), "sampling_rate": RATE}
+            # The frequency doubles as the text when audio is off, so the
+            # "different input" calls stay genuinely different either way.
+            if args.no_audio:
+                content = [{"type": "text", "text": f"Describe a {hz:.0f} Hz tone."}]
+            else:
+                clip = {"array": tone(1.0, hz), "sampling_rate": RATE}
+                content = [{"type": "audio", "audio": clip},
+                           {"type": "text", "text": "Transcribe."}]
             messages = [
-                {"role": "user", "content": [
-                    {"type": "audio", "audio": clip},
-                    {"type": "text", "text": "Transcribe."}]},
+                {"role": "user", "content": content},
                 {"role": "assistant", "content": "ok"},
             ]
             staged = U._collate_vlm_batch(
