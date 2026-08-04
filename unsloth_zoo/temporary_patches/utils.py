@@ -739,6 +739,46 @@ def _recompile_limit_errors():
     return tuple(found)
 
 
+
+def _disabled_hook_graph_break_error():
+    """Dynamo's graph-break exception, if this torch has one."""
+    try:
+        import torch._dynamo.exc as _exc
+    except Exception:
+        return ()
+    _e = getattr(_exc, "Unsupported", None)
+    if isinstance(_e, type) and issubclass(_e, BaseException):
+        return (_e,)
+    return ()
+
+
+def _is_our_own_disabled_hook(exc):
+    """Did we break our own graph with our own `torch.compiler.disable`?
+
+    Two unsloth_zoo fixes collide on Gemma3N vision. One wraps the
+    gradient-checkpointing `requires_grad` hooks in `torch.compiler.disable`,
+    because Dynamo cannot trace `Tensor.requires_grad_()`. The other compiles
+    `Gemma3nMultimodalEmbedder_forward` with `fullgraph = True`. The disabled
+    hook is then invoked from inside the fullgraph region, and Dynamo refuses:
+
+        Unsupported: Skip calling `torch.compiler.disable()`d function
+          Explanation: Skip calling function `requires_grad_pre_hook` ...
+          Hint: Remove the `torch.compiler.disable` call
+
+    Neither fix is wrong on its own and a user can do nothing about the
+    combination, so this one graph break should cost speed rather than the
+    run. Matched narrowly on the disable signature: any OTHER graph break
+    under fullgraph must still raise, exactly as before, because those point
+    at real problems worth seeing.
+    """
+    try:
+        text = str(exc)
+    except Exception:
+        return False
+    return ("torch.compiler.disable" in text
+            and "Skip calling" in text)
+
+
 def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     """Run eager instead of dying when the recompile cache is exhausted.
 
@@ -757,7 +797,8 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     fullgraph still raises exactly as before.
     """
     errors = _recompile_limit_errors()
-    if not errors:
+    graph_break_errors = _disabled_hook_graph_break_error()
+    if not errors and not graph_break_errors:
         return compiled_func
 
     state = {"eager": False}
@@ -774,6 +815,19 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 f"Unsloth: torch.compile ran out of recompilation cache for "
                 f"{label}; continuing in eager mode. Training is unaffected "
                 f"apart from speed. ({type(e).__name__})"
+            )
+            return eager_func(*args, **kwargs)
+        except graph_break_errors as e:
+            # Only our own `torch.compiler.disable` hook. Anything else is a
+            # real graph break and must keep raising.
+            if not _is_our_own_disabled_hook(e):
+                raise
+            state["eager"] = True
+            logger.warning(
+                f"Unsloth: torch.compile hit one of Unsloth's own "
+                f"`torch.compiler.disable`d gradient-checkpointing hooks "
+                f"inside {label}; continuing in eager mode. Training is "
+                f"unaffected apart from speed."
             )
             return eager_func(*args, **kwargs)
 

@@ -132,10 +132,27 @@ def test_compiled_callable_stays_reachable():
 def test_no_wrapper_when_torch_exposes_no_such_errors(monkeypatch):
     # Older torch without these names: return the compiled function
     # unchanged rather than guessing at which exception to catch.
+    #
+    # BOTH sources must be empty now. The wrapper also catches the graph
+    # break Unsloth causes itself by registering a `torch.compiler.disable`d
+    # gradient-checkpointing hook inside a fullgraph region, so a torch that
+    # has `Unsupported` but no recompile-limit errors still needs wrapping.
+    import unsloth_zoo.temporary_patches.utils as u
+    monkeypatch.setattr(u, "_recompile_limit_errors", lambda: ())
+    monkeypatch.setattr(u, "_disabled_hook_graph_break_error", lambda: ())
+    c, e, _ = _pair()
+    assert u._fall_back_to_eager_on_recompile_limit(c, e, "M.forward") is c
+
+
+def test_wrapper_is_added_for_the_graph_break_alone(monkeypatch):
+    """A torch with `Unsupported` but no recompile-limit names still gets the
+    fallback, because the disabled-hook collision can still happen there."""
     import unsloth_zoo.temporary_patches.utils as u
     monkeypatch.setattr(u, "_recompile_limit_errors", lambda: ())
     c, e, _ = _pair()
-    assert u._fall_back_to_eager_on_recompile_limit(c, e, "M.forward") is c
+    if not u._disabled_hook_graph_break_error():
+        pytest.skip("this torch has no torch._dynamo.exc.Unsupported")
+    assert u._fall_back_to_eager_on_recompile_limit(c, e, "M.forward") is not c
 
 
 def test_error_tuple_is_non_empty_on_this_torch():
