@@ -4806,7 +4806,33 @@ def unsloth_compile_transformers(
             if hasattr(function.forward, "get_compiler_config"):
                 continue
 
-            source = inspect.getsource(function.forward).rstrip()
+            try:
+                source = inspect.getsource(function.forward).rstrip()
+            except (OSError, TypeError):
+                # `inspect.getsource` reads through linecache and raises
+                #     OSError: could not get source code
+                # for a forward whose source it cannot retrieve -- a function
+                # built by exec, or one whose file has gone. Unguarded, that
+                # propagates out of FastModel.from_pretrained and the model
+                # does not load, over source we only wanted in order to patch
+                # a dtype cast.
+                #
+                # Observed while collecting tests/saving/text_to_speech_models:
+                # the module raised here after another model had already been
+                # loaded in the same process, and the error named neither
+                # unsloth nor the module it could not read.
+                #
+                # The exact precondition is not fully characterised -- two
+                # plain Qwen loads do NOT trigger it, and after such a load no
+                # torch.nn forward is unreadable (both measured) -- so this is
+                # a guard against a state we have seen, not a theory about how
+                # it arises. `get_compiler_config` above only covers
+                # torch.compile wrappers.
+                #
+                # Either way the handling is unambiguous: source we cannot
+                # read cannot be source-patched, and every other unsupported
+                # case in this loop already skips with continue.
+                continue
 
             if module in _conv_modules:
                 # Conv modules: cast input to weight dtype before the conv op,

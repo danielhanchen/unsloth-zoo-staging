@@ -132,5 +132,76 @@ def test_a_bare_return_is_the_functions_contract():
     assert any(r.value is None for r in returns)
 
 
+# ---- the second site: loading a SECOND model in one process --------------
+
+def _nn_patch_region() -> str:
+    i = SRC.index("source = inspect.getsource(function.forward).rstrip()")
+    return SRC[max(0, i - 700):i + 1400]
+
+
+def test_the_nn_forward_patch_loop_is_guarded():
+    """`inspect.getsource` on a forward it cannot retrieve raises
+    `OSError: could not get source code`, which propagates out of
+    `FastModel.from_pretrained` -- so the model does not load, over source we
+    only wanted in order to patch a dtype cast.
+
+    Observed while collecting tests/saving/text_to_speech_models, after
+    another model had been loaded in the same process.
+
+    Scope, stated honestly: the precondition is NOT fully characterised. Two
+    plain Qwen loads do not trigger it, and after such a load no torch.nn
+    forward is unreadable -- both measured, not assumed. This guards a state
+    we have observed rather than encoding a theory about how it arises.
+    """
+    region = _nn_patch_region()
+    assert "try:" in region
+    assert "except (OSError, TypeError)" in region
+
+
+def test_an_unreadable_forward_is_skipped_not_fatal():
+    """Every other unsupported case in this loop uses `continue`; this must
+    too. Raising abandons the remaining modules as well as this one.
+
+    Checked on the parsed handler rather than its text: the comment inside it
+    contains the word "raises", which a substring search reads as a `raise`
+    statement.
+    """
+    tree = ast.parse(SRC)
+    # Exactly the try whose body IS this assignment -- several other blocks
+    # also call getsource on a forward, and their handlers legitimately do
+    # something else.
+    target = "source = inspect.getsource(function.forward).rstrip()"
+    handlers = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or len(node.body) != 1:
+            continue
+        try:
+            body_src = ast.unparse(node.body[0])
+        except Exception:
+            continue
+        if body_src.replace(" ", "") == target.replace(" ", ""):
+            handlers.extend(node.handlers)
+    assert handlers, f"no try/except whose body is exactly `{target}`"
+    for h in handlers:
+        body = list(ast.walk(ast.Module(body=h.body, type_ignores=[])))
+        assert any(isinstance(n, ast.Continue) for n in body), (
+            "the handler must `continue` to the next module")
+        assert not any(isinstance(n, ast.Raise) for n in body), (
+            "raising here abandons every remaining module too")
+
+
+def test_the_compiler_config_check_is_kept():
+    """It catches torch.compile wrappers, which is a different case from our
+    own exec'd replacements -- the new guard adds to it, not replaces it."""
+    region = _nn_patch_region()
+    assert 'hasattr(function.forward, "get_compiler_config")' in region
+
+
+def test_both_getsource_guards_are_present():
+    """Two distinct sites, two distinct failures. Fixing only the first one
+    just moves the crash later, which is exactly what happened."""
+    assert SRC.count("except (OSError, TypeError)") >= 2
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
