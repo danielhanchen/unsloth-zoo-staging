@@ -2819,7 +2819,7 @@ def prepare_vllm_lora_loading(model):
         vllm_loras_B .append((v_layer.self_attn.o_proj.lora_b_stacked[0], so,))
 
         model_loras_A.append(m_layer.mlp.gate_proj.lora_A.default.weight)
-        model_loras_A.append(m_layer.mlp.gate_proj.lora_A.default.weight)
+        model_loras_A.append(m_layer.mlp.  up_proj.lora_A.default.weight)
         vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[0])
         vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[1])
 
@@ -2828,7 +2828,7 @@ def prepare_vllm_lora_loading(model):
         sg = None if sg == 1.0 else sg
         su = None if su == 1.0 else su
         model_loras_B.append( m_layer.mlp.gate_proj.lora_B.default.weight)
-        model_loras_B.append( m_layer.mlp.gate_proj.lora_B.default.weight)
+        model_loras_B.append( m_layer.mlp.  up_proj.lora_B.default.weight)
         vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[0], sg,))
         vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[1], su,))
 
@@ -2856,6 +2856,42 @@ def prepare_vllm_lora_loading(model):
 pass
 
 
+def _lora_storage_span(tensor):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Absolute byte range touched. Stride-walked, since base[::2] spans twice
+    # numel() * element_size(); absolute, so different storages over one allocation compare.
+    start = tensor.untyped_storage().data_ptr() + \
+        tensor.storage_offset() * tensor.element_size()
+    if tensor.numel() == 0: return start, start
+    last = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride()))
+    return start, start + (last + 1) * tensor.element_size()
+pass
+
+
+def check_vllm_loras_not_aliased(model_loras, vllm_pairs):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Every copy destination must own its memory: overlap with a training tensor overwrites or
+    # rescales the trainer's weights, or trips copy_. Only true tensor identity with no scaling
+    # is exempt, as the copy is then a total no-op. Runs before any copy, so a failure leaves both sides untouched.
+    spans = [(_lora_storage_span(t), t.device) for t in model_loras if t.numel() != 0]
+    for vllm_lora, model_lora, s in vllm_pairs:
+        if vllm_lora.numel() == 0: continue
+        if s is None and vllm_lora is model_lora: continue
+        v_start, v_end = _lora_storage_span(vllm_lora)
+        for (m_start, m_end), m_device in spans:
+            if m_device != vllm_lora.device: continue
+            if v_start >= m_end or m_start >= v_end: continue
+            raise RuntimeError(
+                "Unsloth: a vLLM LoRA slot shares storage with a training tensor. Loading "
+                f"would overwrite, or scale by {s}, weights the trainer still needs. Give "
+                "vLLM its own buffer, and if the slot is meant to be the training tensor "
+                "itself use scaling 1 (LoRA: lora_alpha == r, rsLoRA: lora_alpha == sqrt(r))."
+            )
+        pass
+    pass
+pass
+
+
 def load_lora_directly(model):
     # All Unsloth Zoo code licensed under LGPLv3
     # Load LoRAs directly from model into vLLM internal LoRAs
@@ -2863,6 +2899,12 @@ def load_lora_directly(model):
     model_loras_B = model.model_loras_B
     vllm_loras_A  = model. vllm_loras_A
     vllm_loras_B  = model. vllm_loras_B
+
+    check_vllm_loras_not_aliased(
+        model_loras_A + model_loras_B,
+        [(v, m, None) for v, m in zip(vllm_loras_A, model_loras_A)] + \
+        [(v, m, s)    for m, (v, s) in zip(model_loras_B, vllm_loras_B)],
+    )
 
     for model_lora_A, vllm_lora_A in zip(model_loras_A, vllm_loras_A):
         vllm_lora_A.copy_(model_lora_A, non_blocking = True)
