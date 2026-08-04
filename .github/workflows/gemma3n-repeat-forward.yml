@@ -81,3 +81,12 @@ jobs:
         run: |
           python tests/gemma4_repeat_forward_check.py \
             --model mlx-community/gemma-4-e2b-it-4bit
+
+      - name: Repeat the same forward, no unsloth at all
+        # The attribution step. Everything above goes through FastMLXModel and
+        # make_vlm_baseline_loss_fn, so a drift there cannot be pinned on
+        # mlx-vlm or mlx. This is mlx_vlm.load, one fixed token array, the same
+        # forward five times. Whatever it says belongs upstream of this repo,
+        # and nothing should be filed anywhere until it has said it.
+        if: always()
+        run: python tests/mlx_only_repeat_forward.py
