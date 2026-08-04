@@ -105,7 +105,22 @@ def chunked_hidden_states_selective_log_softmax(
     temperature: float = 1.0,
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
-    flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    # Reshaped against lm_head's hidden size, not hidden_states', and the two are
+    # the same number whenever the matmul below is legal at all. Under
+    # dynamic = True the difference is that Dynamo keeps hidden_states' last dim
+    # as a free symbol, then cannot prove it equal to lm_head's concrete one, and
+    # the matmul guard fails before anything runs:
+    #     a and b must have same reduction dim, but got
+    #     [((s47*s87 + 255)//256), s33] X [1536, 151936]
+    # (NeMo-Gym-Sudoku, inside the generated UnslothGRPOTrainer; the whole error
+    # disappears with compilation off, so it is the guard and not the arithmetic.)
+    # Taking the reduction dim from the operand it has to match makes both sides
+    # the same expression, so there is nothing left for the guard to prove.
+    # torch._check states the same fact to the symbolic shape system directly,
+    # and in eager mode it is a plain assertion that names the real problem
+    # instead of letting a mismatched lm_head reach a reshape or a matmul.
+    torch._check(hidden_states.shape[-1] == lm_head.shape[-1])
+    flat_hidden_states = hidden_states.reshape(-1, lm_head.shape[-1])
     flat_index = index.reshape(-1)
 
     chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
