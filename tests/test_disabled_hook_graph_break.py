@@ -98,8 +98,19 @@ def test_our_disabled_hook_falls_back_to_eager():
     assert _wrap(compiled)() == "eager"
 
 
-def test_the_fallback_latches():
-    """Re-entering the compiler every call would cost more than eager."""
+def test_the_fallback_does_not_latch():
+    """It used to latch, and that latch broke activation checkpointing.
+
+    The flag was shared by every call site of the wrapped function, while
+    checkpointing pairs each individual forward with its own recompute. An
+    early layer packed while compiled, a later layer flipped the flag, and the
+    early layer's recompute then ran eager -- saving a different set of
+    intermediates, which torch detects and aborts on. Gemma4_(E2B)-Vision died
+    exactly that way at the first backward.
+
+    So the compiler must be re-entered per call. It costs a cheap raise once
+    the cache is exhausted, and only in the already-degraded case.
+    """
     calls = {"n": 0}
 
     def compiled(*a, **k):
@@ -108,7 +119,45 @@ def test_the_fallback_latches():
 
     w = _wrap(compiled)
     w(); w(); w()
-    assert calls["n"] == 1, "compiled path must be tried only once"
+    assert calls["n"] == 3, "each call must get its own attempt"
+
+
+def test_a_call_site_that_still_compiles_keeps_compiling():
+    """The property the checkpoint actually depends on.
+
+    One failing call must not push every other call site onto the eager path,
+    because those calls already packed their activations under the compiled
+    graph and have to recompute the same way.
+    """
+    outcomes = iter(["ok", "fail", "ok", "ok"])
+    seen = []
+
+    def compiled(*a, **k):
+        which = next(outcomes)
+        seen.append(which)
+        if which == "fail":
+            raise _unsupported(DISABLE_MSG)
+        return "compiled"
+
+    w = _wrap(compiled)
+    assert w() == "compiled"
+    assert w() == "eager"      # the one that exhausted the cache
+    assert w() == "compiled"   # must NOT have been latched onto eager
+    assert w() == "compiled"
+
+
+def test_it_warns_once_and_not_per_call(caplog):
+    """The condition repeats every call; the log must not."""
+    import logging
+
+    def compiled(*a, **k):
+        raise _unsupported(DISABLE_MSG)
+
+    w = _wrap(compiled)
+    with caplog.at_level(logging.WARNING):
+        w(); w(); w(); w()
+    warnings = [r for r in caplog.records if "eagerly" in r.getMessage()]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
 
 
 def test_a_real_graph_break_still_raises():

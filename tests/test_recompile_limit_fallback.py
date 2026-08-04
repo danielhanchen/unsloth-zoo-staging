@@ -57,14 +57,29 @@ def test_recompile_limit_falls_back_instead_of_raising():
     assert calls == {"c": 1, "e": 1}
 
 
-def test_fallback_latches_and_stops_re_entering_the_compiler():
-    # Re-entering a compiler that is already out of cache costs more than
-    # eager, every single call.
+def test_fallback_re_enters_the_compiler_on_every_call():
+    # This used to assert the opposite, and the latch it protected turned out
+    # to break activation checkpointing.
+    #
+    # The flag was shared by every call site of the wrapped function, while
+    # checkpointing pairs each individual forward with its own recompute
+    # during backward. An early layer packed its activations while still
+    # compiled, a later layer exhausted the cache and flipped the flag, and
+    # the early layer's recompute then ran eager. A compiled graph and an
+    # eager forward save different intermediates, so torch's non-reentrant
+    # checkpoint compares them and aborts with "Something went unexpectedly
+    # wrong in activation checkpoint". Gemma4_(E2B)-Vision died that way at
+    # the first backward, one cell after logging that training was
+    # "unaffected apart from speed".
+    #
+    # Retrying per call keeps each pack and its own recompute in the same
+    # mode. The cost is one raise per call in the already-degraded case,
+    # because Dynamo fails a guard check rather than attempting a recompile.
     c, e, calls = _pair(FailOnRecompileLimitHit("recompile_limit reached"))
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
     for _ in range(5):
         assert w(1) == 2
-    assert calls["c"] == 1
+    assert calls["c"] == 5
     assert calls["e"] == 5
 
 

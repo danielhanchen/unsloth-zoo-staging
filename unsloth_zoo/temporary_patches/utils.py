@@ -791,30 +791,57 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     Unsloth has already raised the limit to 1024. Whatever drives that many
     recompiles, a run that would merely have been slower should not stop.
 
-    The fallback latches: once exhausted, the cache stays exhausted, and
-    re-entering the compiler every call would cost more than eager. Only the
-    cache-exhaustion exceptions are caught, so a genuine graph break under
-    fullgraph still raises exactly as before.
+    Only the cache-exhaustion exceptions are caught, so a genuine graph break
+    under fullgraph still raises exactly as before.
+
+    Deliberately does NOT latch, and that is the subtle part.
+
+    Latching -- flipping a shared flag on the first failure so later calls skip
+    the compiler -- is cheaper, and it is what this did first. But the flag is
+    shared by every call site of the wrapped function, while activation
+    checkpointing pairs each individual forward with its own recompute during
+    backward. So an early layer packs its activations while still compiled, a
+    later layer exhausts the cache and flips the flag, and then the early
+    layer's recompute runs eager. A compiled graph and an eager forward save
+    different intermediates, so torch's non-reentrant checkpoint compares the
+    two and aborts:
+
+        AssertionError: Something went unexpectedly wrong in activation
+        checkpoint. Please report this bug by filing an issue to PyTorch.
+
+    Gemma4_(E2B)-Vision dies exactly this way at the first backward, having
+    logged "continuing in eager mode. Training is unaffected apart from speed"
+    one cell earlier -- which was not true, and pointed at PyTorch rather than
+    at us.
+
+    Retrying the compiler per call keeps each pack and its own recompute in the
+    same mode, which is what the checkpoint requires. It costs one cheap raise
+    per call once the cache is exhausted: Dynamo fails on a guard check rather
+    than attempting a recompile, and it only happens in the already-degraded
+    case. Correctness is worth that.
     """
     errors = _recompile_limit_errors()
     graph_break_errors = _disabled_hook_graph_break_error()
     if not errors and not graph_break_errors:
         return compiled_func
 
-    state = {"eager": False}
+    # Warn once. The condition repeats every call, and the log should not.
+    state = {"warned": False}
+
+    def _warn(message):
+        if not state["warned"]:
+            state["warned"] = True
+            logger.warning(message)
 
     @functools.wraps(eager_func)
     def wrapper(*args, **kwargs):
-        if state["eager"]:
-            return eager_func(*args, **kwargs)
         try:
             return compiled_func(*args, **kwargs)
         except errors as e:
-            state["eager"] = True
-            logger.warning(
+            _warn(
                 f"Unsloth: torch.compile ran out of recompilation cache for "
-                f"{label}; continuing in eager mode. Training is unaffected "
-                f"apart from speed. ({type(e).__name__})"
+                f"{label}; running it eagerly from here. Training is "
+                f"unaffected apart from speed. ({type(e).__name__})"
             )
             return eager_func(*args, **kwargs)
         except graph_break_errors as e:
@@ -822,11 +849,10 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # real graph break and must keep raising.
             if not _is_our_own_disabled_hook(e):
                 raise
-            state["eager"] = True
-            logger.warning(
+            _warn(
                 f"Unsloth: torch.compile hit one of Unsloth's own "
                 f"`torch.compiler.disable`d gradient-checkpointing hooks "
-                f"inside {label}; continuing in eager mode. Training is "
+                f"inside {label}; running it eagerly from here. Training is "
                 f"unaffected apart from speed."
             )
             return eager_func(*args, **kwargs)
