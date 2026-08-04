@@ -28,7 +28,9 @@ on:
         required: false
         default: 'mlx-community/gemma-4-e2b-it-4bit'
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    # Label only. A push to this branch should not replay the whole matrix;
+    # re-running it is a deliberate act, so it takes a deliberate label.
+    types: [labeled]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
