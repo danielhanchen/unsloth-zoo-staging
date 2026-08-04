@@ -171,10 +171,11 @@ jobs:
                   r = fn(); mx.eval(r)
               return (time.perf_counter() - t) / n * 1e3
 
-          rows = [("affine mx.quantize (shipping)", bench(affine_rt)),
-                  ("affine, mx.compile",            bench(mx.compile(affine_rt))),
-                  ("dynamic qmap (bnb/torchao)",    bench(bnb_rt)),
-                  ("dynamic qmap, mx.compile",      bench(mx.compile(bnb_rt)))]
+          affine_c, bnb_c = mx.compile(affine_rt), mx.compile(bnb_rt)
+          rows = [("affine mx.quantize (shipping)", bench(lambda: affine_rt(x))),
+                  ("affine, mx.compile",            bench(lambda: affine_c(x))),
+                  ("dynamic qmap (bnb/torchao)",    bench(lambda: bnb_rt(x))),
+                  ("dynamic qmap, mx.compile",      bench(lambda: bnb_c(x)))]
           base = rows[0][1]
           print("2048x2048 quantize+dequantize round trip, Metal\n")
           for name, ms in rows:
