@@ -3688,7 +3688,30 @@ def unsloth_compile_transformers(
 
     modeling_file.__UNSLOTH_PATCHED__ = True
     functions = dir(modeling_file)
-    full_source = inspect.getsource(modeling_file)
+    try:
+        full_source = inspect.getsource(modeling_file)
+    except (OSError, TypeError) as exception:
+        # `inspect.getsource` reads the file through linecache, and when that
+        # comes back empty it raises `OSError: could not get source code`.
+        # Everything below is source-level feature detection and regex class
+        # discovery, so with no source there is nothing here to do -- but the
+        # exception propagates out of FastModel.from_pretrained, and the model
+        # fails to LOAD because we could not read a file we only wanted in
+        # order to make it faster. Seen in the whisper saving test, where the
+        # error names neither unsloth nor the module it could not read.
+        #
+        # Returning is the honest degradation: LoRA forwards were already
+        # patched above, and the model loads without the source-level
+        # optimisations. Note we do NOT continue with an empty string --
+        # checks of the form `"_supports_sdpa = False" not in full_source`
+        # are TRUE on empty and would silently enable a path the model never
+        # claimed to support.
+        logger.warning(
+            f"Unsloth: Could not read the source of {getattr(modeling_file, '__name__', modeling_file)} "
+            f"({type(exception).__name__}: {exception}), so source-level "
+            f"optimisations are skipped for it. The model still works."
+        )
+        return
 
     # Order by definition position. A bare-name find() also matches
     # forward references in annotations, docstrings and type unions,
