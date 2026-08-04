@@ -9,11 +9,11 @@
 # runs the probe on real Apple Silicon against a real checkpoint, once per
 # candidate version, to replace that guess with a result.
 #
-# Linux CPU MLX already says the pin has it backwards for the checkpoint a user
-# downloads today: mlx-community/gemma-4-e2b-it-4bit refuses to load on 0.4.4
-# (2 unexpected parameters) and 0.5.0 (60 missing), loads on 0.6.3, and hits a
-# transposed audio conv on 0.6.4. This job is what turns that into a result on
-# the hardware and the wheels an Apple Silicon user actually has.
+# The first run put the boundary between 0.6.0 and 0.6.3, and upstream names
+# the cause: mlx-vlm 0.6.2 (Blaizzy/mlx-vlm#1301) stopped building k_proj /
+# v_proj / k_norm for layers in the KV-shared range, which is the 60 tensors
+# E2B does not ship. 0.6.1 and 0.6.2 are here to hold that boundary to a
+# version rather than to a guess.
 #
 # 0.6.5+ is absent on purpose: it requires transformers>=5.14 and this package
 # caps transformers at 5.5.0, so it cannot be installed here at all.
@@ -50,7 +50,7 @@ jobs:
       # others, because "where does it start failing" is the whole point.
       fail-fast: false
       matrix:
-        mlx_vlm: ['0.4.4', '0.5.0', '0.6.0', '0.6.3', '0.6.4']
+        mlx_vlm: ['0.4.4', '0.5.0', '0.6.0', '0.6.1', '0.6.2', '0.6.3', '0.6.4']
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
