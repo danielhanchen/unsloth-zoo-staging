@@ -90,3 +90,16 @@ jobs:
         # and nothing should be filed anywhere until it has said it.
         if: always()
         run: python tests/mlx_only_repeat_forward.py
+
+      - name: Repeat the same forward, model without KV sharing
+        # Narrows the owner. Gemma 4 E2B reuses K/V across its last 20 layers,
+        # and layers in that range hold no K/V of their own -- a cache slot
+        # that a single uncached forward never populates. Reading it before it
+        # is written would look exactly like this: garbage that varies per
+        # call, settles as buffers get reused, and is stable on a CPU backend
+        # that hands out zeroed memory. Gemma 3 has no KV sharing, so if it is
+        # reproducible here the finger points at the shared-KV path.
+        if: always()
+        run: |
+          python tests/mlx_only_repeat_forward.py \
+            --model mlx-community/gemma-3-4b-it-4bit
