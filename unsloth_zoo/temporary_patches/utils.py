@@ -39,6 +39,7 @@ __all__ = [
 ]
 import functools
 import inspect
+import weakref
 import typing as t
 import torch
 from textwrap import dedent
@@ -794,31 +795,34 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     Only the cache-exhaustion exceptions are caught, so a genuine graph break
     under fullgraph still raises exactly as before.
 
-    Deliberately does NOT latch, and that is the subtle part.
+    The fallback LATCHES, and the reason is activation checkpointing.
 
-    Latching -- flipping a shared flag on the first failure so later calls skip
-    the compiler -- is cheaper, and it is what this did first. But the flag is
-    shared by every call site of the wrapped function, while activation
-    checkpointing pairs each individual forward with its own recompute during
-    backward. So an early layer packs its activations while still compiled, a
-    later layer exhausts the cache and flips the flag, and then the early
-    layer's recompute runs eager. A compiled graph and an eager forward save
-    different intermediates, so torch's non-reentrant checkpoint compares the
-    two and aborts:
+    Non-reentrant checkpointing pairs each forward with its own recompute
+    during backward, and compares what the two saved. A compiled graph and an
+    eager forward save different intermediates, so if the mode changes between
+    the two, torch aborts the backward:
 
         AssertionError: Something went unexpectedly wrong in activation
         checkpoint. Please report this bug by filing an issue to PyTorch.
 
-    Gemma4_(E2B)-Vision dies exactly this way at the first backward, having
-    logged "continuing in eager mode. Training is unaffected apart from speed"
-    one cell earlier -- which was not true, and pointed at PyTorch rather than
-    at us.
+    (`checkpoint.py:906`, `holder.handles[gid] in self.recomputed[gid]`.)
 
-    Retrying the compiler per call keeps each pack and its own recompute in the
-    same mode, which is what the checkpoint requires. It costs one cheap raise
-    per call once the cache is exhausted: Dynamo fails on a guard check rather
-    than attempting a recompile, and it only happens in the already-degraded
-    case. Correctness is worth that.
+    This wrapper first tried to avoid that by NOT latching -- retrying the
+    compiler on every call, on the theory that each pack and its own recompute
+    would then agree. rerun16 disproved it on live hardware: Gemma4_(E2B)-
+    Vision hit the same assertion with the non-latching build demonstrably
+    loaded, logging the new wording one cell earlier. Per-call retry is not
+    deterministic in the way that argument needed. The pack and the recompute
+    do not run under the same guards -- grad mode differs, and the recompute
+    happens inside the backward pass -- so the compiler can succeed for one and
+    raise for the other, in EITHER direction.
+
+    So: latch. Once the cache is exhausted, every later call is eager, so every
+    later pack and its recompute agree. That leaves exactly one bad step, the
+    one during which the latch flips, whose already-packed compiled forward is
+    recomputed eagerly. `force_eager_fallback()` below exists so unsloth can
+    catch that single assertion, confirm the switch really happened, and retry
+    the step -- by which point everything is eager and consistent.
     """
     errors = _recompile_limit_errors()
     graph_break_errors = _disabled_hook_graph_break_error()
@@ -826,7 +830,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         return compiled_func
 
     # Warn once. The condition repeats every call, and the log should not.
-    state = {"warned": False}
+    state = {"warned": False, "eager": False}
 
     def _warn(message):
         if not state["warned"]:
@@ -835,9 +839,12 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
 
     @functools.wraps(eager_func)
     def wrapper(*args, **kwargs):
+        if state["eager"]:
+            return eager_func(*args, **kwargs)
         try:
             return compiled_func(*args, **kwargs)
         except errors as e:
+            state["eager"] = True
             _warn(
                 f"Unsloth: torch.compile ran out of recompilation cache for "
                 f"{label}; running it eagerly from here. Training is "
@@ -849,6 +856,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # real graph break and must keep raising.
             if not _is_our_own_disabled_hook(e):
                 raise
+            state["eager"] = True
             _warn(
                 f"Unsloth: torch.compile hit one of Unsloth's own "
                 f"`torch.compiler.disable`d gradient-checkpointing hooks "
@@ -864,7 +872,57 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     _gcc = getattr(compiled_func, "get_compiler_config", None)
     if _gcc is not None:
         wrapper.get_compiler_config = _gcc
+
+    wrapper._unsloth_fallback_state = state
+    wrapper._unsloth_fallback_label = label
+    _EAGER_FALLBACK_WRAPPERS.append(weakref.ref(wrapper))
     return wrapper
+
+
+# Every wrapper built above, weakly, so a patched-then-discarded model does not
+# keep its functions alive. Weak refs also mean the registry cannot report a
+# switch for something nobody is calling any more.
+_EAGER_FALLBACK_WRAPPERS: list = []
+
+
+def eager_fallback_state() -> dict[str, bool]:
+    """{label: already fell back} for every live wrapper. For tests and logs."""
+    out = {}
+    for ref in _EAGER_FALLBACK_WRAPPERS:
+        w = ref()
+        if w is not None:
+            out[w._unsloth_fallback_label] = bool(w._unsloth_fallback_state["eager"])
+    return out
+
+
+def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
+    """Latch every wrapper to eager. Returns how many are eager afterwards.
+
+    Called by unsloth when a backward dies inside activation checkpointing, to
+    make the retry of that step consistent. The recompile limit is hit
+    per-function, so one function falling back can strand a checkpointed
+    region that spans several; switching them together removes the whole class
+    of mismatch rather than the one instance we happened to see.
+
+    Returns a COUNT, not "how many changed", because by the time this is
+    called the one wrapper that caused the trouble has already latched itself
+    and would not be counted as a change -- a caller reading that as "nothing
+    happened" would draw exactly the wrong conclusion.
+
+    `only_if_already_triggered` keeps this honest by default: it refuses to
+    silently switch off compilation for a model that never hit the limit. A
+    caller that gets 0 back has learned that the checkpoint assertion it
+    caught was NOT caused by a compile-mode flip, and should re-raise rather
+    than retry.
+    """
+    live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
+            if w is not None]
+    if only_if_already_triggered and not any(
+            w._unsloth_fallback_state["eager"] for w in live):
+        return 0
+    for w in live:
+        w._unsloth_fallback_state["eager"] = True
+    return len(live)
 
 
 def patch_function(
