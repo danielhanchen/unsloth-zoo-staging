@@ -29,29 +29,9 @@ from .device_type import DEVICE_TYPE, device_synchronize
 from .temporary_patches.common import (
     torch_compile_options,
     UNSLOTH_COMPILE_DISABLE,
+    _maybe_compile,
 )
 
-
-def _maybe_compile(**kwargs):
-    """torch.compile, unless the user has asked for it to be off.
-
-    The three helpers below were decorated with a bare @torch.compile, so
-    UNSLOTH_COMPILE_DISABLE=1 did not reach them: the decorator is applied
-    at import, before any of the compiler's own gates run. That matters
-    because it is the documented escape hatch for exactly this situation.
-    NeMo-Gym-Sudoku dies inside chunked_hidden_states_selective_log_softmax
-    with
-        a and b must have same reduction dim, but got
-        [((s47*s87 + 255)//256), s33] X [1536, 151936]
-    and setting the flag changed nothing at all -- the run failed byte for
-    byte the same way, because the compile had already happened.
-
-    compiler.py and temporary_patches/utils.py both consult this flag; this
-    module simply did not. Behaviour is unchanged when the flag is unset.
-    """
-    if UNSLOTH_COMPILE_DISABLE:
-        return lambda fn: fn
-    return torch.compile(**kwargs)
 
 RL_REPLACEMENTS = dict()
 

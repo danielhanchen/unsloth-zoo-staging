@@ -187,3 +187,27 @@ else:
 
 global TEMPORARY_PATCHES
 TEMPORARY_PATCHES = []
+
+
+def _maybe_compile(**kwargs):
+    """torch.compile, unless the user has asked for it to be off.
+
+    Lives here rather than beside its callers because the compiler COPIES
+    function source verbatim into the generated trainer modules, decorator line
+    included. A helper defined in `rl_replacements.py` is not in scope there,
+    and the generated module dies at import with
+
+        NameError: name '_maybe_compile' is not defined
+
+    which `_patch_trl_rl_trainers` swallows at logger.info level, silently
+    falling every SFT run back to plain trl. That took out Magistral_(24B),
+    Gemma3_(27B) and Qwen3_(32B) with three unrelated-looking errors before the
+    common cause showed up: `UnslothSFTTrainer` appears three times in every
+    artifact that trained and zero times in every artifact that failed.
+
+    compiler.py emits an import for this name when it appears in the generated
+    source, the same way it already does for `torch_compile`.
+    """
+    if UNSLOTH_COMPILE_DISABLE:
+        return lambda fn: fn
+    return torch.compile(**kwargs)

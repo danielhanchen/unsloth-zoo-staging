@@ -112,12 +112,16 @@ def test_the_generated_code_string_is_left_alone():
     assert '"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\\n"' in _src()
 
 
+def _common_src():
+    return (ROOT / "unsloth_zoo" / "temporary_patches" / "common.py").read_text(encoding="utf-8")
+
+
 def test_the_helper_falls_back_to_identity_not_to_none():
     """Returning None from the decorator factory would replace the function
     with None and fail at call time rather than at import."""
-    src = _src()
+    src = _common_src()
     i = src.index("def _maybe_compile(")
-    body = src[i:i + 1600]
+    body = src[i:]
     assert "return lambda fn: fn" in body, body[:400]
 
 
@@ -125,10 +129,19 @@ def test_the_flag_comes_from_the_shared_definition():
     """Re-reading os.environ here would drift from compiler.py, which is how
     two parts of one codebase end up disagreeing about whether compilation is
     on."""
-    src = _src()
-    assert "UNSLOTH_COMPILE_DISABLE," in src
-    i = src.index("def _maybe_compile(")
-    assert "os.environ" not in src[i:i + 1600]
+    assert "UNSLOTH_COMPILE_DISABLE," in _src()
+    common = _common_src()
+    i = common.index("def _maybe_compile(")
+    assert "os.environ" not in common[i:]
+
+
+def test_the_helper_is_not_defined_beside_its_callers():
+    """It was, and the compiler copies decorated function source verbatim into
+    the generated trainer modules, where a name defined in rl_replacements does
+    not resolve. Every SFT run then fell back to plain trl, silently. See
+    tests/test_generated_trainer_is_installed.py."""
+    assert "def _maybe_compile(" not in _src()
+    assert "def _maybe_compile(" in _common_src()
 
 
 if __name__ == "__main__":
