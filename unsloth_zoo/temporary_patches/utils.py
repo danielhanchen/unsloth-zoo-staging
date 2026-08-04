@@ -261,6 +261,62 @@ del _ROCmTorchaoLoader, _ROCmTorchaoFinder
 del _MetaPathFinder, _Loader, _ModuleSpec, _sys_rocm_stub, _types_rocm_stub
 del _is_windows_rocm
 
+# torchao is declared `torchao>=0.13.0` with no upper bound, so a resolver
+# handed a pinned older torch will happily install a torchao built against a
+# newer one. That torchao's float8 path imports symbols straight out of torch
+# (`from torch.nn.functional import ScalingType`), and on the older torch the
+# symbol is simply absent.
+#
+# The resulting ImportError surfaces while importing transformers, names
+# neither torchao nor torch, and takes down `import unsloth` entirely:
+#
+#     cannot import name 'ScalingType' from 'torch.nn.functional'
+#
+# Seen on Qwen3_5_(4B)_Vision and Qwen3_8B_FP8_GRPO, which pin torch==2.8.0
+# and then install unsloth_zoo[base]. Both died in cell 2 with a message that
+# gives the user nothing to act on.
+_TORCHAO_TORCH_SYMBOLS = ("ScalingType", "ScalingGranularity", "Float8Tensor")
+
+
+def _torchao_is_newer_than_torch(message):
+    """Does this ImportError look like torchao reaching into a torch that
+    does not have what it wants?
+
+    Deliberately narrow: the symbol must be one torchao pulls from torch AND
+    the failing module must be a torch one. A missing name from somewhere
+    else is not this problem and must keep its own error.
+    """
+    try:
+        message = str(message)
+    except Exception:                                    # noqa: BLE001
+        return False
+    if "cannot import name" not in message:
+        return False
+    if "torch" not in message:
+        return False
+    return any(sym in message for sym in _TORCHAO_TORCH_SYMBOLS)
+
+
+def _torchao_torch_mismatch_message(message):
+    """Name both versions, because the raw error names neither."""
+    def _ver(mod):
+        try:
+            import importlib.metadata as _md
+            return _md.version(mod)
+        except Exception:                                # noqa: BLE001
+            return "unknown"
+    torch_v, ao_v = _ver("torch"), _ver("torchao")
+    return (
+        f"***** Unsloth: torchao {ao_v} was built for a newer torch than the "
+        f"torch {torch_v} you have installed, so importing it fails with:\n"
+        f"    {message}\n"
+        f"Install a torchao that matches your torch, e.g.\n"
+        f"    pip install --upgrade --force-reinstall --no-cache-dir "
+        f"\"torchao<0.18\"\n"
+        f"or upgrade torch instead. Then restart your runtime/kernel. *****"
+    )
+
+
 try:
     from transformers.processing_utils import Unpack
     assert \
@@ -281,6 +337,8 @@ except ImportError as e:
             f"***** Your Pillow (PIL) version is incompatible with torchvision. "
             f"Please run `pip install --upgrade --force-reinstall Pillow` then restart your runtime/kernel. *****"
         )
+    elif _torchao_is_newer_than_torch(e):
+        raise RuntimeError(_torchao_torch_mismatch_message(e)) from None
     elif "Unpack" not in e:
         raise Exception(e)
     raise RuntimeError(
