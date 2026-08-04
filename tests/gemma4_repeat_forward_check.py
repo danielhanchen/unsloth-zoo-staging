@@ -12,7 +12,12 @@ with a different clip in the middle. Every 440 Hz loss must be the same number.
 If they drift, something from call n is reaching call n+1, and in training that
 would be one batch contaminating the next.
 
-Run: python tests/g4_repeat_forward_check.py --model PATH_OR_REPO
+`--family` exists so the same check can run against an already-qualified
+family. Gemma 4 drifting only matters as a fact about Gemma 4 if gemma3n does
+not; if it drifts too, this is a property of MLX on Metal that predates every
+entry in the gate.
+
+Run: python tests/gemma4_repeat_forward_check.py --model REPO [--family KEY]
 """
 
 import argparse
@@ -33,6 +38,8 @@ def tone(seconds, hertz):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
+    ap.add_argument("--family", default="gemma4",
+                    help="audio family key to open the gate for")
     args = ap.parse_args()
 
     import mlx_vlm
@@ -45,7 +52,7 @@ def main():
     version = getattr(mlx_vlm, "__version__", "0")
     U._AUDIO_QUALIFIED_FAMILIES = dict(
         U._AUDIO_QUALIFIED_FAMILIES,
-        gemma4=U._AudioVersions(version, version),
+        **{args.family: U._AudioVersions(version, version)},
     )
     U._AUDIO_MIN_TRANSFORMERS = {}
 

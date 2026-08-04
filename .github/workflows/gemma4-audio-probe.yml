@@ -42,9 +42,12 @@ permissions:
 jobs:
   probe:
     name: "gemma4 audio @ mlx-vlm ${{ matrix.mlx_vlm }}"
+    # `contains(labels.*)` fires on ANY label event while the label is still
+    # attached, so labelling the PR for a different workflow replayed all seven
+    # macOS jobs. Match the label that was actually just added.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      contains(github.event.pull_request.labels.*.name, 'gemma4-probe')
+      github.event.label.name == 'gemma4-probe'
     runs-on: macos-14
     timeout-minutes: 45
     strategy:

@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Staging-only experiment, not for the upstream repo.
+#
+# The control for the Gemma 4 repeat-forward result. On Metal, four identical
+# Gemma 4 clips gave three different losses (spread 1.576); on Linux CPU MLX
+# the same check is exact. Before that can be called a fact about Gemma 4, the
+# same question has to be asked of a family that is already qualified and
+# shipping.
+#
+# gemma3n is that family: it has been in _AUDIO_QUALIFIED_FAMILIES since the
+# gate shipped, and PR 981 widened it to 0.4.4 - 0.6.4 on the strength of a
+# byte-identical processor. If it drifts the same way, the drift predates every
+# entry in the gate and is a property of MLX on Metal, not of Gemma 4.
+#
+# Runs on the second staging repo on purpose, to keep the macOS queue on the
+# first one free.
+
+name: Gemma3n repeat-forward control (Apple Silicon)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  control:
+    name: "repeat forward, gemma3n @ mlx-vlm 0.6.3"
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'gemma3n-repeat'
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install zoo with mlx-vlm 0.6.3
+        # Same version as the Gemma 4 run, so the two are comparable.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx] "mlx-vlm==0.6.3"
+          python -c "import mlx_vlm; print('mlx-vlm', mlx_vlm.__version__)"
+
+      - name: Repeat the same forward
+        run: |
+          python tests/gemma4_repeat_forward_check.py \
+            --model mlx-community/gemma-3n-E2B-it-4bit \
+            --family gemma3n
