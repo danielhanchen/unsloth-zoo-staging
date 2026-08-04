@@ -57,30 +57,44 @@ def test_recompile_limit_falls_back_instead_of_raising():
     assert calls == {"c": 1, "e": 1}
 
 
-def test_fallback_re_enters_the_compiler_on_every_call():
-    # This used to assert the opposite, and the latch it protected turned out
-    # to break activation checkpointing.
-    #
-    # The flag was shared by every call site of the wrapped function, while
-    # checkpointing pairs each individual forward with its own recompute
-    # during backward. An early layer packed its activations while still
-    # compiled, a later layer exhausted the cache and flipped the flag, and
-    # the early layer's recompute then ran eager. A compiled graph and an
-    # eager forward save different intermediates, so torch's non-reentrant
-    # checkpoint compares them and aborts with "Something went unexpectedly
-    # wrong in activation checkpoint". Gemma4_(E2B)-Vision died that way at
-    # the first backward, one cell after logging that training was
-    # "unaffected apart from speed".
-    #
-    # Retrying per call keeps each pack and its own recompute in the same
-    # mode. The cost is one raise per call in the already-degraded case,
-    # because Dynamo fails a guard check rather than attempting a recompile.
+def test_the_fallback_latches():
+    """This assertion has been reversed twice, and both reversals were driven
+    by live hardware rather than by argument, so the history matters.
+
+    It latched. The latch broke activation checkpointing: the flag is shared by
+    every call site, checkpointing pairs each forward with its own recompute
+    during backward, and a compiled pack recomputed eagerly makes torch abort
+    with "Something went unexpectedly wrong in activation checkpoint".
+    Gemma4_(E2B)-Vision died that way at the first backward.
+
+    So it was changed to retry per call, on the theory that each pack and its
+    own recompute would then agree. rerun16 disproved that on live hardware:
+    the same assertion, with the non-latching build demonstrably loaded. The
+    pack and the recompute do not run under the same guards -- grad mode
+    differs, and the recompute happens inside backward -- so the compiler can
+    succeed for one and raise for the other, in either direction.
+
+    So it latches again (218945d4), which leaves exactly one inconsistent step,
+    the one during which the latch flips. `force_eager_fallback` exists for
+    unsloth to catch that single assertion and retry that step.
+    """
     c, e, calls = _pair(FailOnRecompileLimitHit("recompile_limit reached"))
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
     for _ in range(5):
         assert w(1) == 2
-    assert calls["c"] == 5
+    assert calls["c"] == 1, "the compiler must not be re-entered after the latch"
     assert calls["e"] == 5
+
+
+def test_the_latch_is_per_wrapper_not_global():
+    """Two separately wrapped functions must not knock each other eager."""
+    c1, e1, calls1 = _pair(FailOnRecompileLimitHit("recompile_limit reached"))
+    c2, e2, calls2 = _pair()
+    w1 = _fall_back_to_eager_on_recompile_limit(c1, e1, "A.forward")
+    w2 = _fall_back_to_eager_on_recompile_limit(c2, e2, "B.forward")
+    w1(1); w1(1)
+    assert w2(5) == 10
+    assert calls2 == {"c": 1, "e": 0}
 
 
 def test_recompile_limit_exceeded_is_also_caught():

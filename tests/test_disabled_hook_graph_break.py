@@ -98,18 +98,19 @@ def test_our_disabled_hook_falls_back_to_eager():
     assert _wrap(compiled)() == "eager"
 
 
-def test_the_fallback_does_not_latch():
-    """It used to latch, and that latch broke activation checkpointing.
+def test_the_fallback_latches():
+    """It stopped latching for one release and then went back to latching, and
+    both moves were settled by a live run rather than by reasoning.
 
-    The flag was shared by every call site of the wrapped function, while
-    checkpointing pairs each individual forward with its own recompute. An
-    early layer packed while compiled, a later layer flipped the flag, and the
-    early layer's recompute then ran eager -- saving a different set of
-    intermediates, which torch detects and aborts on. Gemma4_(E2B)-Vision died
-    exactly that way at the first backward.
+    Not latching was meant to keep each checkpoint pack and its own recompute
+    in the same mode. rerun16 showed it does not: Gemma4_(E2B)-Vision hit
+    "Something went unexpectedly wrong in activation checkpoint" with the
+    non-latching build demonstrably loaded. The pack and the recompute run
+    under different guards -- grad mode differs, and the recompute happens
+    inside backward -- so per-call retry can flip mode in either direction.
 
-    So the compiler must be re-entered per call. It costs a cheap raise once
-    the cache is exhausted, and only in the already-degraded case.
+    Latching leaves exactly one inconsistent step, which unsloth catches and
+    retries via `force_eager_fallback`, instead of an unbounded number.
     """
     calls = {"n": 0}
 
@@ -119,16 +120,13 @@ def test_the_fallback_does_not_latch():
 
     w = _wrap(compiled)
     w(); w(); w()
-    assert calls["n"] == 3, "each call must get its own attempt"
+    assert calls["n"] == 1, "the compiler must not be re-entered after the latch"
 
 
-def test_a_call_site_that_still_compiles_keeps_compiling():
-    """The property the checkpoint actually depends on.
-
-    One failing call must not push every other call site onto the eager path,
-    because those calls already packed their activations under the compiled
-    graph and have to recompute the same way.
-    """
+def test_every_later_call_takes_the_same_path():
+    """The property the checkpoint depends on, in the form that survived: once
+    the switch has happened, it is total. A build that sends some calls eager
+    and some compiled is the configuration that aborts the backward."""
     outcomes = iter(["ok", "fail", "ok", "ok"])
     seen = []
 
@@ -141,9 +139,10 @@ def test_a_call_site_that_still_compiles_keeps_compiling():
 
     w = _wrap(compiled)
     assert w() == "compiled"
-    assert w() == "eager"      # the one that exhausted the cache
-    assert w() == "compiled"   # must NOT have been latched onto eager
-    assert w() == "compiled"
+    assert w() == "eager"   # the call that exhausted the cache
+    assert w() == "eager"   # latched: no second attempt at the compiler
+    assert w() == "eager"
+    assert seen == ["ok", "fail"]
 
 
 def test_it_warns_once_and_not_per_call(caplog):
