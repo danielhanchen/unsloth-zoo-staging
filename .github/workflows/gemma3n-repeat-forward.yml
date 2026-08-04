@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Staging-only experiment, not for the upstream repo.
+#
+# The control for the Gemma 4 repeat-forward result. On Metal, four identical
+# Gemma 4 audio clips gave three different losses (spread 1.576); on Linux CPU
+# MLX the same check is exact. Before that is called a fact about Gemma 4 audio,
+# the same question has to be asked with one variable changed.
+#
+# The first attempt used gemma3n as the control and never ran: zoo refused the
+# batch because mlx-community/gemma-3n-E2B-it-4bit ships no audio feature
+# extractor in its processor config, so the processor returns nothing behind the
+# placeholders. A real finding, but not this experiment.
+#
+# So the control holds the model fixed and removes the audio instead. Same
+# checkpoint, same mlx-vlm, same script, text-only batches:
+#
+#   text-only exact, audio drifts  -> the audio path is implicated
+#   both drift                     -> Metal forwards are not reproducible at
+#                                     all, which is not a fact about Gemma 4
+#                                     and not about audio
+#
+# Runs on the second staging repo on purpose, to keep the macOS queue on the
+# first one free.
+
+name: Gemma3n repeat-forward control (Apple Silicon)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  control:
+    name: "repeat forward, text-only @ mlx-vlm 0.6.3"
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'gemma3n-repeat'
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install zoo with mlx-vlm 0.6.3
+        # Same version as the Gemma 4 run, so the two are comparable.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx] "mlx-vlm==0.6.3"
+          python -c "import mlx_vlm; print('mlx-vlm', mlx_vlm.__version__)"
+
+      - name: Repeat the same forward, no audio
+        run: |
+          python tests/gemma4_repeat_forward_check.py \
+            --model mlx-community/gemma-4-e2b-it-4bit --no-audio
+
+      - name: Repeat the same forward, with audio
+        # The paired arm, in the same process-per-step environment, so the two
+        # results differ only in whether audio is present.
+        if: always()
+        run: |
+          python tests/gemma4_repeat_forward_check.py \
+            --model mlx-community/gemma-4-e2b-it-4bit
+
+      - name: Repeat the same forward, no unsloth at all
+        # The attribution step. Everything above goes through FastMLXModel and
+        # make_vlm_baseline_loss_fn, so a drift there cannot be pinned on
+        # mlx-vlm or mlx. This is mlx_vlm.load, one fixed token array, the same
+        # forward five times. Whatever it says belongs upstream of this repo,
+        # and nothing should be filed anywhere until it has said it.
+        if: always()
+        run: python tests/mlx_only_repeat_forward.py
+
+      - name: Repeat the same forward, model without KV sharing
+        # Narrows the owner. Gemma 4 E2B reuses K/V across its last 20 layers,
+        # and layers in that range hold no K/V of their own -- a cache slot
+        # that a single uncached forward never populates. Reading it before it
+        # is written would look exactly like this: garbage that varies per
+        # call, settles as buffers get reused, and is stable on a CPU backend
+        # that hands out zeroed memory. Gemma 3 has no KV sharing, so if it is
+        # reproducible here the finger points at the shared-KV path.
+        if: always()
+        run: |
+          python tests/mlx_only_repeat_forward.py \
+            --model mlx-community/gemma-3-4b-it-4bit
