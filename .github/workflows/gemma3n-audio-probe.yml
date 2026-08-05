@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Staging-only experiment, not for the upstream repo.
+#
+# _AUDIO_QUALIFIED_FAMILIES admits gemma3n over mlx-vlm 0.4.4 to 0.6.4, widened
+# there (PR 981) on the strength of its processor sources being byte-identical
+# across that span. That is an argument about the library, and this family has
+# since shown twice that the library is not the only variable: the collation bug
+# PR 985 fixed made gemma3n audio unusable at any realistic max_seq_length, and
+# it surfaced only because something tried to run it rather than read it.
+#
+# So this runs it, on real Apple Silicon, against the 4-bit export people
+# actually download, on merged main (which carries PR 985).
+
+name: Gemma3n audio probe (Apple Silicon)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  # Keyed on the label so an unrelated label cannot cancel a run mid-flight.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.label.name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: "gemma3n audio @ mlx-vlm ${{ matrix.mlx_vlm }}"
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'gemma3n-probe'
+    runs-on: macos-14
+    timeout-minutes: 60
+    strategy:
+      # The two ends of the window PR 981 gave gemma3n, so a red cell says
+      # which end the argument-from-source-identity does not reach.
+      fail-fast: false
+      matrix:
+        mlx_vlm: ['0.4.4', '0.6.4']
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install zoo with the pinned mlx-vlm
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx] "mlx-vlm==${{ matrix.mlx_vlm }}"
+          python -c "
+          import mlx_vlm, transformers
+          print('mlx-vlm', mlx_vlm.__version__, 'transformers', transformers.__version__)
+          assert mlx_vlm.__version__ == '${{ matrix.mlx_vlm }}', mlx_vlm.__version__
+          "
+
+      - name: Cache the checkpoint
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-gemma3n-e2b-4bit-v1
+
+      - name: Probe
+        run: python tests/gemma3n_audio_probe.py
+
+      - name: Is a KV-shared model reproducible on Metal?
+        # gemma3n also shares K/V across layers, which is the property that
+        # tracked the non-reproducible Gemma 4 forwards: Gemma 4 E2B gave five
+        # different logit sums for five identical forwards where Gemma 3, which
+        # shares nothing, gave one sum five times. If gemma3n drifts too, that
+        # is a second data point for the shared-KV hypothesis; if it does not,
+        # the hypothesis is wrong and the cause is narrower than the
+        # architecture.
+        if: always()
+        run: |
+          python tests/mlx_only_repeat_forward.py \
+            --model mlx-community/gemma-3n-E2B-it-4bit
