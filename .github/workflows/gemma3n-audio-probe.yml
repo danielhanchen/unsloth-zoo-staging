@@ -89,3 +89,16 @@ jobs:
         run: |
           python tests/mlx_only_repeat_forward.py \
             --model mlx-community/gemma-3n-E2B-it-4bit
+
+      - name: Where does the Metal drift start?
+        # mlx_only_repeat_forward says two identical Gemma 4 E2B forwards
+        # disagree at the output. This says at which layer they first disagree,
+        # which is the only thing that can separate "the KV-shared layers cause
+        # it" from "the KV-shared layers are downstream of it".
+        if: always()
+        run: |
+          python tests/mlx_layerwise_drift.py \
+            --model mlx-community/gemma-4-e2b-it-4bit --rounds 3
+          echo "--- control: gemma3n, which shares K/V only when cached"
+          python tests/mlx_layerwise_drift.py \
+            --model mlx-community/gemma-3n-E2B-it-4bit --rounds 3
