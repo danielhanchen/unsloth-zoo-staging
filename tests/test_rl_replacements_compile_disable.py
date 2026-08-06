@@ -16,15 +16,12 @@
 
 """UNSLOTH_COMPILE_DISABLE did not reach the GRPO helpers.
 
-Three functions in `rl_replacements.py` carried a bare `@torch.compile(...)`.
-A decorator runs at import, before any of the compiler's gates, so the flag
-never applied to them -- while `compiler.py` and `temporary_patches/utils.py`
-both consult it. That matters because the flag is the documented escape hatch
-for precisely the failure they produce: re-running `NeMo-Gym-Sudoku` with
-UNSLOTH_COMPILE_DISABLE=1 changed nothing, since the compile had already
-happened at import.
-
-This makes the flag work. It does NOT fix the shape bug.
+Three functions in `rl_replacements.py` carried a bare `@torch.compile(...)`,
+which runs at import, before any of the compiler's gates, so the flag never
+applied to them. That matters because the flag is the documented escape hatch for
+exactly the failure they produce: setting UNSLOTH_COMPILE_DISABLE=1 changed
+nothing, since the compile had already happened at import. This makes the flag
+work. It does NOT fix the shape bug.
 """
 
 import os
@@ -44,9 +41,8 @@ FUNCS = [
 
 
 def _probe(value):
-    """Import rl_replacements in a subprocess with the flag set and report
-    whether each helper came out compiled. A subprocess because the flag is read
-    at import and the module is then cached in sys.modules."""
+    """Is each helper compiled with the flag set? A subprocess, because the flag
+    is read at import and the module is then cached in sys.modules."""
     script = textwrap.dedent("""
         import json, torch
         import unsloth_zoo.rl_replacements as R
@@ -70,8 +66,7 @@ def _probe(value):
 
 
 def test_the_helpers_are_compiled_by_default():
-    """The change adds an off switch, not off-by-default. If this fails, every
-    GRPO run just got slower."""
+    """An off switch, not off-by-default: if this fails, every GRPO run got slower."""
     got = _probe("0")
     assert all(v is True for v in got.values()), got
 
@@ -82,8 +77,7 @@ def test_the_flag_turns_them_off():
 
 
 def test_partial_also_turns_them_off():
-    """compiler.py treats "partial" as compile-off (it only skips the source
-    rewrites for "1"), so the helpers must honour it as well."""
+    """compiler.py treats "partial" as compile-off, so the helpers must too."""
     got = _probe("partial")
     assert all(v is False for v in got.values()), got
 
@@ -99,7 +93,7 @@ def test_an_unset_flag_behaves_like_zero():
     assert "COMPILED True" in r.stdout, (r.stdout[-1500:], r.stderr[-2000:])
 
 
-# ---- the source, so the fix cannot be half-applied -----------------------
+# ---- the source, so the fix cannot be half-applied ----
 
 def _src():
     return (ROOT / "unsloth_zoo" / "rl_replacements.py").read_text(encoding="utf-8")
@@ -114,8 +108,8 @@ def test_no_bare_torch_compile_decorator_remains():
 
 
 def test_the_generated_code_string_is_left_alone():
-    """One `@torch.compile(...)` lives inside a string emitted as generated
-    source; rewriting it would call a helper that module does not import."""
+    """One `@torch.compile(...)` lives in a string emitted as generated source;
+    rewriting it would call a helper that module does not import."""
     assert '"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\\n"' in _src()
 
 
@@ -124,8 +118,7 @@ def _common_src():
 
 
 def test_the_helper_falls_back_to_identity_not_to_none():
-    """Returning None would replace the function with None and fail at call
-    time rather than at import."""
+    """Returning None would replace the function with None, failing at call time."""
     src = _common_src()
     i = src.index("def _maybe_compile(")
     body = src[i:]
@@ -143,7 +136,7 @@ def test_the_flag_comes_from_the_shared_definition():
 
 def test_the_helper_is_not_defined_beside_its_callers():
     """It was, and the compiler copies decorated source into generated trainer
-    modules, where a name from rl_replacements does not resolve -- every SFT run
+    modules, where a name from rl_replacements does not resolve; every SFT run
     then fell back to plain trl, silently."""
     assert "def _maybe_compile(" not in _src()
     assert "def _maybe_compile(" in _common_src()

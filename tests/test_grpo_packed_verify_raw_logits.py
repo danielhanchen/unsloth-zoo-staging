@@ -16,16 +16,13 @@
 
 """The packed path's first-use verifier needs the same width dispatch.
 
-The packed call site dispatches on width, but the self-verify below it takes a
-second per-row forward and always sends it through the lm_head matmul helper.
-A forward that ignores UNSLOTH_RETURN_HIDDEN_STATES returns real vocab logits
-from both, so the verifier raises, the outer handler sets
-`_unsloth_seq_packing_grad_ok = False`, and packing is off for the rest of the
-run. Since the very first packed batch is always verified, the raw-logits
-branch would never be reachable.
-
-The block is exec'd from its own source against a model that returns real
-logits, so the test exercises the dispatch rather than reading it.
+The self-verify below the packed call site takes a second per-row forward and
+always sent it through the lm_head matmul helper. A forward that ignores
+UNSLOTH_RETURN_HIDDEN_STATES returns real vocab logits from both, so the verifier
+raises, the outer handler sets `_unsloth_seq_packing_grad_ok = False`, and
+packing is off for the rest of the run. Since the first packed batch is always
+verified, the raw-logits branch would never be reachable. The block is exec'd
+from its own source, so the test exercises the dispatch rather than reading it.
 """
 
 import contextlib
@@ -51,12 +48,9 @@ PAD_ID, L, KEEP = 0, 8, 4
 
 class _Model(torch.nn.Module):
     """`hidden_states = False` ignores UNSLOTH_RETURN_HIDDEN_STATES and returns
-    real [.., vocab] logits; True is the Unsloth generated forward.
-
-    Position-local, so the packed block-diagonal forward and the per-row
-    forward agree exactly and the verifier's own tolerance is not what is
-    under test here.
-    """
+    real [.., vocab] logits; True is the Unsloth generated forward. Position-local,
+    so packed and per-row forwards agree exactly and the verifier's own tolerance
+    is not what is under test."""
     def __init__(self, hidden_states = False):
         super().__init__()
         torch.manual_seed(0)
@@ -120,11 +114,9 @@ def _run_packed_block(hidden_states = False):
 
 
 def _reference_logprobs(model, input_ids, max_left_pad):
-    """Per-row logprobs straight from the model, no packing involved.
-
-    Pads are dropped first, so the row's leading token has no predecessor and
-    stays 0, exactly as both the packed scatter and the padded loop leave it.
-    """
+    """Per-row logprobs straight from the model, no packing. Pads are dropped
+    first, so the leading token has no predecessor and stays 0, as both the
+    packed scatter and the padded loop leave it."""
     width = KEEP + max_left_pad
     out = torch.zeros(input_ids.shape[0], L)
     for row in range(input_ids.shape[0]):

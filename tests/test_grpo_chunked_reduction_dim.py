@@ -16,18 +16,12 @@
 
 """The GRPO chunked log-softmax and its reduction dim.
 
-The reduction dim is not the bug. In
-
-    a and b must have same reduction dim, but got
-    [((s47*s87 + 255)//256), s33] X [1536, 151936]
-
-`s33` is a backed symbol and `Eq(s33, 1536)` is False -- the tensor really was
-the wrong width. Switching the reduction dim to `lm_head.shape[-1]` plus a bare
-`torch._check` left the guard sets identical (verified with TORCH_LOGS=guards)
-and only made the message worse. The real cause and fix live in
-tests/test_grpo_packed_raw_logits_dispatch.py.
-
-What is left here is the numeric contract, kept as a regression guard.
+The reduction dim is not the bug: in the "a and b must have same reduction dim"
+report, `Eq(s33, 1536)` is simply False and the tensor really was the wrong
+width. Reshaping against `lm_head.shape[-1]` plus a bare `torch._check` left the
+guard sets identical (checked with TORCH_LOGS=guards) and only worsened the
+message. Real cause and fix: tests/test_grpo_packed_raw_logits_dispatch.py.
+What is left here is the numeric contract, as a regression guard.
 """
 
 import os
@@ -42,7 +36,7 @@ sys.path.insert(0, str(ROOT))
 SRC = (ROOT / "unsloth_zoo" / "rl_replacements.py").read_text(encoding="utf-8")
 
 
-# ---- the source ------------------------------------------------------------
+# ---- the source ----
 
 def _fn_source():
     import ast
@@ -55,7 +49,7 @@ def _fn_source():
 
 
 def test_the_reshape_uses_its_own_last_dim():
-    """A no-op reshape. Against `lm_head.shape[-1]` a mismatched caller whose
+    """A no-op reshape. Against `lm_head.shape[-1]`, a mismatched caller whose
     element count divides gets its row count silently rewritten."""
     body = _fn_source()
     assert "hidden_states.reshape(-1, hidden_states.shape[-1])" in body
@@ -63,7 +57,7 @@ def test_the_reshape_uses_its_own_last_dim():
 
 def test_no_message_less_check_is_reintroduced():
     """`torch._check(cond)` names neither operand and Dynamo rejects a callable
-    message, so the matmul must be left to raise -- it prints both."""
+    message, so the matmul must be left to raise: it prints both."""
     import ast
     calls = [
         n for n in ast.walk(ast.parse(_fn_source()))
@@ -86,7 +80,7 @@ def test_the_function_is_still_compiled_by_default():
     assert "_maybe_compile(dynamic = True, fullgraph = True" in preceding
 
 
-# ---- the numbers -----------------------------------------------------------
+# ---- the numbers ----
 
 def _setup():
     torch = pytest.importorskip("torch")
@@ -95,7 +89,7 @@ def _setup():
     )
     if torch.cuda.is_available():
         return torch, fn, "cuda", torch.bfloat16, 128, 256, 2e-2
-    # CPU keeps the shapes small: compiling 1536x151936 there is a wait, not a test.
+    # CPU keeps shapes small: compiling 1536x151936 there is a wait, not a test.
     return torch, fn, "cpu", torch.float32, 32, 64, 1e-4
 
 
@@ -133,8 +127,7 @@ def test_it_still_matches_a_plain_log_softmax(batch, seq, chunks, temperature):
 
 def test_a_mismatched_lm_head_fails_loudly():
     """Wrong-width hidden states can reshape cleanly when the element count
-    divides (2x16x768 against a 1536-wide lm_head gives 16 rows, not 32), so the
-    wrongness must surface here rather than later."""
+    divides, so the wrongness must surface here rather than later."""
     torch, fn, dev, dtype, hidden, vocab, _ = _setup()
     hidden_states = torch.randn(2, 16, hidden // 2, device = dev, dtype = dtype)
     lm_head = torch.randn(vocab, hidden, device = dev, dtype = dtype)
