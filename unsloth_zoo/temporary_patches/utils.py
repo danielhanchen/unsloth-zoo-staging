@@ -39,6 +39,8 @@ __all__ = [
     "dedent",
     "eager_fallback_state",
     "force_eager_fallback",
+    "apply_pending_eager_fallbacks",
+    "torch_compile_with_fallback",
 ]
 import functools
 import inspect
@@ -685,6 +687,154 @@ def _recompile_limit_errors():
     return tuple(found)
 
 
+_UNKNOWN = object()
+
+
+def _saved_tensor_hook_accessor():
+    """torch 2.8 added this; 2.4 to 2.7 have no way to read the hook stack.
+
+    Its own function so a test can stand in for an older torch without having
+    to write to the read-only `torch._C._autograd`.
+    """
+    return getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+# `CheckpointFunction.forward`/`.backward`, the reentrant path's own frames.
+# Reentrant checkpointing re-differentiates what it recomputes, so a mode flip
+# cannot strand it, and both phases carry one of these.
+_REENTRANT_FRAMES = ("forward", "backward")
+
+
+def _frame_local(frame, name):
+    """One local off a live frame, `_UNKNOWN` when it is not there."""
+    try:
+        return frame.f_locals.get(name, _UNKNOWN)
+    except Exception:
+        return _UNKNOWN
+
+
+def _walk_for_checkpoint_frame():
+    """The pre-2.8 answer: is any `torch.utils.checkpoint` frame on the stack?
+
+    The whole live chain is walked. A depth cap cannot be read as proof that
+    no region is open: `checkpoint()` sits well over 60 frames above the
+    compiled call under nested module dispatch, and stopping early answered
+    "no region" and switched to eager inside one. This runs only on the
+    give-up path, which the bump caps bound to a handful per process, so the
+    walk is not on any hot path.
+
+    torch 2.4 to 2.7 expose no saved-tensor-hook accessor, and returning None
+    there would quietly restore the old behaviour on the releases pyproject
+    still supports. The module file is stable across every supported version.
+
+    A reentrant region does not end the walk: reentrant checkpointing nests
+    inside non-reentrant checkpointing, and the outer region is stranded by a
+    mode flip just the same. Its own `torch.utils.checkpoint.checkpoint` frame
+    is the next one outward, so skip that and keep scanning.
+    """
+    try:
+        import sys                              # module-level `_sys` is deleted above
+        import torch.utils.checkpoint as _checkpoint
+        origin = _checkpoint.__file__
+    except Exception:
+        return None
+    if not origin: return None
+    frame, reentrant = sys._getframe(1), 0
+    while frame is not None:
+        if frame.f_code.co_filename == origin:
+            name = frame.f_code.co_name
+            if name in _REENTRANT_FRAMES:
+                reentrant += 1
+            elif name == "checkpoint":
+                use_reentrant = _frame_local(frame, "use_reentrant")
+                if use_reentrant is False: return True
+                if reentrant: reentrant -= 1
+                elif use_reentrant is _UNKNOWN: return True
+            else:
+                return True                     # a pack or recompute frame
+        frame = frame.f_back
+    return False
+
+
+def _checkpoint_early_stop_errors():
+    """Checkpoint's "recomputation finished" signal, as an except-able tuple.
+
+    Private and version-dependent, so resolve it by name and fall back to an
+    empty tuple, which `except` accepts and never matches.
+    """
+    try:
+        import torch.utils.checkpoint as _checkpoint
+    except Exception:
+        return ()
+    found = tuple(
+        cls for cls in (getattr(_checkpoint, "_StopRecomputationError", None),)
+        if isinstance(cls, type) and issubclass(cls, BaseException)
+    )
+    return found
+
+
+def _is_checkpoint_pack_hook(pack):
+    """Is this `torch.utils.checkpoint`'s own pack hook?"""
+    return (getattr(pack, "__module__", "") == "torch.utils.checkpoint" and
+            getattr(pack, "__qualname__", "").startswith(
+                ("_checkpoint_hook", "_recomputation_hook")))
+
+
+def _in_non_reentrant_checkpoint():
+    """Are we inside a `use_reentrant = False` region? None when torch cannot say.
+
+    The only saved-tensor hooks `torch.utils.checkpoint` installs are the two
+    the non-reentrant path uses, and their qualnames separate the forward pack
+    from the backward recompute. Both class names are unchanged from 2.6 to
+    current main. The accessor arrived in 2.8, so 2.6 and 2.7 answer None and
+    keep the old behaviour. Reentrant checkpointing installs no hooks and
+    answers False, which is right: it re-differentiates what it recomputes, so
+    a mode flip cannot strand it.
+
+    The accessor reports only the top of the hook stack, and a user's own
+    `saved_tensors_hooks`/`save_on_cpu` entered inside the region sits above
+    ours, so an unrecognised hook means "cannot tell from here" rather than
+    "no region": ask the frames instead.
+    """
+    top = _saved_tensor_hook_accessor()
+    if top is not None:
+        try:
+            hooks = top(True)                   # ignore_is_tracing
+        except Exception:
+            hooks = _UNKNOWN
+        if hooks is not _UNKNOWN:
+            if not hooks: return False
+            if _is_checkpoint_pack_hook(hooks[0]): return True
+    return _walk_for_checkpoint_frame()
+
+
+# Set when a compiled call ran with a non-reentrant checkpoint's pack hook on
+# top: its activations were packed COMPILED and a backward is still owed. The
+# give-up path used to ask only whether the CURRENT call is inside a region,
+# which is false once that layer's forward has returned, so latching every
+# borrower eager mid-step left the earlier layer to recompute eagerly in
+# backward -- an abort, or silently wrong gradients when the shapes line up.
+_PACKED_COMPILED_IN_CHECKPOINT = False
+
+
+def _note_packed_under_checkpoint():
+    """Cheap probe, run per compiled call: the hook accessor only, no frame walk."""
+    global _PACKED_COMPILED_IN_CHECKPOINT
+    if _PACKED_COMPILED_IN_CHECKPOINT:
+        return
+    top = _saved_tensor_hook_accessor()
+    if top is None:
+        # torch < 2.8 cannot answer. Assume a region may be open: ending a step
+        # is rare and recoverable, wrong gradients are neither.
+        _PACKED_COMPILED_IN_CHECKPOINT = True
+        return
+    try:
+        hooks = top(True)                       # ignore_is_tracing
+    except Exception:
+        _PACKED_COMPILED_IN_CHECKPOINT = True
+        return
+    if hooks and _is_checkpoint_pack_hook(hooks[0]):
+        _PACKED_COMPILED_IN_CHECKPOINT = True
+
+
 def _wants_hard_recompile_failure():
     """Did the user ask Dynamo to make cache exhaustion fatal?
 
@@ -779,6 +929,192 @@ def _is_our_own_disabled_hook(exc):
     )
 
 
+# torch 2.7 renamed both recompile budgets; 2.6 and older still use the old
+# spelling, and the old names survive as aliases afterwards. Bumping whichever
+# pair the installed torch actually reads is the only portable way to buy the
+# current step a few more compilations.
+_RECOMPILE_LIMIT_NAMES = (
+    ("recompile_limit", "cache_size_limit"),
+    ("accumulated_recompile_limit", "accumulated_cache_size_limit"),
+)
+
+# How much headroom one bump buys, and how many bumps a single wrapper may ask
+# for before we give up and go eager. Bounded on purpose: the limit exists to
+# stop unbounded compilation, and this must not quietly remove it.
+_RECOMPILE_LIMIT_BUMP = 16
+_MAX_RECOMPILE_LIMIT_BUMPS = 4
+
+# The budgets live on torch._dynamo.config, which is process-global, so the
+# per-wrapper cap above bounds nothing on its own: N wrappers, or several models
+# trained in one process, each spend their 4 bumps and the global limit ends up
+# hundreds higher, permanently, for every unrelated compiled function. Cap the
+# total and put the originals back once the debt is settled.
+_MAX_TOTAL_RECOMPILE_LIMIT_BUMPS = 8
+_GLOBAL_BUMPS = 0
+_ORIGINAL_RECOMPILE_LIMITS = {}
+# Every value we have set each name to. A bump taken inside
+# `torch._dynamo.config.patch` records the context's temporary value as the
+# original, and the context restores the outer one on exit, so writing the
+# captured value back later would overwrite it. Only restore a name still
+# holding a value we put there, and restore the baseline THAT value came from:
+# name -> {bumped value: value it was bumped from}. Bumps nest, and the two
+# orderings need opposite answers.
+#   bump 1024->1040, patch, bump inside, exit  -> dynamo hands back 1040, owes 1024
+#   patch(2), bump 2->18, exit, bump 8->24     -> live 24 owes 8, NOT the scoped 2
+# A single recorded original answers one and gets the other wrong.
+_BUMPED_RECOMPILE_LIMITS = {}
+
+
+def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
+    """Raise both recompile budgets. False if this torch exposes neither, or if
+    the process-wide bump budget is spent."""
+    global _GLOBAL_BUMPS
+    try:
+        import torch._dynamo.config as _config
+    except Exception:
+        return False
+    # Measured here, not read from whatever the last restore happened to leave
+    # behind. That restore may have run under a `config.patch` that hid our
+    # value, where nothing is in effect and the count reads 0, while the borrow
+    # below happens outside it against the real raised limit.
+    _GLOBAL_BUMPS = max((_live_bump_depth(_config, n)
+                         for n in _BUMPED_RECOMPILE_LIMITS), default = 0)
+    if _GLOBAL_BUMPS >= _MAX_TOTAL_RECOMPILE_LIMIT_BUMPS:
+        return False
+    bumped = False
+    for names in _RECOMPILE_LIMIT_NAMES:
+        for name in names:
+            current = getattr(_config, name, None)
+            if isinstance(current, int) and not isinstance(current, bool):
+                try:
+                    setattr(_config, name, current + extra)
+                except Exception:
+                    continue
+                # Remember which baseline each bumped value came FROM, rather
+                # than one original plus a set of values. Two scoped-patch
+                # orderings are indistinguishable at bump time and need
+                # opposite answers: a first bump inside `config.patch` followed
+                # by an ordinary one must restore the outer value, while an
+                # ordinary bump followed by a nested one must restore the
+                # value from before the outer bump. Keying the baseline by the
+                # value we wrote answers both, because the live value at
+                # restore time says which bump is the one still standing.
+                # A stack per value, not one entry. A scoped patch can repeat
+                # the outer baseline -- bump 8->24, patch to 8, bump to 24
+                # again -- and a single entry collapsed the two debts, so the
+                # inner restore deleted both and the patch exit resurrected 24
+                # with nothing left to hand back.
+                _BUMPED_RECOMPILE_LIMITS.setdefault(name, {}).setdefault(
+                    current + extra, []).append(current)
+                _ORIGINAL_RECOMPILE_LIMITS.setdefault(name, current)
+                bumped = True
+                # Only the name this torch really reads; the alias follows.
+                break
+    if bumped:
+        _GLOBAL_BUMPS += 1
+    return bumped
+
+
+def _restore_recompile_limits_if_idle():
+    """Restore only when no live wrapper is still relying on the extra headroom.
+
+    A wrapper that borrowed budget and has not yet gone eager is still compiling
+    against the raised limit; taking it away mid-flight would push it straight
+    into the fallback we just paid to avoid.
+    """
+    for ref in _EAGER_FALLBACK_WRAPPERS:
+        w = ref()
+        if w is None:
+            continue
+        st = w._unsloth_fallback_state
+        if st.get("bumps") and not st.get("eager"):
+            return 0
+    return _restore_recompile_limits()
+
+
+def _restore_recompile_limits():
+    """Put the budgets back. Returns how many names were restored.
+
+    Called once every wrapper that borrowed headroom has gone eager, so nothing
+    still needs it and the process stops carrying a raised limit around.
+    """
+    global _GLOBAL_BUMPS, _PACKED_COMPILED_IN_CHECKPOINT
+    # A new step packs its own activations; last step's are long since freed.
+    _PACKED_COMPILED_IN_CHECKPOINT = False
+    if not _ORIGINAL_RECOMPILE_LIMITS:
+        return 0
+    try:
+        import torch._dynamo.config as _config
+    except Exception:
+        return 0
+    restored = 0
+    for name in list(_ORIGINAL_RECOMPILE_LIMITS):
+        try:
+            live = getattr(_config, name, None)
+            baselines = _BUMPED_RECOMPILE_LIMITS.get(name, {})
+            if live not in baselines:
+                # Not our value right now: either someone else's write or a
+                # live `torch._dynamo.config.patch` hiding ours, and the two
+                # are indistinguishable. Dropping the claim loses the original
+                # when that patch exits and hands our bump back, so keep it and
+                # settle at a later boundary.
+                continue
+            # Follow the chain back: successive bumps record 1040->1024,
+            # 1056->1040, and so on, so one hop would hand back the previous
+            # bump rather than the value we started from. Bounded by the map,
+            # and `seen` stops a cycle if a bump ever lands on an earlier one.
+            original, chain = baselines[live][-1], [live]
+            while original in baselines and original not in chain:
+                chain.append(original)
+                original = baselines[original][-1]
+            setattr(_config, name, original)
+            restored += 1
+        except Exception:
+            continue
+        # Only the branch just unwound. Dropping the whole map also threw away
+        # branches a live `config.patch` is still hiding: bump 8->24, patch to
+        # 2, bump 2->18, restore -- the 24->8 debt went with it, and the patch
+        # exit then resurrected 24 permanently.
+        for value in chain:
+            stack = baselines.get(value)
+            if stack: stack.pop()
+            if not stack: baselines.pop(value, None)
+        if not baselines:
+            _ORIGINAL_RECOMPILE_LIMITS.pop(name, None)
+            _BUMPED_RECOMPILE_LIMITS.pop(name, None)
+    # Repay only the debts actually settled. Zeroing while a scoped patch still
+    # hid a live bump handed the next wrapper the whole global allowance again,
+    # so repeated patches walked straight past the total cap.
+    _GLOBAL_BUMPS = max((_live_bump_depth(_config, n)
+                         for n in _BUMPED_RECOMPILE_LIMITS), default = 0)
+    return restored
+
+
+def _live_bump_depth(_config, name):
+    """How many of our bumps are IN EFFECT on this name right now.
+
+    Counting every recorded branch instead was wrong in both directions. A
+    branch a completed `config.patch` rolled back is gone -- its headroom is
+    not in the limit any more -- yet it kept consuming the process-wide
+    allowance forever, so repeated scoped patches eventually starved every
+    wrapper of budget nobody was using. And a branch hidden by a LIVE patch is
+    equally not in effect: the limit is the patched value, so borrowing against
+    it is bounded by that value, and the debt is counted again the moment the
+    patch exits and hands it back.
+
+    Walking back from the live value answers both, and it is the same chain the
+    restore follows, so the two cannot disagree.
+    """
+    live = getattr(_config, name, None)
+    baselines = _BUMPED_RECOMPILE_LIMITS.get(name, {})
+    depth, seen = 0, set()
+    while live in baselines and live not in seen:
+        seen.add(live)
+        depth += 1
+        live = baselines[live][-1]
+    return depth
+
+
 def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
     """`torch_compile` a standalone kernel, keeping `patch_function`'s eager fallback.
 
@@ -824,41 +1160,172 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         return compiled_func
 
     # Warn once. The condition repeats every call, and the log should not.
-    state = {"warned": False, "eager": False}
+    state = {"warned": False, "eager": False, "pending_eager": False, "bumps": 0}
 
     def _warn(message):
         if not state["warned"]:
             state["warned"] = True
             logger.warning(message)
 
+    # Nothing is a valid return value, so the retry needs its own sentinel.
+    _NO_RESULT = object()
+
+    def _latch_all_to_eager():
+        """Give up on the budget, taking the other wrappers in the same crisis.
+
+        Switching only this one leaves the rest of the step with some regions
+        compiled and some eager, which is the mismatch this path exists to avoid;
+        one checkpointed region routinely spans several patched functions.
+
+        Only wrappers that borrowed budget come along. One that never bumped was
+        never in trouble and never changed mode, so knocking it eager would cost
+        compilation for nothing and would break the per-wrapper latch that the
+        rest of this file guarantees.
+
+        Anything already packed compiled earlier in this step is still at risk.
+        Buying budget first is what makes that rare; this is the last resort.
+        """
+        state["eager"] = True
+        state["pending_eager"] = False
+        for ref in _EAGER_FALLBACK_WRAPPERS:
+            w = ref()
+            if w is None:
+                continue
+            st = w._unsloth_fallback_state
+            if not st.get("bumps"):
+                continue
+            st["eager"] = True
+            st["pending_eager"] = False
+        _restore_recompile_limits_if_idle()
+
+    def _release_borrowed_budget():
+        """Hand back the bump a retry took out but never got to use.
+
+        The call died for a reason of the model's own, not the compiler's, so
+        the wrapper is not compiling against that headroom. Leaving the bump
+        counted would keep this wrapper looking like a live borrower forever:
+        it is neither eager nor pending, so the step boundary never settles it,
+        `_restore_recompile_limits_if_idle` keeps declining, and the raised
+        process-global limit and the spent shared allowance outlive the run.
+        """
+        if state["bumps"] > 0:
+            state["bumps"] -= 1
+        # Declines while any other wrapper still relies on the headroom.
+        _restore_recompile_limits_if_idle()
+
+    def _retry_with_more_budget(args, kwargs):
+        """Finish THIS call the way it started, if we can.
+
+        Switching to eager here is what breaks non-reentrant activation
+        checkpointing: the pack and the recompute of one and the same region
+        then run in different compile modes, and torch aborts the backward with
+        "Something went unexpectedly wrong in activation checkpoint" or the
+        neighbouring "A different number of tensors was saved" / "different
+        metadata" errors. Buying a little more recompile budget keeps the call
+        compiled and defers the switch to the next step boundary, where nothing
+        is half-packed. Bounded, so a model that recompiles forever still ends
+        up eager rather than compiling without limit.
+        """
+        if state["bumps"] >= _MAX_RECOMPILE_LIMIT_BUMPS:
+            return _NO_RESULT
+        if not _bump_recompile_limits():
+            return _NO_RESULT
+        state["bumps"] += 1
+        try:
+            result = compiled_func(*args, **kwargs)
+        except errors:
+            # Keep the bump: the caller latches everything that borrowed to
+            # eager next, and that hand-back is what restores the budgets.
+            return _NO_RESULT
+        except graph_break_errors as e:
+            if _is_recompile_limit_unsupported(e) or _is_our_own_disabled_hook(e):
+                return _NO_RESULT
+            _release_borrowed_budget()
+            raise
+        except _checkpoint_early_stop_errors() as e:
+            # Not a failure: with early-stop on, checkpoint's recompute hook
+            # raises this once every needed tensor is back, and the checkpoint
+            # machinery swallows it as a successful recomputation. Releasing
+            # the bump and returning here left the wrapper compiled with its
+            # counters reset, so each new guard variant could borrow again and
+            # walk straight past both the per-wrapper and global caps. The
+            # retry DID finish; treat it as one and still let the signal out.
+            state["pending_eager"] = True
+            _warn(
+                f"Unsloth: torch.compile ran out of recompilation cache for "
+                f"{label} during checkpoint recomputation; switching to eager "
+                f"at the next step. Training is unaffected apart from speed."
+            )
+            raise
+        except BaseException:
+            # Anything else propagates to the caller, which may well catch it
+            # and carry on (skipping a bad batch, say), so the budget has to go
+            # back rather than be stranded on a call that never completed.
+            _release_borrowed_budget()
+            raise
+        # Anything else is a real failure of the model, not of the compiler.
+        # Falling through to eager would run the same call twice, applying any
+        # mutation it already made a second time, and would bury the error.
+        state["pending_eager"] = True
+        _warn(
+            f"Unsloth: torch.compile ran out of recompilation cache for "
+            f"{label}; finishing this step compiled and switching to eager at "
+            f"the next step. Training is unaffected apart from speed."
+        )
+        return result
+
+    def _give_up(e, args, kwargs):
+        """No budget left. Latch, then decide whether eager is even survivable.
+
+        Inside a non-reentrant checkpoint region it is not: whatever this step
+        already packed compiled gets recomputed eagerly, and the backward
+        either aborts or, when the shapes happen to line up, hands back wrong
+        gradients (torch compares only shape/dtype/device). Nothing is left to
+        keep this call compiled with, so end the step instead. Every borrower
+        is eager by now, so the caller's retry is consistent, which is the
+        contract `force_eager_fallback` offers reactively.
+        """
+        # Read BEFORE latching: latching hands the borrowed budget back, and
+        # that settlement is a step boundary, which clears the marker.
+        # Not just "are we in a region now": anything this step already packed
+        # compiled owes a backward that would now recompute eagerly.
+        packed = _in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT
+        _latch_all_to_eager()
+        _warn(
+            f"Unsloth: torch.compile ran out of recompilation cache for "
+            f"{label}; running it eagerly from here. Training is "
+            f"unaffected apart from speed. ({type(e).__name__})"
+        )
+        if packed:
+            global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
+            _RAISED_INSIDE_CHECKPOINT = True
+            _CHECKPOINT_SETTLE_ATTEMPTS = 0
+            raise e
+        return eager_func(*args, **kwargs)
+
     @functools.wraps(eager_func)
     def wrapper(*args, **kwargs):
         if state["eager"]:
             return eager_func(*args, **kwargs)
         try:
+            _note_packed_under_checkpoint()
             return compiled_func(*args, **kwargs)
         except errors as e:
             if _wants_hard_recompile_failure():
                 raise
-            state["eager"] = True
-            _warn(
-                f"Unsloth: torch.compile ran out of recompilation cache for "
-                f"{label}; running it eagerly from here. Training is "
-                f"unaffected apart from speed. ({type(e).__name__})"
-            )
-            return eager_func(*args, **kwargs)
+            result = _retry_with_more_budget(args, kwargs)
+            if result is not _NO_RESULT:
+                return result
+            return _give_up(e, args, kwargs)
         except graph_break_errors as e:
             # Cache exhaustion on a torch that has no exception class for it
             # (2.4), then our own `torch.compiler.disable` hook. Anything else
             # is a real graph break and must keep raising.
             if _is_recompile_limit_unsupported(e):
-                state["eager"] = True
-                _warn(
-                    f"Unsloth: torch.compile ran out of recompilation cache "
-                    f"for {label}; running it eagerly from here. Training is "
-                    f"unaffected apart from speed. ({type(e).__name__})"
-                )
-                return eager_func(*args, **kwargs)
+                result = _retry_with_more_budget(args, kwargs)
+                if result is not _NO_RESULT:
+                    return result
+                return _give_up(e, args, kwargs)
             if not _is_our_own_disabled_hook(e):
                 raise
             state["eager"] = True
@@ -874,6 +1341,12 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     # keep `get_compiler_config` present so the unwrap check below still sees
     # a compiled function and reaches `__wrapped__` (the eager original).
     wrapper._unsloth_compiled_func = compiled_func
+    # Anything asking "is this compiled?" looks here, torch included, and the
+    # wrapper is the object callers now hold. Forwarding it keeps that answer
+    # true instead of making the fallback look like it un-compiled the region.
+    _orig = getattr(compiled_func, "_torchdynamo_orig_callable", None)
+    if _orig is not None:
+        wrapper._torchdynamo_orig_callable = _orig
     _gcc = getattr(compiled_func, "get_compiler_config", None)
     if _gcc is not None:
         wrapper.get_compiler_config = _gcc
@@ -903,6 +1376,128 @@ def eager_fallback_state() -> dict[str, bool]:
     return out
 
 
+_RAISED_INSIDE_CHECKPOINT = False
+# Retries are bounded: one collection per step forever would cost more than the
+# stale hooks do, and torch < 2.8 cannot report them at all.
+_MAX_CHECKPOINT_SETTLE_ATTEMPTS = 8
+_CHECKPOINT_SETTLE_ATTEMPTS = 0
+
+
+def _checkpoint_hooks_left_installed():
+    """Are checkpoint's hooks still on top? `_UNKNOWN` when torch cannot say.
+
+    Before 2.8 there is no accessor. Answering False there let settlement give
+    up after one failed collection, and the case that needs the retry is
+    exactly the one that cannot be inspected: a traceback held by
+    `except ... as exc` still roots the generator, so the collect cannot work
+    until the caller drops it.
+    """
+    top = _saved_tensor_hook_accessor()
+    if top is None: return _UNKNOWN
+    try:
+        hooks = top(True)
+    except Exception:
+        return _UNKNOWN
+    return bool(hooks) and _is_checkpoint_pack_hook(hooks[0])
+
+
+def _settle_abandoned_checkpoint_generator():
+    """Finalise the checkpoint generator our give-up raise left mid-flight.
+
+    `_checkpoint_without_reentrant_generator` holds `with _checkpoint_hook(...)`
+    open across its yield, so an exception escaping the region abandons the
+    generator with its saved-tensor hooks still installed, and every later
+    region sees them. Refcounting usually finalises it at once; raising through
+    the compiled frames leaves a cycle, so it waits for a collection. One
+    collect here makes the retry we promised the caller deterministic. Only
+    after a give-up raise, which the bump caps bound to a handful per process.
+    """
+    global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
+    if not _RAISED_INSIDE_CHECKPOINT: return False
+    import gc
+    gc.collect()
+    _CHECKPOINT_SETTLE_ATTEMPTS += 1
+    # A caller retrying from inside `except ... as exc` still roots the
+    # traceback, so the generator survives every collection. Stay pending and
+    # try again at the next boundary rather than never again.
+    # `_UNKNOWN` counts as still pending: before 2.8 nothing can be inspected,
+    # and that is precisely when the retry is needed.
+    _left = _checkpoint_hooks_left_installed()
+    if (_left is _UNKNOWN or _left) and \
+        _CHECKPOINT_SETTLE_ATTEMPTS < _MAX_CHECKPOINT_SETTLE_ATTEMPTS:
+        return False
+    _RAISED_INSIDE_CHECKPOINT = False
+    _CHECKPOINT_SETTLE_ATTEMPTS = 0
+    return True
+
+
+def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
+    """`torch.compile` that survives cache exhaustion under `fullgraph = True`.
+
+    `patch_function` already routes its own `fullgraph = True` compiles through
+    `_fall_back_to_eager_on_recompile_limit`, but the generated modules in
+    `unsloth_compiled_cache` decorate their functions directly and never reach
+    it, so those regions kept the hard failure the wrapper exists to remove.
+    Gemma4 has ten such regions, and the vision tower drives one of them,
+    `Gemma4RMSNorm_forward`, far past the budget:
+
+        FailOnRecompileLimitHit: Hard failure due to fullgraph=True
+
+    raised out of `unsloth_compiled_module_gemma4.py`, ending training at step
+    0. Reproducible on any GPU by lowering `recompile_limit`; a T4 simply
+    reaches it on its own.
+
+    `fullgraph = False` is returned untouched: Dynamo already falls back by
+    itself there, so wrapping would add a layer that can never fire.
+    """
+    def _decorate(func):
+        compiled = torch.compile(func, fullgraph = fullgraph, **compile_kwargs)
+        if not fullgraph:
+            return compiled
+        return _fall_back_to_eager_on_recompile_limit(
+            compiled, func, getattr(func, "__qualname__", None) or repr(func),
+        )
+    return _decorate
+
+
+def apply_pending_eager_fallbacks() -> int:
+    """Latch every wrapper that deferred its switch. Returns how many flipped.
+
+    Call this at a training-step boundary, where no activation-checkpoint
+    region is half-packed. A wrapper that ran out of recompile budget mid-step
+    kept itself compiled for the rest of that step (see
+    `_fall_back_to_eager_on_recompile_limit`) precisely so the pack and the
+    recompute of every checkpointed region agree; this is where that debt is
+    settled.
+
+    Flipping one wrapper flips all of them, for the same reason
+    `force_eager_fallback` does: one checkpointed region usually spans several
+    patched functions, and leaving the rest compiled just moves the mismatch.
+
+    Safe to call on every step. Nothing pending means nothing happens.
+    """
+    _settle_abandoned_checkpoint_generator()
+    live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
+            if w is not None]
+    if not any(w._unsloth_fallback_state.get("pending_eager") for w in live):
+        # Nothing to flip, but a borrower that bumped and was then collected
+        # (training aborted, or the patched object was replaced) would otherwise
+        # leave the process-wide limit raised and its allowance spent forever.
+        # The helper declines while any live wrapper still needs the headroom.
+        _restore_recompile_limits_if_idle()
+        return 0
+    flipped = 0
+    for w in live:
+        if not w._unsloth_fallback_state["eager"]:
+            flipped += 1
+        w._unsloth_fallback_state["eager"] = True
+        w._unsloth_fallback_state["pending_eager"] = False
+    # Everything that borrowed headroom is eager now, so hand the budget back
+    # rather than leaving the process permanently raised.
+    _restore_recompile_limits()
+    return flipped
+
+
 def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
     """Latch every wrapper to eager. Returns how many are eager afterwards.
 
@@ -923,10 +1518,14 @@ def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
     live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
             if w is not None]
     if only_if_already_triggered and not any(
-            w._unsloth_fallback_state["eager"] for w in live):
+            w._unsloth_fallback_state["eager"]
+            or w._unsloth_fallback_state.get("pending_eager")
+            for w in live):
         return 0
     for w in live:
         w._unsloth_fallback_state["eager"] = True
+        w._unsloth_fallback_state["pending_eager"] = False
+    _restore_recompile_limits()
     return len(live)
 
 

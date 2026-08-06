@@ -98,7 +98,10 @@ def test_recompile_limit_falls_back_instead_of_raising():
     c, e, calls = _pair(_LIMIT_ERROR("recompile_limit reached"))
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
     assert w(3) == 6
-    assert calls == {"c": 1, "e": 1}
+    # Two compiled attempts: the one that hit the limit and the one retry the
+    # wrapper makes with a raised budget, so a step that is halfway through an
+    # activation-checkpoint pack can still finish compiled. Then eager.
+    assert calls == {"c": 2, "e": 1}
 
 
 def test_the_fallback_latches():
@@ -121,7 +124,9 @@ def test_the_fallback_latches():
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
     for _ in range(5):
         assert w(1) == 2
-    assert calls["c"] == 1, "the compiler must not be re-entered after the latch"
+    # One failing attempt plus the single bumped retry, and nothing after the
+    # latch: the compiler is not consulted again.
+    assert calls["c"] == 2, "the compiler must not be re-entered after the latch"
     assert calls["e"] == 5
 
 
@@ -258,10 +263,13 @@ def test_cache_exhaustion_reported_as_a_bare_unsupported_falls_back(message):
     c, e, calls = _pair(Unsupported(message))
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
     assert w(3) == 6
-    assert calls == {"c": 1, "e": 1}
+    # Two compiled attempts: the one that hit the limit and the one retry the
+    # wrapper makes with a raised budget, so a step that is halfway through an
+    # activation-checkpoint pack can still finish compiled. Then eager.
+    assert calls == {"c": 2, "e": 1}
     # And it latches, like every other fallback reason.
     assert w(3) == 6
-    assert calls["c"] == 1
+    assert calls["c"] == 2
 
 
 def test_error_tuple_is_non_empty_on_this_torch():
@@ -373,7 +381,10 @@ def test_the_flag_being_off_keeps_the_fallback():
         c, e, calls = _pair(_LIMIT_ERROR("recompile_limit reached"))
         w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
         assert w(3) == 6
-    assert calls == {"c": 1, "e": 1}
+    # Two compiled attempts: the one that hit the limit and the one retry the
+    # wrapper makes with a raised budget, so a step that is halfway through an
+    # activation-checkpoint pack can still finish compiled. Then eager.
+    assert calls == {"c": 2, "e": 1}
 
 
 def test_a_torch_without_the_flag_still_falls_back():
@@ -391,3 +402,803 @@ def test_a_torch_without_the_flag_still_falls_back():
     finally:
         for n, v in saved.items():
             setattr(config, n, v)
+
+
+def test_an_unrelated_error_from_the_retry_is_not_swallowed():
+    """The retry must only absorb compiler failures.
+
+    On cache exhaustion the wrapper retries the compiled function once with a
+    raised budget. If that retry fails for a real reason -- a data-dependent op,
+    a shape error, anything of the model's own -- falling through to eager runs
+    the same call a second time, re-applying any mutation it already made, and
+    buries the error. Only a recompile-limit failure may reach eager.
+    """
+    calls = {"c": 0, "e": 0}
+    boom = RuntimeError("a real model failure, not a compiler one")
+
+    def compiled(x):
+        calls["c"] += 1
+        if calls["c"] == 1:
+            raise _LIMIT_ERROR("recompile_limit reached")
+        raise boom
+
+    def eager(x):
+        calls["e"] += 1
+        return x * 2
+
+    with _hard_failure(False):
+        w = _fall_back_to_eager_on_recompile_limit(compiled, eager, "M.forward")
+        with pytest.raises(RuntimeError, match = "a real model failure"):
+            w(3)
+
+    # Two compiled attempts, and eager never ran: the caller sees its own error.
+    assert calls == {"c": 2, "e": 0}
+
+
+def test_the_recompile_budget_is_bounded_and_handed_back():
+    """The budgets are process-global, so a per-wrapper cap bounds nothing.
+
+    Every bump raises `torch._dynamo.config` for the whole process. Without a
+    shared cap, N wrappers (or several models trained in one process) each spend
+    their own allowance and the limit ends up hundreds higher for every unrelated
+    compiled function; without a restore it stays there for the process's life.
+    """
+    from unsloth_zoo.temporary_patches import utils as u
+    import torch._dynamo.config as config
+
+    name = u._LIMIT_KEYS[0] if hasattr(u, "_LIMIT_KEYS") else _LIMIT_KEYS[0]
+    before = getattr(config, name)
+    saved_global, saved_orig = u._GLOBAL_BUMPS, dict(u._ORIGINAL_RECOMPILE_LIMITS)
+    u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = 0, {}
+    try:
+        # Far more attempts than the cap allows, as many wrappers would make.
+        granted = sum(bool(u._bump_recompile_limits()) for _ in range(50))
+        assert granted == u._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS, granted
+        raised = getattr(config, name)
+        assert raised == before + granted * u._RECOMPILE_LIMIT_BUMP, (before, raised)
+
+        assert u._restore_recompile_limits() >= 1
+        assert getattr(config, name) == before
+        # And the allowance is available again for the next model.
+        assert u._GLOBAL_BUMPS == 0
+    finally:
+        setattr(config, name, before)
+        u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = saved_global, saved_orig
+
+
+def test_exhausting_the_budget_takes_the_other_borrowers_with_it():
+    """Wrappers in the same budget crisis must switch together, and only those.
+
+    One checkpointed region routinely spans several patched functions. Letting
+    only the wrapper that ran out go eager leaves the rest of the step half
+    compiled, which is the mismatch this path exists to avoid. A wrapper that
+    never borrowed budget was never in trouble and must stay compiled.
+    """
+    from unsloth_zoo.temporary_patches import utils as u
+
+    borrower_calls = {"c": 0, "e": 0}
+    bystander_calls = {"c": 0, "e": 0}
+
+    def borrower(x):
+        borrower_calls["c"] += 1
+        raise _LIMIT_ERROR("recompile_limit reached")
+
+    def borrower_eager(x):
+        borrower_calls["e"] += 1
+        return x * 2
+
+    b_c, b_e, _ = _pair(_LIMIT_ERROR("recompile_limit reached"), borrower_calls)
+    s_c, s_e, _ = _pair(None, bystander_calls)
+
+    saved_global = u._GLOBAL_BUMPS
+    with _hard_failure(False):
+        first = _fall_back_to_eager_on_recompile_limit(b_c, b_e, "A.forward")
+        second = _fall_back_to_eager_on_recompile_limit(borrower, borrower_eager,
+                                                        "B.forward")
+        bystander = _fall_back_to_eager_on_recompile_limit(s_c, s_e, "C.forward")
+        # Both borrowers exhaust; the bystander never fails.
+        first(1)
+        u._GLOBAL_BUMPS = u._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS   # budget gone
+        second(1)
+
+    assert second._unsloth_fallback_state["eager"] is True
+    # first borrowed budget earlier, so it comes along.
+    assert first._unsloth_fallback_state["eager"] is True
+    # The bystander never bumped, so it stays compiled.
+    assert bystander._unsloth_fallback_state["eager"] is False
+    u._GLOBAL_BUMPS = saved_global
+
+
+def _dead_ref():
+    """A weakref whose referent is already gone, as the registry holds them."""
+    import weakref
+    def _gone(): pass
+    ref = weakref.ref(_gone)
+    del _gone
+    import gc; gc.collect()
+    return ref
+
+
+def test_a_collected_borrower_does_not_strand_the_raised_limit():
+    """The no-pending path must still settle debt.
+
+    A wrapper can bump the budget, mark itself pending, and then be dropped
+    before the next step boundary: training aborts, or the patched object is
+    re-patched or replaced, and the registry holds it only weakly. The boundary
+    hook then sees nothing pending and used to return early, leaving
+    `torch._dynamo.config` raised for the life of the process and the shared
+    bump allowance spent for every later model.
+    """
+    from unsloth_zoo.temporary_patches import utils as u
+    import torch._dynamo.config as config
+
+    name = u._LIMIT_KEYS[0] if hasattr(u, "_LIMIT_KEYS") else _LIMIT_KEYS[0]
+    before = getattr(config, name)
+    saved_global = u._GLOBAL_BUMPS
+    saved_orig = dict(u._ORIGINAL_RECOMPILE_LIMITS)
+    saved_registry = list(u._EAGER_FALLBACK_WRAPPERS)
+    u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = 0, {}
+    u._EAGER_FALLBACK_WRAPPERS.clear()
+    try:
+        assert u._bump_recompile_limits()
+        assert getattr(config, name) > before
+        # The borrower is gone: every registered ref is dead, as it would be
+        # after the wrapper was collected.
+        u._EAGER_FALLBACK_WRAPPERS.append(_dead_ref())
+
+        u.apply_pending_eager_fallbacks()
+
+        assert getattr(config, name) == before, "limit left raised for the process"
+        assert u._GLOBAL_BUMPS == 0, "bump allowance left spent for later models"
+    finally:
+        setattr(config, name, before)
+        u._GLOBAL_BUMPS = saved_global
+        u._ORIGINAL_RECOMPILE_LIMITS.clear()
+        u._ORIGINAL_RECOMPILE_LIMITS.update(saved_orig)
+        u._EAGER_FALLBACK_WRAPPERS.clear()
+        u._EAGER_FALLBACK_WRAPPERS.extend(saved_registry)
+
+
+def test_a_live_borrower_still_keeps_its_headroom():
+    """The control for the test above: do not hand the budget back underneath a
+    wrapper that borrowed it and is still compiling against it."""
+    from unsloth_zoo.temporary_patches import utils as u
+    import torch._dynamo.config as config
+
+    name = u._LIMIT_KEYS[0] if hasattr(u, "_LIMIT_KEYS") else _LIMIT_KEYS[0]
+    before = getattr(config, name)
+    saved_global = u._GLOBAL_BUMPS
+    saved_orig = dict(u._ORIGINAL_RECOMPILE_LIMITS)
+    saved_registry = list(u._EAGER_FALLBACK_WRAPPERS)
+    u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = 0, {}
+    u._EAGER_FALLBACK_WRAPPERS.clear()
+
+    def _borrower(): pass
+    _borrower._unsloth_fallback_state = {"eager": False, "pending_eager": False, "bumps": 1}
+    _borrower._unsloth_fallback_label = "borrower"
+    try:
+        assert u._bump_recompile_limits()
+        raised = getattr(config, name)
+        import weakref
+        u._EAGER_FALLBACK_WRAPPERS.append(weakref.ref(_borrower))
+
+        u.apply_pending_eager_fallbacks()
+
+        assert getattr(config, name) == raised, "took the headroom back mid-flight"
+    finally:
+        setattr(config, name, before)
+        u._GLOBAL_BUMPS = saved_global
+        u._ORIGINAL_RECOMPILE_LIMITS.clear()
+        u._ORIGINAL_RECOMPILE_LIMITS.update(saved_orig)
+        u._EAGER_FALLBACK_WRAPPERS.clear()
+        u._EAGER_FALLBACK_WRAPPERS.extend(saved_registry)
+
+
+@contextlib.contextmanager
+def _isolated_budget():
+    """Run with a private registry and a fresh, restored bump allowance.
+
+    The bump state is process-global, so a test that leaves it dirty poisons
+    every later test in the same worker.
+    """
+    from unsloth_zoo.temporary_patches import utils as u
+    import torch._dynamo.config as config
+
+    keys = u._LIMIT_KEYS if hasattr(u, "_LIMIT_KEYS") else _LIMIT_KEYS
+    name = keys[0]
+    # A bump raises the accumulated limit too, and one test leaves its bump
+    # active on purpose, so restoring only the first name leaks +16 on the
+    # second into every later test in this worker.
+    before_all = {k: getattr(config, k) for k in keys if hasattr(config, k)}
+    before = before_all[name]
+    saved_global = u._GLOBAL_BUMPS
+    saved_orig = dict(u._ORIGINAL_RECOMPILE_LIMITS)
+    saved_bumped = dict(u._BUMPED_RECOMPILE_LIMITS)
+    saved_registry = list(u._EAGER_FALLBACK_WRAPPERS)
+    u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = 0, {}
+    u._BUMPED_RECOMPILE_LIMITS.clear()
+    u._EAGER_FALLBACK_WRAPPERS.clear()
+    try:
+        yield u, config, name, before
+    finally:
+        for key, value in before_all.items():
+            setattr(config, key, value)
+        u._BUMPED_RECOMPILE_LIMITS.clear()
+        u._BUMPED_RECOMPILE_LIMITS.update(saved_bumped)
+        u._GLOBAL_BUMPS = saved_global
+        u._ORIGINAL_RECOMPILE_LIMITS.clear()
+        u._ORIGINAL_RECOMPILE_LIMITS.update(saved_orig)
+        u._EAGER_FALLBACK_WRAPPERS.clear()
+        u._EAGER_FALLBACK_WRAPPERS.extend(saved_registry)
+
+
+@pytest.mark.parametrize("boom", [
+    RuntimeError("a real model failure, not a compiler one"),
+    _dynamo_exc.Unsupported("a real graph break, not a budget problem"),
+], ids = ["unrelated_error", "real_graph_break"])
+def test_a_retry_that_raises_hands_the_borrowed_budget_back(boom):
+    """A retry that dies must not keep the headroom it borrowed.
+
+    The retry raises the budget for the whole process and counts a bump against
+    the wrapper. If the call then fails for a reason of its own -- a bad batch
+    the caller catches and skips, or a genuine graph break -- the wrapper stays
+    non-eager with a bump outstanding, so the step boundary finds nothing
+    pending and `_restore_recompile_limits_if_idle` refuses forever. The raised
+    `torch._dynamo.config` and the spent shared allowance then outlive the run
+    for every later model and unrelated compiled function.
+    """
+    with _isolated_budget() as (u, config, name, before):
+        calls = {"c": 0}
+
+        def compiled(x):
+            calls["c"] += 1
+            if calls["c"] == 1:
+                raise _LIMIT_ERROR("recompile_limit reached")
+            raise boom
+
+        def eager(x):
+            return x * 2
+
+        with _hard_failure(False):
+            w = _fall_back_to_eager_on_recompile_limit(compiled, eager, "M.forward")
+            with pytest.raises(type(boom)):
+                w(3)
+
+        assert calls["c"] == 2, "the retry did not run"
+        state = w._unsloth_fallback_state
+        assert state["bumps"] == 0, "the failed call kept its bump"
+        assert getattr(config, name) == before, "limit left raised for the process"
+        assert u._GLOBAL_BUMPS == 0, "bump allowance left spent for later models"
+
+
+def test_the_fixture_restores_every_limit_a_bump_raised():
+    """`_bump_recompile_limits` raises the accumulated limit as well as the
+    per-code one, and `test_a_successful_retry_keeps_its_bump` deliberately
+    exits with its bump still active. Restoring one name left the other +16
+    for every later test sharing this worker."""
+    keys = [k for k in _LIMIT_KEYS if hasattr(torch._dynamo.config, k)]
+    assert len(keys) > 1, "this torch exposes only one limit; nothing to leak"
+    outer = {k: getattr(torch._dynamo.config, k) for k in keys}
+    with _isolated_budget() as (mod, config, name, before):
+        mod._bump_recompile_limits()
+        assert all(getattr(config, k) > outer[k] for k in keys), "bump raised one only"
+    assert {k: getattr(torch._dynamo.config, k) for k in keys} == outer
+
+
+def test_a_bump_nested_inside_a_scoped_config_patch_still_settles_up():
+    """Bumps nest, so the last value we set is not the only one that is ours.
+
+    Bump to 24, patch down to 2, bump to 18. On exit dynamo restores 24, which
+    is also ours and still owes the original 8. Recording only the newest value
+    made that look like someone else's change, so 24 stayed forever."""
+    with _isolated_budget() as (mod, config, name, before):
+        mod._bump_recompile_limits()
+        first = getattr(config, name)
+        assert first > before
+        with torch._dynamo.config.patch({name: 2}):
+            mod._bump_recompile_limits()
+            assert getattr(config, name) != first, "the nested bump is a new value"
+        assert getattr(config, name) == first, "dynamo restored our earlier bump"
+        mod._restore_recompile_limits()
+        assert getattr(config, name) == before, "the first bump was stranded"
+
+
+def test_a_bump_taken_inside_a_scoped_config_patch_is_not_written_back():
+    """`torch._dynamo.config.patch` restores its outer value on exit, so the
+    value captured inside it is stale by the time we settle up. Writing it back
+    would change the process-wide limit for good."""
+    with _isolated_budget() as (mod, config, name, before):
+        with torch._dynamo.config.patch({name: 2}):
+            mod._bump_recompile_limits()
+            assert mod._ORIGINAL_RECOMPILE_LIMITS[name] == 2, "captured the temporary"
+        assert getattr(config, name) == before, "dynamo restored the outer value"
+        mod._restore_recompile_limits()
+        assert getattr(config, name) == before, "clobbered the outer value"
+
+
+def test_a_restore_underneath_an_active_config_patch_keeps_the_debt():
+    """A step boundary can land inside someone's `torch._dynamo.config.patch`.
+
+    Our bumped value is not the live one then, and dropping the bookkeeping for
+    that reason loses the original: the patch exits, dynamo hands our bump
+    back, and nothing is left that knows what it was.
+    """
+    with _isolated_budget() as (mod, config, name, before):
+        mod._bump_recompile_limits()
+        bumped = getattr(config, name)
+        assert bumped > before
+        with torch._dynamo.config.patch({name: 2}):
+            mod._restore_recompile_limits()     # our value is hidden right now
+            assert getattr(config, name) == 2, "clobbered the patched value"
+        assert getattr(config, name) == bumped, "dynamo restored our bump"
+        mod._restore_recompile_limits()
+        assert getattr(config, name) == before, "the bump was stranded forever"
+
+
+def test_a_successful_retry_keeps_its_bump():
+    """The control for the test above.
+
+    The wrapper is genuinely compiling against the extra headroom until it goes
+    eager, so a retry that succeeded must hold on to its bump; releasing it
+    would take the budget away mid-flight.
+    """
+    with _isolated_budget() as (u, config, name, before):
+        calls = {"c": 0}
+
+        def compiled(x):
+            calls["c"] += 1
+            if calls["c"] == 1:
+                raise _LIMIT_ERROR("recompile_limit reached")
+            return x * 2
+
+        def eager(x):
+            return x * 2
+
+        with _hard_failure(False):
+            w = _fall_back_to_eager_on_recompile_limit(compiled, eager, "M.forward")
+            assert w(3) == 6
+
+        state = w._unsloth_fallback_state
+        assert state["bumps"] == 1 and state["pending_eager"] is True
+        assert getattr(config, name) > before, "headroom taken back mid-flight"
+        assert u._GLOBAL_BUMPS == 1
+
+
+# ---- round 3: four Codex items ------------------------------------------
+
+def _utils():
+    """The module itself, so module-level bookkeeping can be reset."""
+    import unsloth_zoo.temporary_patches.utils as U
+    return U
+
+
+# Labels this file's own wrappers are built with, so the reset can leave the
+# package's real kernels registered.
+_OUR_LABELS = frozenset((
+    "M.forward", "A.forward", "B.forward", "C.forward", "probe",
+))
+
+
+def _limit_names():
+    import torch._dynamo.config as cfg
+    return [n for group in _utils()._RECOMPILE_LIMIT_NAMES for n in group
+            if isinstance(getattr(cfg, n, None), int)]
+
+
+def _snapshot_limits():
+    import torch._dynamo.config as cfg
+    return {n: getattr(cfg, n) for n in _limit_names()}
+
+
+# Captured at import, before any test bumps: pytest imports the module first.
+_PRISTINE_LIMITS = _snapshot_limits()
+
+
+def _reset_bump_state(U):
+    import torch._dynamo.config as cfg
+    U._ORIGINAL_RECOMPILE_LIMITS.clear()
+    U._BUMPED_RECOMPILE_LIMITS.clear()
+    U._GLOBAL_BUMPS = 0
+    # Drop only the wrappers this file made. The registry is process-wide and
+    # holds every patched kernel in the package, so clearing it deregistered
+    # gemma/gemma4/qwen3 for the rest of the worker and their own tests then
+    # could not find themselves in eager_fallback_state().
+    U._EAGER_FALLBACK_WRAPPERS[:] = [
+        _r for _r in U._EAGER_FALLBACK_WRAPPERS if _r() is not None
+        and getattr(_r(), "_unsloth_fallback_label", None) not in _OUR_LABELS
+    ]
+    # Clearing the bookkeeping alone left a real bump standing: a wrapper that
+    # exhausted its cache raised both budgets by 16 before signalling, so every
+    # later test ran against enlarged limits and could stop reaching the
+    # exhaustion it exercises.
+    for name, value in _PRISTINE_LIMITS.items():
+        setattr(cfg, name, value)
+
+def test_a_scoped_first_bump_does_not_strand_a_stale_original():
+    """`setdefault` alone kept the PATCHED value as the recorded original.
+
+    First bump inside `torch._dynamo.config.patch` records the temporary value.
+    Leaving the patch restores the real outer one, which we keep a claim on
+    because it is not in the bumped set. Without rebasing, the next ordinary
+    bump preserves the stale original and a later restore writes it over the
+    real outer value, lowering the process-wide limit for good.
+    """
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = "recompile_limit" if hasattr(cfg, "recompile_limit") else "cache_size_limit"
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        with torch._dynamo.config.patch({name: 2}):
+            U._bump_recompile_limits(16)          # records original 2
+        assert getattr(cfg, name) == outer, "patch exit should restore the outer value"
+        U._bump_recompile_limits(16)              # must rebase onto `outer`
+        U._restore_recompile_limits()
+        assert getattr(cfg, name) == outer, (
+            f"limit left at {getattr(cfg, name)}, expected {outer}")
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_the_frame_walk_has_no_depth_cap():
+    """A cap cannot be read as proof that no checkpoint is open: `checkpoint()`
+    sits well over 60 frames up under nested module dispatch, and stopping
+    early answered "no region" and switched to eager inside one."""
+    import inspect
+    U = _utils()
+    src = inspect.getsource(U._walk_for_checkpoint_frame)
+    assert "_limit" not in src, "the depth cap is back"
+    assert "seen" not in src
+
+
+def test_deep_nesting_still_finds_the_region():
+    U = _utils()
+    if U._saved_tensor_hook_accessor() is None:
+        pytest.skip("needs a torch that can build the region")
+    seen = {}
+
+    def probe():
+        seen["walk"] = U._walk_for_checkpoint_frame()
+        return torch.zeros(1, requires_grad=True).sum()
+
+    def deep(n):
+        return probe() if n == 0 else deep(n - 1)
+
+    x = torch.randn(4, 4, requires_grad=True)
+    torch.utils.checkpoint.checkpoint(lambda _: deep(120), x, use_reentrant=False)
+    assert seen["walk"] is True, "120 frames deep and the walk lost the region"
+
+
+def test_an_uninspectable_hook_stack_reads_as_unknown():
+    """Before 2.8 nothing can be inspected, and that is exactly when the
+    settlement retry is needed, so False was the wrong answer."""
+    U = _utils()
+    real = U._saved_tensor_hook_accessor
+    U._saved_tensor_hook_accessor = lambda: None
+    try:
+        assert U._checkpoint_hooks_left_installed() is U._UNKNOWN
+    finally:
+        U._saved_tensor_hook_accessor = real
+
+
+def test_settlement_stays_pending_when_it_cannot_be_inspected():
+    U = _utils()
+    real = U._saved_tensor_hook_accessor
+    U._saved_tensor_hook_accessor = lambda: None
+    try:
+        U._RAISED_INSIDE_CHECKPOINT = True
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+        assert U._settle_abandoned_checkpoint_generator() is False
+        assert U._RAISED_INSIDE_CHECKPOINT is True
+    finally:
+        U._saved_tensor_hook_accessor = real
+        U._RAISED_INSIDE_CHECKPOINT = False
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+
+
+def test_settlement_still_gives_up_eventually():
+    """Bounded, so a permanently rooted traceback cannot cost a collect a step
+    forever."""
+    U = _utils()
+    real = U._saved_tensor_hook_accessor
+    U._saved_tensor_hook_accessor = lambda: None
+    try:
+        U._RAISED_INSIDE_CHECKPOINT = True
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+        for _ in range(U._MAX_CHECKPOINT_SETTLE_ATTEMPTS + 2):
+            if U._settle_abandoned_checkpoint_generator():
+                break
+        else:
+            pytest.fail("settlement never gave up")
+    finally:
+        U._saved_tensor_hook_accessor = real
+        U._RAISED_INSIDE_CHECKPOINT = False
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+
+
+def test_the_early_stop_signal_is_resolvable():
+    U = _utils()
+    errs = U._checkpoint_early_stop_errors()
+    assert isinstance(errs, tuple)
+    for cls in errs:
+        assert issubclass(cls, BaseException)
+
+
+def test_early_stop_counts_as_a_finished_retry():
+    """checkpoint's recompute hook raises this once every needed tensor is
+    back, and the machinery swallows it as success. Releasing the bump and
+    re-raising left the wrapper compiled with its counters reset, so each new
+    guard variant could borrow again and walk past both caps."""
+    U = _utils()
+    errs = U._checkpoint_early_stop_errors()
+    if not errs:
+        pytest.skip("this torch has no _StopRecomputationError")
+    stop = errs[0]
+    calls = {"n": 0}
+
+    def eager(x):
+        return x
+
+    class _Compiled:
+        def __call__(self, x):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise U._recompile_limit_errors()[0]("cache exhausted")
+            raise stop()
+
+    wrapped = U._fall_back_to_eager_on_recompile_limit(_Compiled(), eager, "probe")
+    _reset_bump_state(U)
+    with pytest.raises(stop):
+        wrapped(torch.zeros(1))
+    assert wrapped._unsloth_fallback_state["pending_eager"] is True, \
+        "the retry finished; the wrapper must still be latched for next step"
+    _reset_bump_state(U)
+
+
+# ---- round 4: three Codex items -----------------------------------------
+
+def test_a_hidden_branch_survives_restoring_a_visible_one():
+    """Restoring one branch used to drop every branch recorded for the name.
+
+    Bump 8->24, enter a patch at 2, restore (24 is hidden, so the debt is
+    kept), bump 2->18, restore. That second restore popped the whole per-name
+    map, taking the 24->8 debt with it, and the patch exit then handed 24 back
+    as the process-wide limit for good.
+    """
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        U._bump_recompile_limits(16)                  # outer -> outer+16
+        bumped = getattr(cfg, name)
+        with torch._dynamo.config.patch({name: 2}):
+            U._restore_recompile_limits()             # ours is hidden: keep it
+            U._bump_recompile_limits(16)              # 2 -> 18
+            U._restore_recompile_limits()             # settles 18 -> 2
+            assert getattr(cfg, name) == 2
+        assert getattr(cfg, name) == bumped, "patch exit hands our bump back"
+        assert U._restore_recompile_limits() == 1, "the hidden debt was dropped"
+        assert getattr(cfg, name) == outer, (
+            f"limit left at {getattr(cfg, name)}, expected {outer}")
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_the_allowance_counts_what_is_actually_in_effect():
+    """Zeroing the counter unconditionally let repeated scoped patches borrow
+    the whole process-wide allowance again.
+
+    Counting every recorded branch instead was wrong the other way: a branch a
+    completed patch rolled back is not in the limit any more, so charging for
+    it starved wrappers of budget nobody was using. The count is the depth of
+    the chain under the LIVE value, which answers both.
+    """
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        U._bump_recompile_limits(16)
+        assert U._GLOBAL_BUMPS == 1
+        with torch._dynamo.config.patch({name: 2}):
+            U._restore_recompile_limits()             # nothing settled
+            # Under the patch the limit is 2: our headroom is not in effect,
+            # so borrowing here is bounded by 2 and not by our raised value.
+            assert U._GLOBAL_BUMPS == 0
+        # ...and the moment the patch hands it back it is charged again.
+        U._bump_recompile_limits(0)
+        assert U._GLOBAL_BUMPS >= 1, "a live bump stopped being counted"
+        U._restore_recompile_limits()
+        U._restore_recompile_limits()
+        assert U._GLOBAL_BUMPS == 0, "a settled bump must be repaid"
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_a_branch_a_completed_patch_rolled_back_stops_counting():
+    """The starvation case: a bump taken inside a patch dies with it, so its
+    entry must not keep consuming the process-wide allowance."""
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        with torch._dynamo.config.patch({name: 2}):
+            U._bump_recompile_limits(16)              # 2 -> 18, dies on exit
+        U._bump_recompile_limits(16)                  # outer -> outer+16
+        U._restore_recompile_limits()
+        assert getattr(cfg, name) == outer
+        assert U._GLOBAL_BUMPS == 0, "an unreachable branch was still charged"
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_two_bumps_landing_on_the_same_value_are_two_debts():
+    """A scoped patch can repeat the outer baseline, and one map entry per
+    value collapsed the pair: the inner restore deleted both, and the patch
+    exit then resurrected the bumped value with nothing left to restore it."""
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        U._bump_recompile_limits(16)                  # outer -> outer+16
+        bumped = getattr(cfg, name)
+        with torch._dynamo.config.patch({name: outer}):
+            U._bump_recompile_limits(16)              # outer -> outer+16 again
+            U._restore_recompile_limits()             # settles ONE of them
+            assert getattr(cfg, name) == outer
+        assert getattr(cfg, name) == bumped, "patch exit hands the outer one back"
+        assert U._restore_recompile_limits() == 1, "the second debt was lost"
+        assert getattr(cfg, name) == outer
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_the_total_cap_still_holds_across_scoped_patches():
+    """The end the counter exists for: bumps stay bounded even when every
+    restore lands under a patch that hides the live value."""
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        taken = 0
+        for _ in range(U._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS + 4):
+            if U._bump_recompile_limits(16):
+                taken += 1
+            with torch._dynamo.config.patch({name: 2}):
+                U._restore_recompile_limits()
+        assert taken == U._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS, taken
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_a_fully_settled_name_leaves_no_bookkeeping_behind():
+    """The ordinary path must still clear out, or the counter never reaches 0
+    and bumps stop being available at all."""
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        U._bump_recompile_limits(16)
+        U._bump_recompile_limits(16)
+        U._restore_recompile_limits()
+        assert getattr(cfg, name) == outer
+        assert not U._BUMPED_RECOMPILE_LIMITS
+        assert not U._ORIGINAL_RECOMPILE_LIMITS
+        assert U._GLOBAL_BUMPS == 0
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_the_reset_helper_puts_the_real_budgets_back():
+    """It only cleared bookkeeping, so a test whose wrapper really bumped left
+    both limits +16 for everything that ran after it."""
+    import torch._dynamo.config as cfg
+    U = _utils()
+    names = _limit_names()
+    before = {n: getattr(cfg, n) for n in names}
+    U._bump_recompile_limits(16)
+    assert any(getattr(cfg, n) != before[n] for n in names), "nothing bumped"
+    _reset_bump_state(U)
+    assert {n: getattr(cfg, n) for n in names} == before
+
+
+def test_giving_up_ends_the_step_when_an_earlier_layer_packed_compiled():
+    """Not just "are we inside checkpoint() right now".
+
+    A checkpointed layer's forward returns long before its backward runs. If the
+    budget is exhausted after that, `_in_non_reentrant_checkpoint()` is False,
+    so the old give-up path went eager and returned -- while every borrower had
+    just been latched, including the wrapper whose activations were packed
+    COMPILED earlier in the same step. That layer then recomputes eagerly in
+    backward, which either aborts the checkpoint consistency check or hands
+    back wrong gradients when the shapes happen to line up.
+    """
+    U = _utils()
+    _reset_bump_state(U)
+    U._PACKED_COMPILED_IN_CHECKPOINT = False
+
+    def eager(x):
+        return x
+
+    class _Exhausted:
+        def __call__(self, x):
+            raise U._recompile_limit_errors()[0]("cache exhausted")
+
+    wrapped = U._fall_back_to_eager_on_recompile_limit(_Exhausted(), eager, "M.forward")
+    real_in = U._in_non_reentrant_checkpoint
+    real_bump = U._bump_recompile_limits
+    U._in_non_reentrant_checkpoint = lambda: False   # the layer has returned
+    U._bump_recompile_limits = lambda *a, **k: False # nothing left to borrow
+    try:
+        U._PACKED_COMPILED_IN_CHECKPOINT = True
+        with pytest.raises(U._recompile_limit_errors()):
+            wrapped(torch.zeros(1))
+        assert U._RAISED_INSIDE_CHECKPOINT is True, \
+            "the step has to be ended so the caller can retry it"
+    finally:
+        U._in_non_reentrant_checkpoint = real_in
+        U._bump_recompile_limits = real_bump
+        U._RAISED_INSIDE_CHECKPOINT = False
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        _reset_bump_state(U)
+
+
+def test_nothing_packed_this_step_still_just_goes_eager():
+    """The ordinary case must not start ending steps: no checkpoint is open and
+    none was, so eager is survivable and cheaper than a retry."""
+    U = _utils()
+    _reset_bump_state(U)
+    calls = {"e": 0}
+
+    def eager(x):
+        calls["e"] += 1
+        return x
+
+    class _Exhausted:
+        def __call__(self, x):
+            raise U._recompile_limit_errors()[0]("cache exhausted")
+
+    wrapped = U._fall_back_to_eager_on_recompile_limit(_Exhausted(), eager, "M.forward")
+    real_in = U._in_non_reentrant_checkpoint
+    real_bump = U._bump_recompile_limits
+    U._in_non_reentrant_checkpoint = lambda: False
+    U._bump_recompile_limits = lambda *a, **k: False
+    try:
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        assert wrapped(torch.zeros(1)) is not None
+        assert calls["e"] == 1
+        assert U._RAISED_INSIDE_CHECKPOINT is False
+    finally:
+        U._in_non_reentrant_checkpoint = real_in
+        U._bump_recompile_limits = real_bump
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        _reset_bump_state(U)
+
+
+def test_the_packed_marker_is_cleared_at_the_step_boundary():
+    """Last step's activations are freed, so the flag must not stick and end
+    every later step."""
+    U = _utils()
+    _reset_bump_state(U)
+    U._PACKED_COMPILED_IN_CHECKPOINT = True
+    U._restore_recompile_limits()
+    assert U._PACKED_COMPILED_IN_CHECKPOINT is False
