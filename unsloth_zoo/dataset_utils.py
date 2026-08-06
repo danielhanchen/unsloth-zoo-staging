@@ -23,6 +23,7 @@ __all__ = [
 ]
 
 from typing import Union, Callable, Optional, List, Dict
+import itertools as _itertools
 import torch
 
 def _iterable_batch_size(dataset, default = 1000):
@@ -358,6 +359,37 @@ def get_chat_template_parts(tokenizer):
 pass
 
 
+def _model_forward_parameter_names(model):
+    """Every named parameter of `model.forward`, unwrapping PEFT / compile layers.
+
+    A wrapper's own forward hides the real signature, so walk down to the base
+    model. Used to decide what a dataset column must survive for: anything the
+    model is actually fed.
+    """
+    import inspect as _inspect
+    names = set()
+    for _ in range(6):
+        if model is None: break
+        forward = getattr(model, "forward", None)
+        if forward is not None:
+            try:
+                names.update(
+                    name for name, p in _inspect.signature(forward).parameters.items()
+                    if p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)
+                )
+            except (TypeError, ValueError): pass
+        unwrap = getattr(model, "get_base_model", None)
+        nxt = None
+        if callable(unwrap):
+            try: nxt = unwrap()
+            except Exception: nxt = None
+        if nxt is None or nxt is model:
+            nxt = getattr(model, "_orig_mod", None) or getattr(model, "base_model", None)
+        model = None if nxt is model else nxt
+    names.discard("self")
+    return names
+
+
 def train_on_responses_only(
     trainer,
     instruction_part  = None,
@@ -596,20 +628,26 @@ def train_on_responses_only(
         return num_proc
     pass
 
+    # `remove_unused_columns = False` is the user asking for their columns to
+    # survive, and HF's Trainer honours it: a custom `compute_loss` can pop a
+    # `sample_weight` the model itself never declares, so the model-input
+    # keep-lists below would delete the weighting the run depends on.
+    _keep_every_column = not getattr(
+        getattr(trainer, "args", None), "remove_unused_columns", True)
+
     # transformers 5.0+ VLMs skip dataset prep in SFTTrainer.__init__
     # (skip_prepare_dataset=True when _is_vlm), so tokenize before masking.
     def _maybe_tokenize_dataset(dataset):
         if dataset is None:
             return dataset
-        sample = next(iter(dataset))
-        if "input_ids" in sample:
-            return dataset  # Already tokenized
-        _tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
-        # Use the actual tokenizer, not the processor
-        if hasattr(_tokenizer, "tokenizer"):
-            _tok = _tokenizer.tokenizer
-        else:
-            _tok = _tokenizer
+        # An empty split has no row to peek at and nothing to tokenize.
+        sample = next(iter(dataset), None)
+        if sample is None or "input_ids" in sample:
+            return dataset  # Empty, or already tokenized
+        # The already-unwrapped text tokenizer, and the `tokenizer =` override
+        # when the caller gave one: the response markers were tokenized with it,
+        # so encoding here with anything else yields IDs they can never match.
+        _tok = tokenizer
         max_length = getattr(trainer.args, "max_length", None) or getattr(trainer.args, "max_seq_length", 2048)
         text_field = getattr(trainer.args, "dataset_text_field", "text")
         def _tokenize_fn(examples):
@@ -618,6 +656,24 @@ def train_on_responses_only(
         _map_kwargs = {"batched": True, "num_proc": _effective_num_proc(dataset)}
         if isinstance(dataset, IterableDataset):
             _map_kwargs = {"batched": True}
+        # Drop the raw columns we just tokenized. Keeping them would hand the
+        # collator a string column it cannot stack into a tensor. Two exceptions:
+        # `labels`, which is already token-level and which the masking pass below
+        # intersects with, so removing it would un-mask what the caller masked;
+        # and anything `model.forward` declares, such as a per-row `sample_weight`
+        # or a custom auxiliary target, which the tokenizer does not recreate and
+        # which the later model-input keep-list never gets the chance to save.
+        _raw_columns = getattr(dataset, "column_names", None) or list(sample.keys())
+        if not isinstance(_raw_columns, dict):
+            _keep = {"labels"} | _model_forward_parameter_names(
+                getattr(trainer, "model", None))
+            # This strip runs before the keep-list at the end of the function, so
+            # it has to honour the opt-out itself or the column is already gone.
+            # Only the text just tokenized still goes: it is the string the
+            # collator cannot stack, and its tokens replace it.
+            if _keep_every_column:
+                _keep |= set(_raw_columns) - {text_field, "text"}
+            _map_kwargs["remove_columns"] = [c for c in _raw_columns if c not in _keep]
         import warnings as _w
         with _w.catch_warnings():
             _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
@@ -667,9 +723,54 @@ def train_on_responses_only(
         print("Unsloth: Warning: " + message)
     pass
 
+    def _no_training_signal_message(dataset_name, how_many):
+        return (
+            f"Unsloth: train_on_responses_only masked every label to -100 in {dataset_name}"
+            f"{how_many}, so there is nothing to train on. The response marker "
+            f"{repr(response_part)} was not found in any sample - check that "
+            "instruction_part and response_part match your chat template."
+        )
+    pass
+
+    def _no_training_signal(dataset_name, how_many):
+        return ValueError(_no_training_signal_message(dataset_name, how_many))
+    pass
+
+    # Streaming rows cannot be counted or filtered, and fix_zero_training_loss
+    # skips them too, so read a bounded prefix instead. Iterating restarts the
+    # stream, so no rows are consumed.
+    _STREAM_SCAN_ROWS = 16
+
+    def _check_streaming_labels(dataset, dataset_name):
+        rows = 0
+        try:
+            # One row past the bound, to tell "the whole stream" from "a prefix".
+            for row in _itertools.islice(iter(dataset), _STREAM_SCAN_ROWS + 1):
+                rows += 1
+                if rows > _STREAM_SCAN_ROWS: break
+                labels = row.get("labels") if isinstance(row, dict) else None
+                if labels is None: return
+                if getattr(labels, "tolist", None): labels = labels.tolist()
+                if any(l != -100 for l in labels): return
+        except Exception:
+            return  # unreadable stream: leave it exactly as before
+        if rows == 0: return
+        # Only a stream that ENDED inside the prefix is provably all masked. A
+        # longer one may be sorted or filtered so that responses start later, and
+        # refusing it would block a run that trains fine, so only warn.
+        if rows <= _STREAM_SCAN_ROWS:
+            raise _no_training_signal(dataset_name, "")
+        print("Unsloth: Warning: " + _no_training_signal_message(
+            dataset_name, f" (first {_STREAM_SCAN_ROWS} samples)",
+        ) + "\nLater samples may still carry responses, so training continues.")
+    pass
+
     def _filter_fully_masked(dataset, dataset_name="dataset"):
         if isinstance(dataset, IterableDataset):
-            return dataset  # Cannot filter IterableDataset efficiently
+            # Cannot filter an IterableDataset efficiently, but a fully masked one
+            # would otherwise train on no signal at all.
+            _check_streaming_labels(dataset, dataset_name)
+            return dataset
         if "labels" not in dataset.column_names:
             return dataset
         # filter rewrites the whole Arrow table even when it drops nothing, so scan the
@@ -697,11 +798,7 @@ def train_on_responses_only(
         # Everything masked and not from truncation: the markers do not match the
         # template at all, so fail clearly instead of returning an empty dataset.
         if len(dropped) == n_before:
-            raise ValueError(
-                f"Unsloth: train_on_responses_only masked every label to -100 in {dataset_name}, "
-                f"so there is nothing to train on. The response marker {repr(response_part)} was not "
-                "found in any sample - check that instruction_part and response_part match your chat template."
-            )
+            raise _no_training_signal(dataset_name, "")
         # Drop via filter (Arrow mask), not select(keep_indices): a keep list would be one
         # Python int per surviving row (GBs on a large corpus). _has_valid_labels is the
         # exact inverse of `dropped`, so survivors are identical.
@@ -731,6 +828,550 @@ def train_on_responses_only(
         return hasattr(collator, "image_processor")
     pass
 
+    # Processor outputs beside `input_ids`; a row with any of these needs its collator.
+    # Only the floor: the real set is derived below from the installed processor.
+    _MULTIMODAL_COLUMNS = frozenset((
+        "pixel_values", "pixel_values_videos", "pixel_attention_mask",
+        "image_grid_thw", "video_grid_thw", "image_sizes", "image_sizes_videos",
+        "images", "image", "videos", "video", "audio", "audios",
+        "token_type_ids_images", "input_features", "input_features_mask",
+        "audio_values", "audio_attention_mask", "input_audio_embeds",
+        "aspect_ratio_ids", "aspect_ratio_mask", "cross_attention_mask",
+        # Processor-specific spellings: phi4_multimodal, pix2struct, kosmos-2.5.
+        "image_pixel_values", "audio_input_features", "audio_embed_sizes",
+        "high_res_pixel_values", "flattened_patches",
+        # Fuyu keeps its preprocessed images here, beside `input_ids`.
+        "image_patches", "image_patches_indices",
+        # Integer side-cars whose dtype reads as plain, so only the name refuses:
+        # Gemma 3 declares `num_crops`, Llama 3.2 Vision `num_tiles`.
+        "num_crops", "num_tiles",
+    ))
+
+    # Names the text tokenizer owns; a processor half repeating one of these must
+    # not turn every text-only row into a refusal.
+    _TEXT_COLUMNS = frozenset((
+        "input_ids", "attention_mask", "token_type_ids", "position_ids",
+        "labels", "label", "label_ids", "special_tokens_mask",
+        "offset_mapping", "length",
+    ))
+
+    def _derive_multimodal_columns():
+        """The non-text names this processor actually produces.
+
+        A hand list rots: Fuyu emits `image_patches`/`image_patches_indices` and
+        every new model spells its own. Each processor half declares its outputs
+        in `model_input_names`, so ask them and subtract the text half.
+        """
+        _halves = ("image_processor", "video_processor", "feature_extractor",
+                   "audio_processor", "qformer_tokenizer")
+        names = set()
+        holders = [getattr(processor, attr, None) for attr in _halves]
+        # The processor's own list merges text and vision (that is the only place
+        # FuyuProcessor names `image_patches_indices`), so take it too.
+        if processor is not tokenizer: holders.append(processor)
+        # With the `tokenizer =` override `processor` is the unwrapped text
+        # tokenizer, and the real multimodal processor is only on the collator.
+        _coll = getattr(trainer, "data_collator", None)
+        for attr in ("processor", "tokenizer"):
+            held = getattr(_coll, attr, None)
+            if held is None or held is processor or held is tokenizer: continue
+            holders.append(held)
+            holders += [getattr(held, a, None) for a in _halves]
+        # `_is_vision_collator` also accepts a half held straight on the collator
+        # (`collator.image_processor`), and that half names its own outputs too.
+        holders += [getattr(_coll, a, None) for a in _halves]
+        for holder in holders:
+            if holder is None: continue
+            try: names.update(getattr(holder, "model_input_names", None) or ())
+            except Exception: pass
+        names -= set(getattr(tokenizer, "model_input_names", None) or ())
+        return frozenset(names - _TEXT_COLUMNS)
+    pass
+
+    try:
+        _MULTIMODAL_COLUMNS = _MULTIMODAL_COLUMNS | _derive_multimodal_columns()
+    except Exception:
+        pass
+
+    # Keys and `type` tags a chat turn uses to point at an image/video/audio.
+    # `input_image`/`input_video` are the responses-API spelling of the same
+    # parts, and `mlx/loader.py` already renders them as media.
+    _MEDIA_KEYS = frozenset((
+        "image", "images", "image_url", "video", "videos", "video_url",
+        "audio", "audios", "audio_url", "input_audio", "pixel_values",
+        "input_image", "input_video",
+        "bytes", "path", "url",
+    ))
+
+    # The subset of those keys that is media only half the time: `meta = {"url":
+    # ..., "path": "corpus/shard.jsonl"}` is ordinary provenance on a text corpus,
+    # so refusing on the key name alone refuses a healthy text-only run. Judged by
+    # value instead, exactly like `_AMBIGUOUS_MEDIA_COLUMNS` at the top level.
+    # `bytes` stays a hard reject: raw binary is never text.
+    _AMBIGUOUS_MEDIA_KEYS = frozenset(("path", "url"))
+
+    # Top-level column names that only ever point at media. A pretokenized VLM
+    # set often keeps its media as a plain URL/path string beside `input_ids`,
+    # and a string value alone looks like text, so the name has to say so.
+    _MEDIA_COLUMNS = frozenset((
+        "image_url", "image_urls", "img_url", "img_urls", "image_link",
+        "video_url", "video_urls", "audio_url", "audio_urls",
+        "input_image", "input_images", "input_video", "input_videos",
+        "input_audio", "input_audios",
+        "image_path", "image_paths", "img_path", "img_paths",
+        "video_path", "video_paths", "audio_path", "audio_paths",
+        "image_file", "image_files", "video_file", "video_files",
+        "audio_file", "audio_files", "image_bytes",
+        # `*_filename` is as common a spelling as `*_path`, and only `image_`
+        # was here: a `video_filename`/`audio_filename` column matched neither
+        # list, so its plain string schema called the split text-only.
+        "image_filename", "image_filenames", "video_filename", "video_filenames",
+        "audio_filename", "audio_filenames",
+        # Bare names, which `_MEDIA_KEYS` already treats as unambiguous media one
+        # level down. A pretokenized set storing "cat.jpg" in a plain `img` column
+        # looked like text on schema alone, so the value was never examined and the
+        # images were dropped before training.
+        "img", "imgs", "image", "images", "video", "videos", "audio", "audios",
+    ))
+
+    # A name that only ever points at media points at media nested too: a turn
+    # storing `{"image_path": "cat.jpg"}` is exactly the top-level column moved
+    # one level down, and a nested string is what `_is_plain_text` calls text.
+    _MEDIA_KEYS = _MEDIA_KEYS | _MEDIA_COLUMNS
+
+    # Names that are media half the time and an ordinary text field the other
+    # half (`path` is a source file, `url` a citation), so refusing on the name
+    # would refuse good text runs. Ask the value instead.
+    _AMBIGUOUS_MEDIA_COLUMNS = frozenset((
+        "path", "paths", "url", "urls", "uri", "file", "files",
+        "file_path", "filepath", "file_name", "filename", "media", "source_url",
+    ))
+
+    # Those names are ambiguous nested too: `{"file_path": "images/cat.jpg"}` in a
+    # turn or a `meta` struct is the top-level column moved one level down, and
+    # only `path`/`url` were value-scanned there, so every other spelling was
+    # called text and its media dropped.
+    _AMBIGUOUS_MEDIA_KEYS = _AMBIGUOUS_MEDIA_KEYS | _AMBIGUOUS_MEDIA_COLUMNS
+
+    # Keys whose dtype cannot settle the column. `type` joins the ambiguous
+    # media names because the chat-part convention puts the modality in the
+    # value: `{"type": "image", "content": "cat.jpg"}` is all `string`.
+    _VALUE_SCAN_KEYS = _AMBIGUOUS_MEDIA_KEYS | frozenset(("type",))
+
+    # Every suffix a missing entry costs is a VLM row silently trained as text,
+    # so cover the modern web formats too (`.avif` is what most image CDNs serve
+    # now) and the older spellings of the ones already here.
+    _MEDIA_SUFFIXES = (
+        ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".apng", ".gif", ".bmp", ".dib",
+        ".webp", ".avif", ".tif", ".tiff", ".svg", ".heic", ".heif", ".heics",
+        ".jp2", ".j2k", ".jxl", ".ppm", ".pgm", ".pnm", ".pbm",
+        ".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".m4v",
+        ".ogv", ".3gp", ".3g2", ".wmv", ".flv", ".m2ts", ".mts",
+        ".wav", ".mp3", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".opus",
+        ".wma", ".aiff", ".aif", ".aifc", ".amr", ".mka", ".weba",
+    )
+
+    def _looks_like_media_value(value, _depth = 0):
+        """A string naming an image/video/audio file, by extension or data URI.
+
+        A plural ambiguous column (`urls`, `paths`, `files`) holds a *list* of
+        those strings per row, so recurse rather than call the row safe.
+        """
+        if isinstance(value, (list, tuple)):
+            return _depth < 4 and \
+                any(_looks_like_media_value(v, _depth + 1) for v in value)
+        if not isinstance(value, str): return False
+        text = value.strip().lower()
+        if text.startswith(("data:image/", "data:video/", "data:audio/")): return True
+        # Drop a query string/fragment: `.../cat.jpg?width=64`.
+        for sep in ("?", "#"):
+            text = text.split(sep, 1)[0]
+        return text.endswith(_MEDIA_SUFFIXES)
+    pass
+
+    def _feature_holds_strings(feature, _depth = 0):
+        """True when this column's values are strings, or lists of them."""
+        if feature is None or _depth >= 8: return False
+        if isinstance(feature, (list, tuple)):
+            return bool(feature) and \
+                all(_feature_holds_strings(f, _depth + 1) for f in feature)
+        inner = getattr(feature, "feature", None)        # Sequence/List/LargeList
+        if inner is not None: return _feature_holds_strings(inner, _depth + 1)
+        dtype = getattr(feature, "dtype", None)          # Value/ClassLabel
+        return isinstance(dtype, str) and dtype.endswith("string")
+    pass
+
+    def _string_column_batches(split, name):
+        """The whole column in batches, or None when it must not be scanned.
+
+        Reading a `datasets.Image`/audio column decodes every row (minutes and
+        gigabytes on a real VLM set) to learn what its dtype already says, and
+        `_columns_are_provably_text` refuses such a column anyway, so only ever
+        scan a column the schema calls a string.
+        """
+        features = getattr(split, "features", None)
+        if not features: return None                     # an unresolved stream
+        try:
+            if not _feature_holds_strings(features.get(name)): return None
+            len(split)                                   # map-style only
+            return split.select_columns([name]).iter(batch_size = 1000)
+        except Exception:
+            return None
+    pass
+
+    def _column_holds_strings(split, name):
+        """Whether the schema says this column's values are strings."""
+        features = getattr(split, "features", None)
+        if not features: return False
+        try:
+            return _feature_holds_strings(features.get(name))
+        except Exception:
+            return False
+    pass
+
+    # Ambiguous string columns that could not be read past the sample. Named in
+    # the refusal below, since dropping the column is the fix when it is text.
+    _unscannable_media_columns = set()
+
+    def _ambiguous_column_holds_media(split, name, rows):
+        """Whether an ambiguous column points at media, over EVERY row when the
+        split can be scanned: the 16-row sample misses a `cat.jpg` on row 5, and
+        its dtype is `string` either way, so the schema cannot answer for it.
+        Reading one string column is cheap - no image is ever decoded.
+        """
+        batches = _string_column_batches(split, name)
+        if batches is None:
+            # Not strings, so the name alone cannot make the column media.
+            if not _column_holds_strings(split, name):
+                return any(_looks_like_media_value(row.get(name)) for row in rows)
+            # Strings this split will not hand over in full (streaming, or a
+            # column a custom transform owns). The sample cannot speak for the
+            # rows it never reads, and guessing "text" drops a media column
+            # silently, so refuse instead.
+            _unscannable_media_columns.add(name)
+            return True
+        try:
+            for batch in batches:
+                if any(_looks_like_media_value(v) for v in batch[name]): return True
+            return False
+        except Exception:
+            _unscannable_media_columns.add(name)
+            return True
+    pass
+
+    def _column_is_all_strings(split, name):
+        """Whether EVERY row of a text column really holds a string.
+
+        `Value('string')` is nullable, so a `None` past the sample keeps the
+        dtype and would reach the plain tokenizer, crashing the run mid-`map`
+        instead of being refused here.
+        """
+        batches = _string_column_batches(split, name)
+        if batches is None: return True                  # the sample decided
+        try:
+            for batch in batches:
+                if not all(isinstance(v, str) for v in batch[name]): return False
+            return True
+        except Exception:
+            # The scan blew up partway (a custom transform needing the columns
+            # `select_columns` just removed), so only the sampled rows were ever
+            # checked and the rest are unproven. Refuse, exactly as the ambiguous
+            # media scan does, rather than call the failure a proof.
+            _unscannable_media_columns.add(name)
+            return False
+    pass
+
+    def _has_media_column(names, rows, split = None):
+        """True when a top-level column points at media the text path would drop."""
+        names = [n for n in names if isinstance(n, str) and n not in _TEXT_COLUMNS]
+        if any(n.lower() in _MEDIA_COLUMNS for n in names): return True
+        # An ambiguous name costs a scan, so only reach it if no name settled it.
+        return any(n.lower() in _AMBIGUOUS_MEDIA_COLUMNS and
+                   _ambiguous_column_holds_media(split, n, rows) for n in names)
+    pass
+
+    def _is_plain_text(value, _depth = 0):
+        """True only for text/scalars and nests of them.
+
+        A column name says nothing about its contents: `messages` holds a list of
+        turns whose content can be inline image parts, and dropping that column
+        would drop the images. So anything the text path cannot encode -- a dict
+        naming media, a PIL image, bytes -- is not plain text.
+        """
+        if isinstance(value, str) or value is None: return True
+        if isinstance(value, (bool, int, float)): return True
+        if _depth >= 6: return False
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if not isinstance(key, str): return False
+                lower = key.lower()
+                if lower in _AMBIGUOUS_MEDIA_KEYS:
+                    if _looks_like_media_value(item): return False
+                elif lower in _MEDIA_KEYS: return False
+                if not _is_plain_text(item, _depth + 1): return False
+            kind = value.get("type")
+            if isinstance(kind, str) and kind.lower() in _MEDIA_KEYS: return False
+            return True
+        if isinstance(value, (list, tuple)):
+            return all(_is_plain_text(v, _depth + 1) for v in value)
+        return False
+    pass
+
+    def _row_is_plain_text(row, schema_proven = frozenset()):
+        # Tokenizer/model columns are numeric by construction; the rest is what
+        # can smuggle in images. A column the schema already proved needs no
+        # second opinion: it judged EVERY row, where re-reading it as a value is
+        # strictly weaker and misreads the tensor/ndarray `with_format("torch")`
+        # and `with_format("numpy")` hand back for an ordinary numeric column.
+        return all(_is_plain_text(v) for k, v in row.items()
+                   if k not in _TEXT_COLUMNS and k not in schema_proven)
+    pass
+
+    # A one-row peek calls a mixed split text-only: row 0 holds plain `messages`
+    # while a later row hides an inline image. Sample a small fixed number of rows
+    # instead - bounded, so a huge or streaming split stays cheap.
+    _SCAN_ROWS = 16
+
+    def _sample_rows(split):
+        try: n = len(split)
+        except Exception: n = None
+        if n is None:
+            # Streaming: a prefix is all that can be read without consuming it.
+            return list(_itertools.islice(iter(split), _SCAN_ROWS))
+        if n == 0: return []
+        # Spread the sample over the whole split, first and last row included;
+        # random access is cheap on Arrow.
+        if n <= _SCAN_ROWS: idx = range(n)
+        else: idx = sorted({i * (n - 1) // (_SCAN_ROWS - 1) for i in range(_SCAN_ROWS)})
+        return [split[i] for i in idx]
+    pass
+
+    # A sample of any fixed size is guesswork: a 200-row split reads 16 positions,
+    # so an image on row 5 goes unseen and the strip below drops it. Arrow types
+    # are uniform down a column, so the schema answers for EVERY row at once, and
+    # reading it is constant time - where scanning one `datasets.Image` column
+    # exhaustively decodes each image (~1ms/row, ~94s per 100k rows).
+    _PLAIN_DTYPES = ("string", "large_string", "bool", "null", "int", "uint",
+                     "float", "double", "decimal", "date", "time", "duration",
+                     "timestamp")
+
+    def _feature_is_plain_text(feature, _depth = 0):
+        """True only when this column type cannot hold media in any row."""
+        if feature is None or _depth >= 8: return False
+        if isinstance(feature, dict):                       # struct
+            for key, value in feature.items():
+                if not isinstance(key, str): return False
+                lower = key.lower()
+                # An ambiguous key is settled by the value scan below, not by name.
+                if lower in _MEDIA_KEYS and lower not in _AMBIGUOUS_MEDIA_KEYS:
+                    return False
+                if not _feature_is_plain_text(value, _depth + 1): return False
+            return True
+        if isinstance(feature, (list, tuple)):
+            return all(_feature_is_plain_text(f, _depth + 1) for f in feature)
+        inner = getattr(feature, "feature", None)           # Sequence/List/LargeList
+        if inner is not None: return _feature_is_plain_text(inner, _depth + 1)
+        # Value/ClassLabel name a primitive dtype. Image is "PIL.Image.Image" and
+        # Audio/Video a dict, so anything unrecognised stays unsafe.
+        dtype = getattr(feature, "dtype", None)
+        if not isinstance(dtype, str): return False
+        return dtype.startswith(_PLAIN_DTYPES)
+    pass
+
+    def _feature_needs_a_value_scan(feature, _depth = 0):
+        """Whether the dtypes alone cannot settle this column.
+
+        Two all-string shapes decide at value level. A nested `path`/`url` is
+        `string` for both a media reference and ordinary provenance. So is a
+        `type` tag: `{"type": "image", "content": "cat.jpg"}` is an image part
+        and `{"type": "text", ...}` is not, and calling the schema plain marked
+        the column proven, which skips the tag check in `_row_is_plain_text` and
+        drops the media silently.
+        """
+        if feature is None or _depth >= 8: return False
+        if isinstance(feature, dict):
+            return any(isinstance(k, str) and (k.lower() in _VALUE_SCAN_KEYS or
+                                               _feature_needs_a_value_scan(v, _depth + 1))
+                       for k, v in feature.items())
+        if isinstance(feature, (list, tuple)):
+            return any(_feature_needs_a_value_scan(f, _depth + 1) for f in feature)
+        inner = getattr(feature, "feature", None)           # Sequence/List/LargeList
+        if inner is not None: return _feature_needs_a_value_scan(inner, _depth + 1)
+        return False
+    pass
+
+    def _column_values_are_plain_text(split, name):
+        """Whether EVERY row of a struct the schema could not settle is text.
+
+        The 16-row sample misses a `cat.jpg` on row 5000 and the schema says
+        `string` either way, so read the whole column - the same trade the
+        top-level ambiguous columns already make. Callers gate on
+        `_feature_is_plain_text` first, so no Image/Audio column is ever decoded.
+        """
+        try:
+            len(split)                                   # map-style only
+            batches = split.select_columns([name]).iter(batch_size = 1000)
+            for batch in batches:
+                if not all(_is_plain_text(v) for v in batch[name]): return False
+            return True
+        except Exception:
+            # A stream cannot speak for the rows it never hands over; guessing
+            # "text" would drop a media column silently, so refuse instead.
+            _unscannable_media_columns.add(name)
+            return False
+    pass
+
+    def _columns_are_provably_text(split, names):
+        """`(every column is text, the columns the schema itself proved)`.
+
+        The second half is threaded down to `_row_is_plain_text`, which must not
+        re-judge a column the schema has already settled for every row.
+        """
+        features = getattr(split, "features", None)
+        if features:
+            proven = set()
+            try:
+                for name, feature in features.items():
+                    if name in _TEXT_COLUMNS: continue
+                    if not _feature_is_plain_text(feature): return False, proven
+                    if _feature_needs_a_value_scan(feature) and \
+                        not _column_values_are_plain_text(split, name): return False, proven
+                    proven.add(name)
+                return True, proven
+            except Exception:
+                return False, proven
+        # No schema (an unresolved stream): a sample cannot prove what the rows it
+        # never reads hold, so trust only the tokenizer's own columns.
+        return not (set(names) - _TEXT_COLUMNS), set()
+    pass
+
+    def _split_views(dataset):
+        """`(column names, sampled rows, provably text, schema-proven, split)` per split.
+
+        `iter()` restarts a datasets IterableDataset, so peeking rows does not
+        consume the stream (this is how `_maybe_tokenize_dataset` peeks too).
+        """
+        splits = list(dataset.values()) if isinstance(dataset, dict) else [dataset]
+        views = []
+        for split in splits:
+            if split is None: continue
+            names = getattr(split, "column_names", None)
+            if isinstance(names, dict): names = None
+            rows = []
+            try:
+                rows = [r for r in _sample_rows(split) if isinstance(r, dict)]
+            except Exception:
+                if not names: raise
+                rows = []
+            if not names:
+                if not rows: raise ValueError("Unsloth: cannot read the dataset columns")
+                names = list(rows[0].keys())
+            provable, proven = _columns_are_provably_text(split, names)
+            views.append((set(names), rows, provable, proven, split))
+        return views
+    pass
+
+    def _dataset_is_pretokenized(dataset):
+        """True when rows carry `input_ids` and nothing but plain text beside them,
+        i.e. text tokenized up front where dataset-level masking is correct.
+        Multimodal or unreadable rows return False, keeping the caller's old refusal
+        (the text path swaps in a text collator and would drop the image handling).
+        """
+        if dataset is None:
+            return False
+        try:
+            views = _split_views(dataset)
+        except Exception:
+            return False
+        if not views: return False
+        for names, rows, provable, proven, split in views:
+            if "input_ids" not in names: return False
+            if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
+            if _has_media_column(names, rows, split): return False
+            # Columns look text-only, so check the values too: a `messages` column
+            # can carry inline images that the strip below would throw away.
+            if not provable: return False
+            for row in rows:
+                if not _row_is_plain_text(row, proven): return False
+        return True
+    pass
+
+    def _split_is_raw_text_only(dataset):
+        """True when a split carries no `input_ids` but a real string column.
+
+        Applies to train and eval alike: proving every row of the text column is
+        a string IS the evidence that the run is text-only, and it does not get
+        stronger by the split's name. `_maybe_tokenize_dataset` below tokenizes
+        such a split with the same text tokenizer. The column has to hold
+        strings, not conversations: a list of turns needs a chat template, and
+        its content can be inline images.
+        """
+        if dataset is None:
+            return False
+        text_field = getattr(getattr(trainer, "args", None), "dataset_text_field", None) or "text"
+        try:
+            views = _split_views(dataset)
+        except Exception:
+            return False
+        if not views: return False
+        for names, rows, provable, proven, split in views:
+            if "input_ids" in names: return False
+            if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
+            if _has_media_column(names, rows, split): return False
+            # The column `_maybe_tokenize_dataset` would actually read.
+            field = text_field if text_field in names else "text"
+            if field not in names: return False
+            if not provable: return False
+            for row in rows:
+                if not isinstance(row.get(field), str): return False
+                if not _row_is_plain_text(row, proven): return False
+            # The sample says these rows are text; the tokenizer reads every row.
+            if not _column_is_all_strings(split, field): return False
+        return True
+    pass
+
+    # Classified up here rather than beside the swap below, so the packing
+    # refusal can run before either split is tokenized: it is a deterministic
+    # configuration error, and raising it after a full preprocessing pass makes
+    # a large corpus pay for the answer twice and leaves the datasets mutated.
+    from transformers import DataCollatorForSeq2Seq, DataCollatorWithPadding
+    import transformers as _transformers
+    _PAD_DELEGATING_COLLATORS = tuple(_cls for _cls in (
+        DataCollatorForSeq2Seq, DataCollatorWithPadding,
+        getattr(_transformers, "DataCollatorForTokenClassification", None),
+        getattr(_transformers, "DataCollatorForLanguageModeling", None),
+        getattr(_transformers, "DataCollatorForMultipleChoice", None),
+    ) if isinstance(_cls, type))
+    # Read defensively: this now runs ahead of the early returns below, and a
+    # trainer without `.args` used to reach one of them.
+    packing_enabled = getattr(getattr(trainer, "args", None), "packing", False)
+
+    def _is_known_bypassed_collator(collator):
+        if isinstance(collator, _PAD_DELEGATING_COLLATORS): return True
+        # TRL's vision collator rebuilds labels through its processor. Matched by
+        # name so this does not depend on which TRL version is installed.
+        return any(b.__name__ == "DataCollatorForVisionLanguageModeling"
+                   for b in type(collator).__mro__)
+
+    def _refuse_packing_with_a_foreign_collator(collator):
+        """The case with no right answer: `_is_vision_collator` matches one
+        merely holding a processor, and a custom self-packing collator does
+        exactly that. Replacing it discards its packing, its `position_ids` and
+        any block-attention inputs; keeping it risks its `__call__` rebuilding
+        `labels` over the mask. Both are silently wrong, so say so."""
+        if not packing_enabled or _is_known_bypassed_collator(collator): return
+        raise ValueError(
+            f"Unsloth: `{type(collator).__name__}` holds a processor and does not support "
+            "response-only masking, and `packing = True` asks that same collator to build the "
+            "packed batch. Both cannot be honoured: replacing it discards its packing, its "
+            "`position_ids` and any block-attention inputs, while keeping it risks its "
+            "`__call__` rebuilding `labels` over the mask just written. Turn packing off, or "
+            "build UnslothVisionDataCollator(..., train_on_responses_only = True, "
+            "instruction_part = ..., response_part = ...) so masking runs at collate time."
+        )
+
+    # Set when a foreign vision collator is let through to the text path below.
+    _bypassed_vision_collator = False
     data_collator = getattr(trainer, "data_collator", None)
     if _is_vision_collator(data_collator):
         masking = getattr(data_collator, "train_on_responses_only", None)
@@ -738,29 +1379,70 @@ def train_on_responses_only(
             return trainer  # collator already masks responses; nothing to do
         is_unsloth = any(b.__name__ == "UnslothVisionDataCollator" for b in type(data_collator).__mro__)
         if not is_unsloth:
-            # A processor-style collator we cannot reliably configure: do not return as
-            # if masking were applied (it would leave responses unmasked silently).
-            raise ValueError(
-                "Unsloth: Detected a vision data collator that does not support response-only "
-                "masking. Build UnslothVisionDataCollator(..., train_on_responses_only = True, "
-                "instruction_part = ..., response_part = ...) so masking runs at collate time."
+            # A text-only run on a multimodal model still carries a processor as its
+            # `tokenizer`, so a plain text collator trips `_is_vision_collator`.
+            # Discriminate on the data instead, over every split that gets collated:
+            # the swap below is trainer-wide, so a train-only check would strip a
+            # multimodal eval set of its image handling.
+            _eval = getattr(trainer, "eval_dataset", None)
+            _eval_splits = list(_eval.values()) if isinstance(_eval, dict) else [_eval]
+            _train = getattr(trainer, "train_dataset", None)
+            # The train split gets the same allowance as an eval one. Requiring
+            # it to be PRE-tokenized refused the common case: TRL 0.22.2 hands
+            # a plain text SFT on a multimodal checkpoint its own
+            # `DataCollatorForVisionLanguageModeling` and leaves the dataset at
+            # `["text"]`, tokenizing inside the collator. Nothing there is a
+            # vision run, and `_split_is_raw_text_only` proves it over every
+            # row, so refusing lost Gemma3_(4B), Gemma3N_(4B)-Conversational,
+            # Gemma3_(27B)_A100 and Qwen_3_5_27B for a masking pass that is
+            # exactly what the dataset path below does correctly.
+            def _collatable(d):
+                return _dataset_is_pretokenized(d) or _split_is_raw_text_only(d)
+            if not (
+                (_train is None or _collatable(_train))
+                and all(_collatable(d) for d in _eval_splits if d is not None)
+            ):
+                # Cannot configure this collator, so refuse rather than silently
+                # return with responses left unmasked.
+                _hint = ""
+                if _unscannable_media_columns:
+                    _hint = (
+                        f" Column(s) {sorted(_unscannable_media_columns)} may point at "
+                        "images/videos/audio and this split cannot be read past its first "
+                        "rows to tell, so they are assumed to be media - drop them with "
+                        "`dataset.remove_columns([...])` if they are ordinary text."
+                    )
+                raise ValueError(
+                    "Unsloth: Detected a vision data collator that does not support response-only "
+                    "masking. Build UnslothVisionDataCollator(..., train_on_responses_only = True, "
+                    "instruction_part = ..., response_part = ...) so masking runs at collate time."
+                    + _hint
+                )
+            # Fall through to the dataset-level text path below.
+            _refuse_packing_with_a_foreign_collator(data_collator)
+            _bypassed_vision_collator = True
+            print(
+                f"Unsloth: `{type(data_collator).__name__}` holds a processor but the "
+                "dataset is already tokenized, so response-only masking is applied at "
+                "the dataset level (image handling is untouched)."
             )
-        # If the collator's tokenizer already carries the parts, let the nested call
-        # read them; passing them explicitly would hit the "already set" guard.
-        coll_proc = getattr(data_collator, "processor", tokenizer)
-        coll_tok = coll_proc.tokenizer if hasattr(coll_proc, "tokenizer") else coll_proc
-        parts = {} if hasattr(coll_tok, "_unsloth_input_part") else \
-            dict(instruction_part = instruction_part, response_part = response_part)
-        data_collator.train_on_responses_only = train_on_responses_only(
-            None,
-            force_match        = force_match,
-            tokenizer          = coll_proc,
-            return_function    = True,
-            last_response_only = last_response_only,
-            **parts,
-        )
-        print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")
-        return trainer
+        else:
+            # Parts already on the collator's tokenizer: let the nested call read
+            # them, since passing them again hits the "already set" guard.
+            coll_proc = getattr(data_collator, "processor", tokenizer)
+            coll_tok = coll_proc.tokenizer if hasattr(coll_proc, "tokenizer") else coll_proc
+            parts = {} if hasattr(coll_tok, "_unsloth_input_part") else \
+                dict(instruction_part = instruction_part, response_part = response_part)
+            data_collator.train_on_responses_only = train_on_responses_only(
+                None,
+                force_match        = force_match,
+                tokenizer          = coll_proc,
+                return_function    = True,
+                last_response_only = last_response_only,
+                **parts,
+            )
+            print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")
+            return trainer
     pass
 
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
@@ -775,8 +1457,10 @@ def train_on_responses_only(
     pass
 
     if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
-        # Eval datasets could be a dict!
-        if type(trainer.eval_dataset) is dict:
+        # Eval datasets could be a dict! DatasetDict subclasses dict, so match on
+        # isinstance: `type(...) is dict` sent it down the single-dataset path,
+        # where column_names is a dict of splits and every per-split step no-ops.
+        if isinstance(trainer.eval_dataset, dict):
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
@@ -798,20 +1482,112 @@ def train_on_responses_only(
         pass
     pass
 
-    # Edit data collator to DataCollatorForSeq2Seq (vision collators were handled
-    # earlier and returned, so trainer.data_collator here is a text collator).
-    from transformers import DataCollatorForSeq2Seq
-    packing_enabled = getattr(trainer.args, "packing", False)
-    if (
-        hasattr(trainer, "data_collator")
-        and not isinstance(trainer.data_collator, DataCollatorForSeq2Seq)
-        and not packing_enabled
+    # Edit data collator to DataCollatorForSeq2Seq. Collators that rebuild labels
+    # from a processor already returned above, so what is left here only pads.
+    _collator = getattr(trainer, "data_collator", None)
+    # A collator holding a processor (DataCollatorForSeq2Seq/WithPadding) pads
+    # through a `.pad` processors do not have, so it dies on the first batch;
+    # rebuild it around the unwrapped text tokenizer. A collator holding no
+    # padding object at all stays untouched (TRL's packing
+    # DataCollatorForLanguageModeling takes a bare pad_token_id).
+    # Holding the object is not proof it is padded through: a custom collator can
+    # keep a processor for its own use and batch (and pack) everything itself, and
+    # replacing that one throws its packing away. So only the classes that provably
+    # delegate to `.pad` are repaired from the attribute; TRL's vision collator
+    # calls its processor instead and is already covered by the bypass flag below.
+    _pad_source = getattr(_collator, "tokenizer", None)
+    if _pad_source is None:
+        _pad_source = getattr(_collator, "processor", None)
+    _processor_backed = _pad_source is not None and not hasattr(_pad_source, "pad") \
+        and isinstance(_collator, _PAD_DELEGATING_COLLATORS)
+    # That repair is not packing-gated like the swap: it fails either way. The
+    # bypassed-collator case under packing already refused above, before
+    # anything was mapped.
+    if hasattr(trainer, "data_collator") and (
+        _processor_backed or _bypassed_vision_collator
+        or (not isinstance(_collator, DataCollatorForSeq2Seq) and not packing_enabled)
     ):
-        trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer)
+        # Keep the caller's settings when only swapping the tokenizer on a seq2seq
+        # collator; for any other class this is a replacement, not a swap, and its
+        # same-named attributes need not mean the same thing.
+        _same_class = _processor_backed and isinstance(_collator, DataCollatorForSeq2Seq)
+        # These are handed to `tokenizer.pad` with the same meaning by every
+        # pad-delegating collator, not just DataCollatorWithPadding: a
+        # DataCollatorForTokenClassification carrying `padding = "max_length"` is
+        # a separate class, not a subclass, so an isinstance check on that one
+        # class dropped its settings and silently turned the run into a
+        # dynamically padded one. Ask whether the fields are there.
+        _padding_class = _processor_backed and not _same_class and any(
+            hasattr(_collator, _n)
+            for _n in ("padding", "max_length", "pad_to_multiple_of")
+        )
+        # `label_pad_token_id` means the same thing to DataCollatorForSeq2Seq as
+        # it does to a DataCollatorForTokenClassification, so a caller who chose
+        # a non-default one keeps it; dropping it padded unequal-length batches
+        # with -100 instead and can break a loss that reads the pad value.
+        _names = ("model", "padding", "max_length", "pad_to_multiple_of",
+                  "label_pad_token_id", "return_tensors") if _same_class else \
+                 ("padding", "max_length", "pad_to_multiple_of",
+                  "label_pad_token_id", "return_tensors")
+        _kept = {
+            name: getattr(_collator, name)
+            for name in _names
+            if (_same_class or _padding_class) and hasattr(_collator, name)
+        }
+        trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
+
+        # `tokenizer.pad(..., return_tensors = "pt")` stacks every key it is
+        # handed, and only pads the few it knows, so any leftover column kills
+        # the first batch: a raw `text`/`messages` cannot be tensorized, a
+        # ragged `prompt_ids` is stacked unpadded, and a scalar `label` is taken
+        # for the labels themselves. The trainer normally strips them, but not
+        # when unused-column removal is off (token-type-id models above turn it
+        # off). So keep only what the model is actually fed.
+        import inspect as _inspect
+        def _model_input_columns():
+            # token_type_ids is why unused-column removal is off; the rest are
+            # asked of the processor and the model so this cannot rot.
+            names = {"input_ids", "attention_mask", "token_type_ids", "labels"}
+            holders = [processor, tokenizer]
+            holders += [getattr(processor, attr, None) for attr in
+                        ("tokenizer", "image_processor", "feature_extractor",
+                         "video_processor", "audio_processor")]
+            for holder in holders:
+                try: names.update(getattr(holder, "model_input_names", None) or ())
+                except Exception: pass
+            # Unwrap PEFT/compile wrappers: their own forward hides pixel_values.
+            names.update(_model_forward_parameter_names(getattr(trainer, "model", None)))
+            names.discard("self")
+            return names
+        _keep_columns = _model_input_columns()
+        def _drop_raw_columns(dataset):
+            if _keep_every_column: return dataset
+            if dataset is None or not hasattr(dataset, "remove_columns"): return dataset
+            try:
+                names = getattr(dataset, "column_names", None)
+                if names is None: names = list(next(iter(dataset)).keys())
+                if isinstance(names, dict): return dataset
+                drop = [c for c in names if c not in _keep_columns]
+            except Exception:
+                return dataset
+            if not drop: return dataset
+            print(f"Unsloth: Dropping columns the model is not fed: {sorted(drop)}")
+            return dataset.remove_columns(drop)
+        if hasattr(trainer, "train_dataset"):
+            trainer.train_dataset = _drop_raw_columns(trainer.train_dataset)
+        _eval_now = getattr(trainer, "eval_dataset", None)
+        if isinstance(_eval_now, dict):
+            for _key in list(_eval_now.keys()):
+                _eval_now[_key] = _drop_raw_columns(_eval_now[_key])
+        elif _eval_now is not None:
+            trainer.eval_dataset = _drop_raw_columns(_eval_now)
+    pass
 
     # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
+    # Eval-only trainers have no train split, and this check calls len() on it.
     from .training_utils import fix_zero_training_loss
-    fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
+    if getattr(trainer, "train_dataset", None) is not None:
+        fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
     return trainer
 pass
 
