@@ -1,7 +1,7 @@
 name: "staging-1001 ubuntu-latest"
 on:
   push:
-    branches: ["pr-1001-xplat-ci"]
+    branches: ["pr-1001-plus-1002-xplat-ci"]
     paths:
       - 'studio/**'
       - '.github/workflows/staging-1001-ubuntu-latest.yml'
