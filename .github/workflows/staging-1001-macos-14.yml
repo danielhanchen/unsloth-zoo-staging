@@ -5,6 +5,8 @@ on:
     paths:
       - 'studio/**'
       - '.github/workflows/staging-1001-macos-14.yml'
+      - 'tests/**'
+      - 'unsloth_zoo/**'
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
