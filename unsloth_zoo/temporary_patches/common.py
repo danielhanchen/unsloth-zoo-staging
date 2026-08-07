@@ -19,11 +19,15 @@ __all__ = [
     "torch_compile_options",
     "UNSLOTH_ENABLE_LOGGING",
     "UNSLOTH_COMPILE_DISABLE",
+    "UNSLOTH_COMPILE_DISABLE_PARTIAL",
     "get_torch_compile_options",
     "is_transformers_v5_moe_quantization_available",
     "logger",
     "torch_compile",
     "_torch_compile",
+    "flatten_for_elementwise_norm",
+    "unwrap_norm_weight",
+    "publish_to_modeling_module",
 ]
 
 import os
@@ -32,7 +36,9 @@ import logging
 from ..log import logger
 import functools
 UNSLOTH_ENABLE_LOGGING  = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
-UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
+UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial",)
+# "partial" keeps the source rewrites but turns torch.compile off, like compiler.py does.
+UNSLOTH_COMPILE_DISABLE_PARTIAL = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "partial"
 
 # Get only allowed options
 import inspect
@@ -185,5 +191,61 @@ else:
         torch.compile,
     )
 
+def flatten_for_elementwise_norm(hidden_states):
+    """``(..., H)`` -> ``((N, H), original_shape)``.
+
+    Norms only touch the last dim, so making every caller rank 2 drops the rank and
+    leading-dim guards from the shared kernel's Dynamo cache.
+    """
+    shape = hidden_states.shape
+    return hidden_states.reshape(-1, shape[-1]), shape
+pass
+
+
+def unwrap_norm_weight(weight):
+    """Hand a norm weight to a compiled kernel as a plain Tensor view.
+
+    Dynamo pins a static shape for anything whose ``type`` is ``nn.Parameter`` even
+    under ``dynamic = True``, so every distinct norm width would be another cache
+    entry. A view takes dynamic shapes, and autograd still reaches the Parameter.
+    """
+    if weight is None: return None
+    return weight.reshape(-1)
+pass
+
+def publish_to_modeling_module(modeling_module, **names):
+    """Make helper names used by a patched forward importable from the modeling module.
+
+    ``create_standalone_class`` copies the patched forward's source into
+    ``unsloth_compiled_cache`` and resolves its free names against the modeling
+    module, so unsloth_zoo helpers must be published here or the generated module
+    raises NameError on import.
+    """
+    for name, value in names.items():
+        try:
+            setattr(modeling_module, name, value)
+        except Exception as e:
+            # Log, never swallow: silence reappears as an unexplained NameError from
+            # generated cache code. `warning`, not `warning_once`, which transformers
+            # monkeypatches on later and may not exist yet.
+            logger.warning(
+                f"Unsloth: could not publish `{name}` to "
+                f"{getattr(modeling_module, '__name__', modeling_module)}: {e}"
+            )
+pass
+
 global TEMPORARY_PATCHES
 TEMPORARY_PATCHES = []
+
+
+def _maybe_compile(**kwargs):
+    """torch.compile, unless UNSLOTH_COMPILE_DISABLE asks for it to be off.
+
+    Defined here, not beside its callers: the compiler copies decorated source
+    verbatim into generated trainer modules, where a name local to
+    rl_replacements.py NameErrors at import and the failure is swallowed.
+    compiler.py emits the import when the name appears.
+    """
+    if UNSLOTH_COMPILE_DISABLE or UNSLOTH_COMPILE_DISABLE_PARTIAL:
+        return lambda fn: fn
+    return torch.compile(**kwargs)

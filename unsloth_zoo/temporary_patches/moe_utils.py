@@ -126,10 +126,19 @@ def _grouped_mm_with_backward_fix(
     ~57% of MoE GPU time) every step. torch._grouped_mm takes the non-contiguous view directly,
     but some CUDA builds silently miscompute it (pytorch/pytorch#186365), so we only skip the
     copy when a one-time probe proves the view path matches the contiguous one; else we keep the
-    always-correct copy. Falls back to a per-group matmul on the 16-byte stride error. Bit-exact
-    vs the always-contiguous path in forward and backward.
+    always-correct copy. Falls back to a per-group matmul when the device has no torch._grouped_mm
+    at all, and on the 16-byte stride error. Bit-exact vs the always-contiguous path in forward
+    and backward.
     """
     inputs = inputs.contiguous()
+    # Devices without torch._grouped_mm never reach the kernel. The Triton backend
+    # is picked precisely when the probe says no, but its separated-LoRA delta
+    # still routed through here. torch 2.8 hard-raises unless `dprops->major == 9`
+    # (Blas.cpp, sm90_only), and 2.6/2.7 have no `_grouped_mm` at all, so a LoRA
+    # MoE died on every card but an H100. 2.9 onwards falls back internally, which
+    # is why this only shows up on the older pins. Probe is cached: one global read.
+    if not _check_torch_grouped_mm_supported():
+        return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_grouped_mm_is_safe():
         weight = weight.contiguous()   # #186365: view path unproven on this build -> safe copy
     try:
@@ -146,10 +155,8 @@ def _grouped_mm_with_backward_fix(
         return _manual_grouped_mm(inputs, weight, offsets)
 
 
-def _manual_grouped_mm(
-    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
-    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps."""
+def _grouped_matmul_loop(inputs, weight, offsets):
+    """out[s:e] = inputs[s:e] @ weight[g], group by group. No autograd."""
     outputs = []
     start = 0
     for expert_idx, end in enumerate(offsets.detach().cpu().tolist()):
@@ -159,6 +166,125 @@ def _manual_grouped_mm(
     if outputs:
         return torch.cat(outputs, dim=0)
     return inputs.new_empty((0, weight.shape[-1]))
+
+
+def _routing_signature(inputs, offsets):
+    """Offsets plus an order-sensitive checksum of the expert-sorted rows.
+
+    The offsets are only the routing histogram, so a replay that swaps two
+    tokens between experts of equal size leaves them identical while `inputs`
+    holds a different sequence. The checksum moves with the rows, so the swap
+    is visible. Bit-cast into the offsets vector, exactly, so the whole thing
+    is one device sync -- the same one the group loop already pays.
+    """
+    rows = inputs.detach().float().sum(dim = -1)
+    ramp = torch.arange(1, rows.numel() + 1, device = rows.device, dtype = rows.dtype)
+    checksum = torch.dot(rows, ramp).reshape(1)
+    packed = torch.cat((
+        offsets.detach().reshape(-1).to(torch.int64),
+        checksum.view(torch.int32).to(torch.int64),
+    ))
+    return packed.cpu().tolist()
+
+
+class _ManualGroupedMM(torch.autograd.Function):
+    """The loop above, saving what torch._grouped_mm saves and nothing else.
+
+    Written as a Function rather than left to autograd because the naive loop
+    puts every per-group SLICE on the tape, and a slice's shape is the group
+    size, which the router decides. Non-reentrant activation checkpointing
+    replays the forward and compares saved metadata, so any routing difference
+    between the two passes surfaces as
+
+        CheckpointError: Recomputed values ... have different metadata
+        saved: torch.Size([38, 8])  recomputed: torch.Size([39, 8])
+
+    one row apart, in a hundred groups at once. `torch._grouped_mm` never shows
+    that because it is one op saving the whole `[T, K]` input, so a fallback
+    that means to be a drop-in has to save the same shape-stable set: inputs,
+    weight, offsets. The slices are rebuilt in backward.
+
+    This does not make routing deterministic, and does not pretend to: it
+    restores the numerics the fused path already has on an H100.
+    """
+    @staticmethod
+    def forward(ctx, inputs, weight, offsets):
+        # A plain list, NOT a tensor: non-reentrant checkpointing replaces the
+        # saved TENSORS with the replay's, so a saved `offsets` tells us what
+        # the replay routed, never what the forward routed. This copy survives,
+        # and backward uses it to tell the two apart.
+        ctx.forward_routing = _routing_signature(inputs, offsets)
+        ctx.save_for_backward(inputs, weight, offsets)
+        with torch.no_grad():
+            return _grouped_matmul_loop(inputs, weight, offsets)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inputs, weight, offsets = ctx.saved_tensors
+        routing = _routing_signature(inputs, offsets)
+        if routing != ctx.forward_routing:
+            # Shape-stable saves would otherwise let this through silently, and
+            # pairing the original `grad_output` with the replay's partition is
+            # a gradient for a routing that never produced the loss. Louder than
+            # CheckpointError and pointed at the actual cause.
+            were, now = ctx.forward_routing[:-1], routing[:-1]
+            how = ("the same experts in a different order"
+                   if were == now else f"expert ends {were} then {now}")
+            raise RuntimeError(
+                "Unsloth: the MoE router assigned tokens differently in the "
+                f"activation-checkpoint replay than in the forward ({how}), so "
+                "the gradients would belong to a routing that never produced "
+                "the loss. Turn gradient checkpointing off for this run, or "
+                "make the router deterministic."
+            )
+        bounds = routing[:-1]
+        need_x, need_w, _ = ctx.needs_input_grad
+        grad_output = grad_output.contiguous()
+        # `backward` runs OUTSIDE the forward's autocast region, so a forward
+        # that autocast fp32 weights to bf16 hands back a bf16 `grad_output`
+        # while the saved tensors are still fp32, and the first matmul raises.
+        # Aligned by hand rather than with `torch.amp.custom_fwd/custom_bwd`,
+        # whose `device_type` is fixed at class definition: this fallback also
+        # runs on CPU and XPU.
+        compute_dtype = grad_output.dtype
+        grad_inputs = torch.zeros_like(inputs) if need_x else None
+        grad_weight = torch.zeros_like(weight) if need_w else None
+        start = 0
+        for expert_idx, end in enumerate(bounds):
+            if start < end:
+                g = grad_output[start:end]
+                if need_x:
+                    w = weight[expert_idx]
+                    grad_inputs[start:end] = (
+                        g @ w.to(compute_dtype).transpose(-2, -1)
+                    ).to(inputs.dtype)
+                if need_w:
+                    x = inputs[start:end].to(compute_dtype)
+                    grad_weight[expert_idx] = (
+                        x.transpose(-2, -1) @ g).to(weight.dtype)
+            start = end
+        return grad_inputs, grad_weight, None
+
+
+def _manual_grouped_mm(
+    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps.
+
+    Not compilable, and marked so. Group boundaries come off a tensor, so
+    `start < end` is a data-dependent branch Dynamo cannot guard, and a
+    tensorized rewrite is worse than the problem: gathering `weight[expert_id]`
+    per row materializes `[T, K, N]`, and masking runs every expert over every
+    row. `torch.compiler.disable` makes a compiled caller break cleanly here
+    rather than abort mid-trace; under `fullgraph = True` a break is still
+    fatal, which is what the eager fallback in `temporary_patches/utils.py` is
+    for.
+    """
+    return _ManualGroupedMM.apply(inputs, weight, offsets)
+
+
+if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+    _manual_grouped_mm = torch.compiler.disable(_manual_grouped_mm)
 
 
 # Recompute-in-backward for the frozen base expert GEMM: the dequantized bf16 stack
@@ -299,13 +425,17 @@ def _check_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
-    if not torch.cuda.is_available():
+    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
+    if torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        device = torch.device("xpu", torch.xpu.current_device())
+    else:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
-        device = torch.cuda.current_device()
         dtype = torch.float16
 
         # 1 expert, 1 token, dim 8 (safe alignment).
@@ -335,8 +465,13 @@ def _transposed_view_grouped_mm_is_safe():
 
     safe = False
     try:
-        if _TORCH_GROUPED_MM_AVAILABLE and torch.cuda.is_available():
-            device = torch.cuda.current_device()
+        if torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = torch.device("xpu", torch.xpu.current_device())
+        else:
+            device = None
+        if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
             gen = torch.Generator(device=device).manual_seed(0)
@@ -1361,9 +1496,14 @@ def forward_native_grouped_mm(
 
     # Runtime safety check (defense in depth).
     if not _check_torch_grouped_mm_supported():
-        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+        # Compute Capability is CUDA-only; on XPU it would mask this message.
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+            where = f"this device (Compute Capability {major}.{minor})"
+        else:
+            where = "this device"
         raise RuntimeError(
-            f"torch._grouped_mm is not supported on this device (Compute Capability {major}.{minor}). "
+            f"torch._grouped_mm is not supported on {where}. "
             f"Set UNSLOTH_MOE_BACKEND='unsloth_triton' or 'native_torch' to use a compatible backend."
         )
 
