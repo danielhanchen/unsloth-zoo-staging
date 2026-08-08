@@ -292,6 +292,12 @@ def test_the_alias_routes_a_fullgraph_compile_through_the_fallback(monkeypatch):
     assert seen.get("fullgraph") is True, "the routing does not reach the fallback"
 
     if C.UNSLOTH_COMPILE_DISABLE:
+        # Skipping outright would leave the alias unchecked in the one mode this
+        # file is meant to survive, and a rebinding to bare torch.compile here is
+        # not a partial, so the source scan above would not see it either. Pin
+        # what the disabled branch is supposed to bind before standing down.
+        assert C.torch_compile is C.noop, "the disabled alias is not the no-op"
+        assert C._torch_compile is C.noop, "the disabled inner alias is not the no-op"
         pytest.skip("compilation is off, so the alias is bound to `noop` by design")
     seen.clear()
 
