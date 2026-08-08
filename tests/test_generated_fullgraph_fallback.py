@@ -81,7 +81,7 @@ def test_the_grpo_loss_regions_are_wrapped():
         "accumulate_chunk is still compiled bare"
 
 
-def test_maybe_compile_routes_fullgraph_through_the_fallback():
+def test_maybe_compile_routes_fullgraph_through_the_fallback(monkeypatch):
     """Three more fullgraph regions go through this one helper, so wiring it
     covers them without touching each decorator."""
     from unsloth_zoo.temporary_patches import common
@@ -93,10 +93,41 @@ def test_maybe_compile_routes_fullgraph_through_the_fallback():
 
     def f(x):
         return x
+    # `_maybe_compile` reads both switches as module globals on every call, so
+    # pinning them off here exercises the routing even when the suite runs with
+    # compilation disabled -- which is how unsloth's own CI runs it. Without
+    # this the helper returns `lambda fn: fn` and the assertions below describe
+    # behaviour that is switched off by design rather than broken.
+    monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE", False)
+    monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE_PARTIAL", False)
     wrapped = common._maybe_compile(fullgraph = True, dynamic = True)(f)
     assert hasattr(wrapped, "_unsloth_fallback_state")
     plain = common._maybe_compile(dynamic = True)(f)
     assert not hasattr(plain, "_unsloth_fallback_state")
+
+
+def test_maybe_compile_is_a_no_op_when_compilation_is_switched_off():
+    """The other half of the switch: `UNSLOTH_COMPILE_DISABLE` has to remove the
+    fallback wrapper too, or turning compilation off still hands torch a
+    fullgraph region."""
+    from unsloth_zoo.temporary_patches import common
+
+    def f(x):
+        return x
+    for flag in ("UNSLOTH_COMPILE_DISABLE", "UNSLOTH_COMPILE_DISABLE_PARTIAL"):
+        saved = {
+            name: getattr(common, name)
+            for name in ("UNSLOTH_COMPILE_DISABLE", "UNSLOTH_COMPILE_DISABLE_PARTIAL")
+        }
+        setattr(common, "UNSLOTH_COMPILE_DISABLE", False)
+        setattr(common, "UNSLOTH_COMPILE_DISABLE_PARTIAL", False)
+        setattr(common, flag, True)
+        try:
+            wrapped = common._maybe_compile(fullgraph = True, dynamic = True)(f)
+        finally:
+            for name, value in saved.items():
+                setattr(common, name, value)
+        assert wrapped is f, f"{flag} did not switch the fullgraph wrapper off"
 
 
 def test_the_generated_preamble_imports_the_helper():
@@ -236,6 +267,15 @@ def test_the_alias_sites_exist_and_are_covered_by_the_alias_itself():
 
 
 def test_the_alias_routes_a_fullgraph_compile_through_the_fallback(monkeypatch):
+    """Two halves, checked apart.
+
+    The routing lives in `_compile_or_fall_back`, which is a plain function and
+    exists whatever the switches say, so it is exercised unconditionally. The
+    alias `torch_compile` is *bound* to it at import, and
+    `UNSLOTH_COMPILE_DISABLE` deliberately binds `noop` instead: with nothing
+    compiled there is no fullgraph region to fall back from. That binding cannot
+    be rebound without reimporting the module, so it is the half that is
+    skipped, and only when the switch is actually on."""
     from unsloth_zoo.temporary_patches import common as C
     seen = {}
 
@@ -246,10 +286,19 @@ def test_the_alias_routes_a_fullgraph_compile_through_the_fallback(monkeypatch):
     monkeypatch.setattr("unsloth_zoo.temporary_patches.utils."
                         "torch_compile_with_fallback", _fake)
 
+    @C._compile_or_fall_back(dynamic = True, fullgraph = True)
+    def _routed(x): return x
+
+    assert seen.get("fullgraph") is True, "the routing does not reach the fallback"
+
+    if C.UNSLOTH_COMPILE_DISABLE:
+        pytest.skip("compilation is off, so the alias is bound to `noop` by design")
+    seen.clear()
+
     @C.torch_compile(dynamic = True, fullgraph = True)
     def _f(x): return x
 
-    assert seen.get("fullgraph") is True
+    assert seen.get("fullgraph") is True, "the alias is not bound to the routing"
 
 
 def test_the_alias_still_accepts_a_function_positionally():
