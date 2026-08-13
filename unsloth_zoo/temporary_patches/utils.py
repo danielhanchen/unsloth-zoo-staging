@@ -1382,6 +1382,212 @@ def _live_bump_depth(_config, name):
     return depth
 
 
+# Headroom left in Dynamo's recompilation cache at the last step boundary, by
+# label. The DIFFERENCE between two boundaries is what a step actually consumed,
+# and that is the only honest way to say whether the next step fits: an absolute
+# occupancy cannot tell a call site that compiled four variants once and settled
+# from one that compiles four more every step.
+_RECOMPILE_HEADROOM: dict = {}
+
+# Labels taken eager by that prediction rather than by an exhaustion. Separate
+# from `_LATCHED_EAGER_LABELS` (which they also join) purely so a run can report
+# which mechanism acted.
+_PREEMPTIVE_EAGER_LABELS: set = set()
+
+
+def _dynamo_cache_entries(code):
+    """Dynamo's cache entries for one code object, or None if torch cannot say.
+
+    `_debug_get_cache_entry_list` is the only way to read the linked list torch
+    itself counts against the recompile budgets, and it is private, so every
+    failure here means "no prediction" rather than an error: the fallback then
+    behaves exactly as it did before."""
+    try:
+        from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+    except Exception:
+        return None
+    try:
+        return _debug_get_cache_entry_list(code)
+    except Exception:
+        return None
+
+
+def _cache_entry_id_match_key(entry):
+    """Which frames this cache entry counts for, as a hashable key.
+
+    torch's `_has_same_id_matched_objs` compares a frame's locals against the
+    objects an entry ID_MATCHed, and only entries that match are counted against
+    `recompile_limit`. An entry that ID_MATCHed nothing counts for every frame,
+    and so does one whose matched object has since been collected, since torch
+    skips a dead weakref. `()` means exactly that: counts for everyone.
+
+    Unreadable is reported as `()` too. Over-counting predicts exhaustion early
+    and costs one call site its compilation; under-counting lets the exhaustion
+    happen mid-step, which is the failure this whole path exists to prevent.
+    """
+    manager = getattr(entry, "guard_manager", None)
+    if manager is None:
+        # torch 2.4 keeps the guards on `check_fn`; 2.5+ renamed it.
+        manager = getattr(entry, "check_fn", None)
+    matched = getattr(manager, "id_matched_objs", None)
+    if not matched:
+        return ()
+    key = []
+    try:
+        for name, reference in matched.items():
+            referent = reference() if callable(reference) else reference
+            if referent is None:
+                continue
+            key.append((name, id(referent)))
+    except Exception:
+        return ()
+    return tuple(sorted(key))
+
+
+def _recompile_cache_occupancy(code):
+    """`(entries for this code, most any one frame can see)`, or None.
+
+    The pair is what torch compares against the two budgets: the total against
+    `accumulated_recompile_limit`, and the per-frame count against
+    `recompile_limit`. The second is a property of the calling frame, which
+    cannot be sampled from outside one, so the worst case over the entries
+    present is used -- the largest group of entries sharing ID_MATCHed objects,
+    plus the entries that count for every frame.
+    """
+    entries = _dynamo_cache_entries(code)
+    if entries is None:
+        return None
+    total, universal, groups = 0, 0, {}
+    for entry in entries:
+        total += 1
+        key = _cache_entry_id_match_key(entry)
+        if key == ():
+            universal += 1
+        else:
+            groups[key] = groups.get(key, 0) + 1
+    return total, universal + (max(groups.values()) if groups else 0)
+
+
+def _recompile_budgets():
+    """`(recompile_limit, accumulated_recompile_limit)` as CONFIGURED, or None.
+
+    Read through `_ORIGINAL_RECOMPILE_LIMITS` where we hold a debt: a bump we
+    have not handed back yet is temporary headroom for one call in flight, and
+    counting it as budget would say a saturated call site has room it loses
+    again at the next restore.
+    """
+    try:
+        import torch._dynamo.config as _config
+    except Exception:
+        return None
+    budgets = []
+    for names in _RECOMPILE_LIMIT_NAMES:
+        value = None
+        for name in names:
+            current = getattr(_config, name, None)
+            if isinstance(current, int) and not isinstance(current, bool):
+                original = _ORIGINAL_RECOMPILE_LIMITS.get(name)
+                value = current if original is None else min(current, original)
+                break
+        if value is None:
+            return None
+        budgets.append(value)
+    return tuple(budgets)
+
+
+def _latch_saturated_call_sites(live) -> int:
+    """Take eager, AT THE BOUNDARY, every call site the next step would exhaust.
+
+    This is the half the deferral cannot reach. `_retry_with_more_budget` buys a
+    step out of trouble and promises to switch at the next boundary, which is
+    right whenever the exhaustion is seen during a forward. It cannot help when
+    the exhaustion is seen during a checkpoint RECOMPUTE, because by then that
+    step's forward has already packed compiled activations and the recompute
+    that ran out of budget is the recompute those activations are compared
+    against. Non-reentrant checkpointing then aborts the backward with
+
+        AssertionError: Something went unexpectedly wrong in activation
+        checkpoint
+
+    and no later boundary can undo it. Measured on a Kaggle T4 with
+    gemma-4-E2B-it, whose 504 RMSNorms share one code object and fill its cache
+    within the first step.
+
+    So decide before the step instead of during it. Dynamo raises the moment a
+    NEW variant would take a code object past its budget, so the question "will
+    this step exhaust" is answerable from two numbers that are already there:
+    the headroom now, and how much of it the previous step consumed. A call site
+    with no room for what it spent last time goes eager here, where nothing is
+    half-packed and the switch costs only speed.
+
+    A call site is measured once before it can be judged, so nothing is taken
+    eager on its first boundary. That is what keeps the healthy path exactly as
+    it was: a model that compiles a few variants during warmup and then settles
+    consumes zero per step from that point on, and zero consumption never
+    predicts an exhaustion however full the cache looks.
+    """
+    budgets = _recompile_budgets()
+    if budgets is None:
+        return 0
+    specific, accumulated = budgets
+    # Lowest headroom per label, since one label can cover several wrappers, and
+    # the one closest to its budget is the one that decides the step.
+    headrooms, measured = {}, {}
+    for wrapper in live:
+        if wrapper._unsloth_fallback_state["eager"]:
+            continue
+        label = getattr(wrapper, "_unsloth_fallback_label", None)
+        code = getattr(wrapper, "_unsloth_eager_code", None)
+        if label is None or code is None:
+            continue
+        occupancy = measured.get(id(code), _UNKNOWN)
+        if occupancy is _UNKNOWN:
+            occupancy = _recompile_cache_occupancy(code)
+            measured[id(code)] = occupancy
+        if occupancy is None:
+            continue
+        total, same_frame = occupancy
+        headroom = min(accumulated - total, specific - same_frame)
+        if label in headrooms:
+            headroom = min(headroom, headrooms[label])
+        headrooms[label] = headroom
+
+    flipped = 0
+    for label, headroom in headrooms.items():
+        previous = _RECOMPILE_HEADROOM.get(label)
+        _RECOMPILE_HEADROOM[label] = headroom
+        if previous is None:
+            # First measurement: a baseline, not a verdict.
+            continue
+        # Clamped: a restored bump can hand headroom BACK, and a negative
+        # consumption would otherwise read as room the call site does not have.
+        consumed = max(0, previous - headroom)
+        if headroom > consumed:
+            continue
+        _RECOMPILE_HEADROOM.pop(label, None)
+        _LATCHED_EAGER_LABELS.add(label)
+        # Deliberately NOT `_RECENT_EAGER_LABELS`: that set answers "did the
+        # compile mode flip DURING this step", which is what tells a caller a
+        # checkpoint failure is worth retrying. This flip happens between steps,
+        # so every pack and recompute in the step ahead agree, and claiming it as
+        # evidence would send a caller retrying past an unrelated failure.
+        _PREEMPTIVE_EAGER_LABELS.add(label)
+        for wrapper in live:
+            if getattr(wrapper, "_unsloth_fallback_label", None) != label:
+                continue
+            if not wrapper._unsloth_fallback_state["eager"]:
+                flipped += 1
+            wrapper._unsloth_fallback_state["eager"] = True
+            wrapper._unsloth_fallback_state["pending_eager"] = False
+        logger.warning_once(
+            f"Unsloth: torch.compile's recompilation cache for {label} has no "
+            f"room left for another shape, and running out of it inside "
+            f"activation checkpointing aborts the step; running it eagerly from "
+            f"here. Training is unaffected apart from speed."
+        )
+    return flipped
+
+
 def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
     """`torch_compile` a standalone kernel, keeping `patch_function`'s eager fallback.
 
@@ -1925,6 +2131,13 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
 
     wrapper._unsloth_fallback_state = state
     wrapper._unsloth_fallback_label = label
+    # The code object Dynamo keys its recompilation cache on, so a step boundary
+    # can read how much of the budget this call site has left. The EAGER
+    # function's, because that is the frame `torch.compile` intercepts; the
+    # compiled callable has no code of its own to count against. Absent for
+    # anything without one (a callable object, a `functools.partial`), and the
+    # prediction simply skips those.
+    wrapper._unsloth_eager_code = getattr(eager_func, "__code__", None)
     _EAGER_FALLBACK_WRAPPERS.append(weakref.ref(wrapper))
     # GRPO rebuilds and re-wraps `accumulate_chunk` inside every backward, so the
     # registry gained an entry per step forever and every scan above walked them
@@ -2102,7 +2315,11 @@ def apply_pending_eager_fallbacks() -> int:
         # leave the process-wide limit raised and its allowance spent forever.
         # The helper declines while any live wrapper still needs the headroom.
         _restore_recompile_limits_if_idle()
-        return 0
+        # AFTER the restore, so the headroom is measured against the budget the
+        # step ahead will actually run under rather than a bump about to be
+        # handed back. This is the ordinary path -- nothing has run out of
+        # budget yet -- and it is precisely where the prediction has to act.
+        return _latch_saturated_call_sites(live)
     flipped = 0
     for w in live:
         if not w._unsloth_fallback_state["eager"]:
@@ -2122,6 +2339,10 @@ def apply_pending_eager_fallbacks() -> int:
     # Everything that borrowed headroom is eager now, so hand the budget back
     # rather than leaving the process permanently raised.
     _restore_recompile_limits()
+    # No prediction on this path: the settle above has already taken every live
+    # wrapper eager, so there is nothing left to predict for. A wrapper rebuilt
+    # after it picks up a fresh baseline at the next boundary, through the early
+    # return above.
     return flipped
 
 
