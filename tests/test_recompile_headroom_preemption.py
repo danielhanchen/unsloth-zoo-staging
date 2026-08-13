@@ -25,12 +25,16 @@ against, so torch aborts the backward with
     AssertionError: Something went unexpectedly wrong in activation checkpoint
 
 inside the very step the deferral promised to fix at its end. Measured on a
-Kaggle T4 with gemma-4-E2B-it, whose 504 RMSNorms share one code object.
+Kaggle T4 with gemma-4-E2B-it, whose RMSNorm kernel recompiled its way through a
+budget of 1024 inside two steps while never holding more than five cache
+entries -- torch counts compiles as well as entries, and it is the count that
+runs away when guards keep being invalidated.
 
 The step in which the budget runs out is therefore already lost when the
 exhaustion becomes observable, so the decision has to be made before the step:
-Dynamo's cache occupancy and the previous step's consumption of it are both
-readable at a boundary, and they say whether the step ahead fits.
+what a call site has left of its budget, and what the last step spent of it,
+are both readable at a boundary, and together they say whether the step ahead
+fits.
 """
 
 import sys
@@ -83,14 +87,27 @@ def _wrapper(label = "M.forward", fail_after = 10 ** 9):
     return wrapper, calls
 
 
-def _fake_cache(monkeypatch, readings, budgets = (8, 256)):
-    """Stand in for Dynamo, handing out one `(total, per frame)` per boundary."""
+def _fake_cache(monkeypatch, readings, budgets = (8, 256), compiles = None):
+    """Stand in for Dynamo, handing out one reading per boundary.
+
+    A reading is `(total, per frame)`; the frame id is filled in for it, since
+    every test that cares about the compile count sets `compiles` instead.
+    """
     remaining = list(readings)
     monkeypatch.setattr(U, "_recompile_budgets", lambda: budgets)
     monkeypatch.setattr(
         U, "_recompile_cache_occupancy",
-        lambda code: remaining.pop(0) if remaining else readings[-1],
+        lambda code: (lambda r: (r[0], r[1], 7))(
+            remaining.pop(0) if remaining else readings[-1]),
     )
+    monkeypatch.setattr(
+        U, "_counts_compiles_against_the_accumulated_limit",
+        lambda: compiles is not None)
+    if compiles is not None:
+        counted = list(compiles)
+        monkeypatch.setattr(
+            U, "_frame_compile_count",
+            lambda frame_id: counted.pop(0) if counted else compiles[-1])
 
 
 # ---- the decision --------------------------------------------------------
@@ -172,6 +189,67 @@ def test_the_two_budgets_are_both_respected():
         U.apply_pending_eager_fallbacks()
         assert U.apply_pending_eager_fallbacks() == 1
     assert wrapper(1) == "eager"
+
+
+def test_the_compile_count_is_read_and_not_just_the_cache_size():
+    """The T4's shape exactly, and the reason the cache size alone is not the
+    measurement. When guards are invalidated the entries leave the cache, so a
+    call site can recompile its way through a budget of 1024 while never holding
+    more than a handful of entries. gemma-4-E2B-it was holding FIVE."""
+    wrapper, _ = _wrapper()
+    with pytest.MonkeyPatch.context() as patch:
+        _fake_cache(patch, [(5, 5), (5, 5)], budgets = (1024, 1024),
+                    compiles = [0, 600])
+        U.apply_pending_eager_fallbacks()
+        assert U.apply_pending_eager_fallbacks() == 1
+    assert wrapper(1) == "eager"
+
+
+def test_the_compile_count_is_left_alone_on_a_torch_that_ignores_it():
+    """Reading a count this torch does not check would take call sites eager
+    for a refusal that never comes."""
+    wrapper, _ = _wrapper()
+    with pytest.MonkeyPatch.context() as patch:
+        _fake_cache(patch, [(5, 5), (5, 5)], budgets = (1024, 1024))
+        patch.setattr(U, "_frame_compile_count", lambda frame_id: 1024)
+        U.apply_pending_eager_fallbacks()
+        assert U.apply_pending_eager_fallbacks() == 0
+    assert wrapper(1) == "compiled"
+
+
+def test_the_margin_acts_before_the_step_that_would_overrun():
+    """Acting only when the very next step is predicted to overrun leaves no
+    room for a step that costs more than the one measured, and the step in which
+    the budget runs out is the step that is lost."""
+    wrapper, _ = _wrapper()
+    with pytest.MonkeyPatch.context() as patch:
+        # 300 spent per step against 1024: three more steps would fit, four
+        # would not, and the call site is taken eager while it still has room.
+        _fake_cache(patch, [(0, 0), (0, 0)], budgets = (1024, 1024),
+                    compiles = [0, 300])
+        U.apply_pending_eager_fallbacks()
+        assert U.apply_pending_eager_fallbacks() == 1
+    assert wrapper(1) == "eager"
+
+
+def test_a_frame_id_learned_once_survives_the_cache_emptying():
+    """Every entry can be invalidated between two boundaries, and a frame id
+    read from no entries is no id at all -- which would drop the compile count
+    exactly where it has the most to say."""
+    wrapper, _ = _wrapper()
+    seen = []
+    with pytest.MonkeyPatch.context() as patch:
+        readings = [(3, 3, 11), (0, 0, None)]
+        patch.setattr(U, "_recompile_budgets", lambda: (1024, 1024))
+        patch.setattr(U, "_recompile_cache_occupancy",
+                      lambda code: readings.pop(0) if readings else (0, 0, None))
+        patch.setattr(U, "_counts_compiles_against_the_accumulated_limit",
+                      lambda: True)
+        patch.setattr(U, "_frame_compile_count",
+                      lambda frame_id: seen.append(frame_id) or 900)
+        U.apply_pending_eager_fallbacks()
+        U.apply_pending_eager_fallbacks()
+    assert seen == [11, 11], "the frame id was forgotten with the cache"
 
 
 # ---- what it must not disturb -------------------------------------------
@@ -257,7 +335,7 @@ def test_the_occupancy_counts_what_dynamo_counts():
         compiled(torch.randn(2, width), torch.randn(width))
     occupancy = U._recompile_cache_occupancy(kernel.__code__)
     assert occupancy is not None, "torch stopped exposing its cache entries"
-    total, per_frame = occupancy
+    total, per_frame, frame_id = occupancy
     assert total == 3
     # No ID_MATCHed objects for a plain tensor kernel, so every entry counts
     # against every frame and the two numbers agree.
@@ -279,7 +357,7 @@ def test_entries_matched_to_different_objects_do_not_crowd_one_frame():
     entries.append(Entry({}))
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(U, "_dynamo_cache_entries", lambda code: entries)
-        total, per_frame = U._recompile_cache_occupancy(object)
+        total, per_frame, frame_id = U._recompile_cache_occupancy(object)
     assert total == 4
     # One instance's entry, plus the one that matches everybody.
     assert per_frame == 2
@@ -297,7 +375,7 @@ def test_a_collected_id_match_counts_for_every_frame():
     entries = [Entry({"self": lambda: None}), Entry({"self": lambda: None})]
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(U, "_dynamo_cache_entries", lambda code: entries)
-        total, per_frame = U._recompile_cache_occupancy(object)
+        total, per_frame, frame_id = U._recompile_cache_occupancy(object)
     assert (total, per_frame) == (2, 2)
 
 
@@ -317,9 +395,37 @@ def test_a_huge_cache_is_not_walked_entry_by_entry():
     entries = [Entry() for _ in range(U._ID_MATCH_GROUPING_CAP + 1)]
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(U, "_dynamo_cache_entries", lambda code: entries)
-        total, per_frame = U._recompile_cache_occupancy(object)
+        total, per_frame, frame_id = U._recompile_cache_occupancy(object)
     assert (total, per_frame) == (len(entries), len(entries))
     assert walked["entries"] == 0, "the cap did not stop the walk"
+
+
+def test_the_compile_count_matches_what_dynamo_counted():
+    """Against the real counter, and through the real frame id, which is only
+    reachable off a cache entry."""
+
+    def counted(x, weight):
+        return x + weight
+
+    torch._dynamo.reset()
+    with torch._dynamo.config.patch(recompile_limit = 64,
+                                    accumulated_recompile_limit = 256):
+        compiled = torch.compile(counted, fullgraph = True, dynamic = False,
+                                 backend = "eager")
+        for width in (2, 3, 4, 5):
+            compiled(torch.randn(width), torch.randn(width))
+    occupancy = U._recompile_cache_occupancy(counted.__code__)
+    assert occupancy is not None
+    frame_id = occupancy[2]
+    assert frame_id is not None, "torch stopped exposing the frame id"
+    assert U._frame_compile_count(frame_id) == 4
+
+
+def test_this_torch_is_asked_whether_it_checks_the_count():
+    """A capability, read off the installed torch. Recorded as a test so the
+    day a release drops the check, this says so rather than silently taking
+    call sites eager for a refusal that no longer happens."""
+    assert U._counts_compiles_against_the_accumulated_limit() in (True, False)
 
 
 def test_an_outstanding_bump_is_not_counted_as_budget(monkeypatch):

@@ -1398,6 +1398,14 @@ _PREEMPTIVE_EAGER_LABELS: set = set()
 # as the whole cache instead of being grouped. See `_recompile_cache_occupancy`.
 _ID_MATCH_GROUPING_CAP = 64
 
+# How many more steps at the last step's rate a call site must be able to afford
+# before its compilation is left alone. Not 1: the step in which the budget runs
+# out is the step that is lost, and what a step spends varies with the batch, so
+# acting only when the very next one is predicted to overrun leaves no room for
+# a step that costs more than the one measured. It costs a healthy call site
+# nothing, since it spends zero per step and zero times any margin is still zero.
+_RECOMPILE_STEPS_OF_MARGIN = 4
+
 
 def _dynamo_cache_entries(code):
     """Dynamo's cache entries for one code object, or None if torch cannot say.
@@ -1448,20 +1456,36 @@ def _cache_entry_id_match_key(entry):
     return tuple(sorted(key))
 
 
-def _recompile_cache_occupancy(code):
-    """`(entries for this code, most any one frame can see)`, or None.
+def _cache_entry_frame_id(entry):
+    """Dynamo's id for the frame this entry was compiled for, or None.
 
-    The pair is what torch compares against the two budgets: the total against
-    `accumulated_recompile_limit`, and the per-frame count against
+    Dynamo counts compiles per frame id, not per code object, so this is the key
+    into that counter. Every entry for one code object carries the same one.
+    """
+    compile_id = getattr(entry, "compile_id", None)
+    frame_id = getattr(compile_id, "frame_id", None)
+    return frame_id if isinstance(frame_id, int) else None
+
+
+def _recompile_cache_occupancy(code):
+    """`(entries, most any one frame can see, Dynamo's frame id)`, or None.
+
+    The first two are what torch compares against the two budgets: the total
+    against `accumulated_recompile_limit`, and the per-frame count against
     `recompile_limit`. The second is a property of the calling frame, which
     cannot be sampled from outside one, so the worst case over the entries
     present is used -- the largest group of entries sharing ID_MATCHed objects,
     plus the entries that count for every frame.
+
+    The third is not an occupancy at all. It is what
+    `_frame_compile_count` needs, and reading it here is free because the entries
+    are already in hand.
     """
     entries = _dynamo_cache_entries(code)
     if entries is None:
         return None
     total = len(entries)
+    frame_id = _cache_entry_frame_id(entries[0]) if entries else None
     if total > _ID_MATCH_GROUPING_CAP:
         # Grouping is a Python walk of every entry, and this runs for every call
         # site at every step boundary, so it is not paid on a cache that is
@@ -1469,7 +1493,7 @@ def _recompile_cache_occupancy(code):
         # conservative answer, and it is the exact one on any torch that inlines
         # nn.Modules rather than ID_MATCHing them, which is where a cache gets
         # this big in the first place.
-        return total, total
+        return total, total, frame_id
     universal, groups = 0, {}
     for entry in entries:
         key = _cache_entry_id_match_key(entry)
@@ -1477,7 +1501,54 @@ def _recompile_cache_occupancy(code):
             universal += 1
         else:
             groups[key] = groups.get(key, 0) + 1
-    return total, universal + (max(groups.values()) if groups else 0)
+    return total, universal + (max(groups.values()) if groups else 0), frame_id
+
+
+def _frame_compile_count(frame_id):
+    """How many times Dynamo has COMPILED this frame, or None.
+
+    Not the same number as the live cache size, and on the failure this exists
+    for it is the only one that matters. An entry whose guards are invalidated
+    -- because something they hold a weakref to was freed -- leaves the cache,
+    so a call site can recompile a thousand times while never holding more than
+    a handful of entries. Measured on a Kaggle T4 with gemma-4-E2B-it, where the
+    kernel that ran out of budget was holding FIVE entries against a budget of
+    1024.
+
+    torch keeps this count precisely because the cache size cannot answer for
+    it, and refuses the next compile once it reaches the accumulated limit.
+    """
+    if frame_id is None:
+        return None
+    try:
+        from torch._dynamo.convert_frame import FRAME_COMPILE_COUNTER
+        return int(FRAME_COMPILE_COUNTER[frame_id])
+    except Exception:
+        return None
+
+
+@functools.lru_cache(maxsize = 1)
+def _counts_compiles_against_the_accumulated_limit():
+    """Does this torch refuse a compile on the COUNT as well as the cache size?
+
+    Asked of the installed torch rather than assumed from a version, and
+    answered no when it cannot be asked: reading the count against a torch that
+    does not check it would take call sites eager for a refusal that never
+    comes."""
+    try:
+        from torch._dynamo import cache_size as _cache_size
+    except Exception:
+        return False
+    for name in ("exceeds_recompile_limit", "exceeds_cache_size_limit",
+                 "_exceeds_cache_size_limit"):
+        function = getattr(_cache_size, name, None)
+        if function is None:
+            continue
+        try:
+            return "frame_compile_id" in inspect.getsource(function)
+        except Exception:
+            return False
+    return False
 
 
 def _recompile_budgets():
@@ -1522,26 +1593,27 @@ def _latch_saturated_call_sites(live) -> int:
         checkpoint
 
     and no later boundary can undo it. Measured on a Kaggle T4 with
-    gemma-4-E2B-it, whose 504 RMSNorms share one code object and fill its cache
-    within the first step.
+    gemma-4-E2B-it, whose RMSNorm kernel recompiled its way through a budget of
+    1024 inside two steps.
 
-    So decide before the step instead of during it. Dynamo raises the moment a
-    NEW variant would take a code object past its budget, so the question "will
+    So decide before the step instead of during it. Dynamo refuses the moment a
+    new compile would take a code object past its budget, so the question "will
     this step exhaust" is answerable from two numbers that are already there:
-    the headroom now, and how much of it the previous step consumed. A call site
-    with no room for what it spent last time goes eager here, where nothing is
-    half-packed and the switch costs only speed.
+    the budget left now, and how much of it the previous step spent. A call site
+    that cannot afford a few more steps at that rate goes eager here, where
+    nothing is half-packed and the switch costs only speed.
 
     A call site is measured once before it can be judged, so nothing is taken
     eager on its first boundary. That is what keeps the healthy path exactly as
     it was: a model that compiles a few variants during warmup and then settles
-    consumes zero per step from that point on, and zero consumption never
-    predicts an exhaustion however full the cache looks.
+    spends zero per step from that point on, and zero spent never predicts an
+    exhaustion however little room is left.
     """
     budgets = _recompile_budgets()
     if budgets is None:
         return 0
     specific, accumulated = budgets
+    counts_compiles = _counts_compiles_against_the_accumulated_limit()
     # Lowest headroom per label, since one label can cover several wrappers, and
     # the one closest to its budget is the one that decides the step.
     headrooms, measured = {}, {}
@@ -1558,8 +1630,21 @@ def _latch_saturated_call_sites(live) -> int:
             measured[id(code)] = occupancy
         if occupancy is None:
             continue
-        total, same_frame = occupancy
+        total, same_frame, frame_id = occupancy
+        # Remembered on the wrapper: an invalidated cache empties, and a frame
+        # id read from no entries is no id at all, which would silently drop the
+        # compile count exactly when it has the most to say.
+        if frame_id is None:
+            frame_id = getattr(wrapper, "_unsloth_dynamo_frame_id", None)
+        else:
+            wrapper._unsloth_dynamo_frame_id = frame_id
         headroom = min(accumulated - total, specific - same_frame)
+        if counts_compiles:
+            compiles = _frame_compile_count(frame_id)
+            if compiles is not None:
+                # The binding one whenever guards are being invalidated: the
+                # cache stays small while the count runs away.
+                headroom = min(headroom, accumulated - compiles)
         if label in headrooms:
             headroom = min(headroom, headrooms[label])
         headrooms[label] = headroom
@@ -1572,9 +1657,9 @@ def _latch_saturated_call_sites(live) -> int:
             # First measurement: a baseline, not a verdict.
             continue
         # Clamped: a restored bump can hand headroom BACK, and a negative
-        # consumption would otherwise read as room the call site does not have.
-        consumed = max(0, previous - headroom)
-        if headroom > consumed:
+        # spend would otherwise read as room the call site does not have.
+        spent = max(0, previous - headroom)
+        if headroom > spent * _RECOMPILE_STEPS_OF_MARGIN:
             continue
         _RECOMPILE_HEADROOM.pop(label, None)
         _LATCHED_EAGER_LABELS.add(label)
@@ -1592,10 +1677,10 @@ def _latch_saturated_call_sites(live) -> int:
             wrapper._unsloth_fallback_state["eager"] = True
             wrapper._unsloth_fallback_state["pending_eager"] = False
         logger.warning_once(
-            f"Unsloth: torch.compile's recompilation cache for {label} has no "
-            f"room left for another shape, and running out of it inside "
-            f"activation checkpointing aborts the step; running it eagerly from "
-            f"here. Training is unaffected apart from speed."
+            f"Unsloth: {label} is recompiling fast enough to run out of "
+            f"torch.compile's budget, and running out of it inside activation "
+            f"checkpointing ends the step; running it eagerly from here. "
+            f"Training is unaffected apart from speed."
         )
     return flipped
 
