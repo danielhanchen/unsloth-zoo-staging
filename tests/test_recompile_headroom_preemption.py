@@ -301,6 +301,27 @@ def test_a_collected_id_match_counts_for_every_frame():
     assert (total, per_frame) == (2, 2)
 
 
+def test_a_huge_cache_is_not_walked_entry_by_entry():
+    """This runs for every call site at every step boundary, so a cache far
+    past any budget is counted, not grouped. Reading it as one undivided group
+    is the conservative answer and the exact one wherever a cache gets that
+    big."""
+    walked = {"entries": 0}
+
+    class Entry:
+        @property
+        def guard_manager(self):
+            walked["entries"] += 1
+            return type("GuardManager", (), {"id_matched_objs": {}})()
+
+    entries = [Entry() for _ in range(U._ID_MATCH_GROUPING_CAP + 1)]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(U, "_dynamo_cache_entries", lambda code: entries)
+        total, per_frame = U._recompile_cache_occupancy(object)
+    assert (total, per_frame) == (len(entries), len(entries))
+    assert walked["entries"] == 0, "the cap did not stop the walk"
+
+
 def test_an_outstanding_bump_is_not_counted_as_budget(monkeypatch):
     """`_bump_recompile_limits` raises the process limits to get one call out of
     trouble and hands them back later. Reading the raised value would tell a

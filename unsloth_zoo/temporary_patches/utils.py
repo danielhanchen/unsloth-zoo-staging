@@ -1394,6 +1394,10 @@ _RECOMPILE_HEADROOM: dict = {}
 # which mechanism acted.
 _PREEMPTIVE_EAGER_LABELS: set = set()
 
+# Above this many cache entries for one code object, the per-frame count is read
+# as the whole cache instead of being grouped. See `_recompile_cache_occupancy`.
+_ID_MATCH_GROUPING_CAP = 64
+
 
 def _dynamo_cache_entries(code):
     """Dynamo's cache entries for one code object, or None if torch cannot say.
@@ -1457,9 +1461,17 @@ def _recompile_cache_occupancy(code):
     entries = _dynamo_cache_entries(code)
     if entries is None:
         return None
-    total, universal, groups = 0, 0, {}
+    total = len(entries)
+    if total > _ID_MATCH_GROUPING_CAP:
+        # Grouping is a Python walk of every entry, and this runs for every call
+        # site at every step boundary, so it is not paid on a cache that is
+        # already enormous. Reading such a cache as one undivided group is the
+        # conservative answer, and it is the exact one on any torch that inlines
+        # nn.Modules rather than ID_MATCHing them, which is where a cache gets
+        # this big in the first place.
+        return total, total
+    universal, groups = 0, {}
     for entry in entries:
-        total += 1
         key = _cache_entry_id_match_key(entry)
         if key == ():
             universal += 1
@@ -2340,9 +2352,11 @@ def apply_pending_eager_fallbacks() -> int:
     # rather than leaving the process permanently raised.
     _restore_recompile_limits()
     # No prediction on this path: the settle above has already taken every live
-    # wrapper eager, so there is nothing left to predict for. A wrapper rebuilt
-    # after it picks up a fresh baseline at the next boundary, through the early
-    # return above.
+    # wrapper eager, so there is nothing left to predict for. The baselines go
+    # with it, since a wrapper rebuilt under a label the settle did not make
+    # permanent starts compiled again, and measuring it against a reading from
+    # before the settle would charge it for a step it did not run.
+    _RECOMPILE_HEADROOM.clear()
     return flipped
 
 
