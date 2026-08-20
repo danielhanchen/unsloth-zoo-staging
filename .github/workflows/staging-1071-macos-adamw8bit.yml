@@ -1,0 +1,74 @@
+name: staging-1071 does real bnb change the AdamW8bit fallback on Mac
+
+on:
+  push:
+    branches: [pr-1071-xplat-ci]
+  workflow_dispatch:
+
+# Studio's diffusion trainers do:
+#     try:
+#         import bitsandbytes as bnb
+#         return bnb.optim.AdamW8bit(params, lr=lr)
+#     except Exception:
+#         pass          # -> torch.optim.AdamW
+# Against the Unsloth stub the construction raises, so the fallback fires. The question
+# this job answers is whether the REAL macOS arm64 wheel constructs successfully and
+# defers the failure to the first .step(), which would move a clean startup fallback into
+# a mid-training crash on any Mac that has bitsandbytes installed.
+jobs:
+  adamw8bit-on-mac:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -U pip && python -m pip install torch "bitsandbytes>=0.45"
+      - name: Construct and step AdamW8bit with the real wheel
+        run: |
+          python - <<'PY'
+          import platform, torch, json
+          print("host:", platform.system(), platform.machine())
+          print("cuda available:", torch.cuda.is_available())
+          import bitsandbytes as bnb
+          print("bnb:", bnb.__version__)
+          p = torch.nn.Parameter(torch.randn(8, 8))
+          out = {}
+          try:
+              opt = bnb.optim.AdamW8bit([p], lr=1e-3)
+              out["construct"] = "SUCCEEDED"
+          except Exception as exc:
+              out["construct"] = f"{type(exc).__name__}: {exc}"
+              print(json.dumps(out)); raise SystemExit(0)
+          try:
+              (p.sum()).backward()
+              opt.step()
+              out["step"] = "SUCCEEDED"
+          except Exception as exc:
+              out["step"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+          print(json.dumps(out, indent=2))
+          if out["construct"] == "SUCCEEDED" and out["step"] != "SUCCEEDED":
+              print("REGRESSION SHAPE CONFIRMED: constructs, then fails at .step()")
+          elif out["step"] == "SUCCEEDED":
+              print("NO REGRESSION: 8-bit AdamW actually works on this host")
+          PY
+
+      - name: For contrast, the same call against the Unsloth stub
+        run: |
+          git clone --depth 1 --branch pr-1071-xplat-ci \
+            https://github.com/danielhanchen/unsloth-zoo-staging.git zoo
+          cd zoo
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from unsloth_zoo.stubs.bitsandbytes_stub import inject_into_sys_modules
+          inject_into_sys_modules()
+          import torch, bitsandbytes as bnb
+          p = torch.nn.Parameter(torch.randn(8, 8))
+          try:
+              bnb.optim.AdamW8bit([p], lr=1e-3)
+              print("stub: construction SUCCEEDED (unexpected)")
+          except Exception as exc:
+              print(f"stub: construction raised {type(exc).__name__}: {str(exc)[:160]}")
+              print("=> the trainer's except-Exception fallback to torch.optim.AdamW fires")
+          PY
