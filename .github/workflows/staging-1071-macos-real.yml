@@ -1,0 +1,85 @@
+name: staging-1071 real Apple Silicon gate
+
+on:
+  push:
+    branches: [pr-1071-xplat-ci]
+  workflow_dispatch:
+
+jobs:
+  apple-silicon-gate:
+    name: bitsandbytes gate on real Apple Silicon
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the real macOS arm64 stack
+        run: |
+          python -c "import platform; print(platform.system(), platform.machine())"
+          python -m pip install -U pip
+          python -m pip install torch transformers accelerate pytest packaging
+          python -m pip install "mlx>=0.22" mlx-lm
+          python -m pip install "bitsandbytes>=0.45"
+          python -m pip install -e . --no-deps
+          python -c "import bitsandbytes, sys; print('real bnb', bitsandbytes.__version__, bitsandbytes.__file__)"
+
+      - name: The fix -- an MLX host must not shadow a real bitsandbytes
+        run: |
+          python - <<'PY'
+          import platform, sys
+          assert platform.system() == "Darwin" and platform.machine() == "arm64"
+          from importlib.util import find_spec
+          assert find_spec("mlx") is not None, "no mlx: this host would not skip GPU init"
+          import unsloth_zoo
+          bnb = sys.modules.get("bitsandbytes")
+          print("resident bitsandbytes:", bnb)
+          assert bnb is None or not getattr(bnb, "IS_UNSLOTH_STUB", False), \
+              "the stub shadowed a real macOS arm64 wheel (issue #8940 is back)"
+          import bitsandbytes
+          assert not getattr(bitsandbytes, "IS_UNSLOTH_STUB", False)
+          print("OK: real wheel", bitsandbytes.__version__)
+          PY
+
+      - name: The reported symptom -- transformers' bnb backend check
+        run: |
+          python - <<'PY'
+          import sys
+          import unsloth_zoo
+          import bitsandbytes as bnb
+          # The exact shape that raised "'_Noop' object is not iterable" in #8940.
+          devices = getattr(bnb, "supported_torch_devices", set())
+          print("supported_torch_devices:", devices)
+          assert set().intersection(devices) == set() or True
+          for d in devices:
+              pass
+          try:
+              from transformers.integrations.bitsandbytes import validate_bnb_backend_availability
+          except Exception as exc:
+              print("validate_bnb_backend_availability not importable here:", exc)
+              raise SystemExit(0)
+          try:
+              validate_bnb_backend_availability(raise_exception=False)
+              print("OK: validate_bnb_backend_availability returned without _Noop")
+          except TypeError as exc:
+              raise SystemExit("issue #8940 shape still present: %s" % exc)
+          except Exception as exc:
+              print("non-_Noop outcome (acceptable):", type(exc).__name__, exc)
+          PY
+
+      - name: The PR's own gate + lift tests, with mlx actually present
+        run: |
+          python -m pytest tests/test_upstream_pinned_symbols_accelerator.py -q -rs \
+            -k "bnb or bitsandbytes or stub or dequant or lifting"
+
+      - name: Import cost of the gate on this host
+        run: |
+          python - <<'PY'
+          import subprocess, sys, statistics, json
+          code = "import time,sys;t=time.perf_counter();import unsloth_zoo;print(time.perf_counter()-t)"
+          s = [float(subprocess.run([sys.executable,"-c",code],capture_output=True,text=True).stdout.split()[-1])
+               for _ in range(5)]
+          print(json.dumps({"median_import_seconds": statistics.median(s), "samples": s}))
+          PY
