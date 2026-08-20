@@ -93,31 +93,26 @@ jobs:
         # made that fail, which is what took this job red on 2026-08-18.
         run: python -m pytest tests/test_mlx_save_over_source.py -v -rs
 
-      - name: DIAG A qwen35 on installed mlx
+      - name: DIAG E1 each test alone
         continue-on-error: true
         run: |
-          python -c "import mlx.core as mx; print('MLXVER', mx.__version__)"
-          set +e; python -m pytest tests/test_qwen35_vjp_metal.py -q; echo "DIAG_A_EXIT=$?"
+          set +e
+          for t in test_gated_delta_kernel_grad_raises_without_patch test_patch_gated_delta_vlm_fixes_grad_and_matches_reference test_disable_fused_mrope_fixes_rotary_grad test_end_to_end_training_step_all_patches; do
+            python -m pytest tests/test_qwen35_vjp_metal.py -q -k "$t" >/dev/null 2>&1
+            echo "ALONE $t EXIT=$?"
+          done
 
-      - name: DIAG B qwen35 with mx.synchronize registered at exit
+      - name: DIAG F clear_cache plus synchronize at exit
         continue-on-error: true
         run: |
-          printf '%s\n' "import atexit, mlx.core as mx" "atexit.register(mx.synchronize)" "import pytest, sys" "sys.exit(pytest.main(['tests/test_qwen35_vjp_metal.py','-q']))" > diag_b.py
-          set +e; python diag_b.py; echo "DIAG_B_EXIT=$?"
+          printf '%s\n' "import atexit, mlx.core as mx" "def _c():" "    mx.synchronize()" "    mx.clear_cache()" "atexit.register(_c)" "import pytest, sys" "sys.exit(pytest.main(['tests/test_qwen35_vjp_metal.py','-q']))" > diag_f.py
+          set +e; python diag_f.py; echo "DIAG_F_EXIT=$?"
 
-      - name: DIAG C qwen35 on mlx 0.32.0
+      - name: DIAG G os._exit after pytest
         continue-on-error: true
         run: |
-          pip install -q "mlx==0.32.0"
-          python -c "import mlx.core as mx; print('MLXVER', mx.__version__)"
-          set +e; python -m pytest tests/test_qwen35_vjp_metal.py -q; echo "DIAG_C_EXIT=$?"
-
-      - name: DIAG D back on mlx 0.32.1
-        continue-on-error: true
-        run: |
-          pip install -q "mlx==0.32.1"
-          python -c "import mlx.core as mx; print('MLXVER', mx.__version__)"
-          set +e; python -m pytest tests/test_qwen35_vjp_metal.py -q; echo "DIAG_D_EXIT=$?"
+          printf '%s\n' "import pytest, os, sys" "rc = pytest.main(['tests/test_qwen35_vjp_metal.py','-q'])" "sys.stdout.flush()" "os._exit(rc)" > diag_g.py
+          set +e; python diag_g.py; echo "DIAG_G_EXIT=$?"
 
       - name: tests/test_qwen35_vjp_metal.py
         # Metal VJP regressions for the qwen3_5 training patches (issue 6002).
