@@ -93,26 +93,14 @@ jobs:
         # made that fail, which is what took this job red on 2026-08-18.
         run: python -m pytest tests/test_mlx_save_over_source.py -v -rs
 
-      - name: DIAG E1 each test alone
+      - name: DIAG modes K L M N O
         continue-on-error: true
         run: |
           set +e
-          for t in test_gated_delta_kernel_grad_raises_without_patch test_patch_gated_delta_vlm_fixes_grad_and_matches_reference test_disable_fused_mrope_fixes_rotary_grad test_end_to_end_training_step_all_patches; do
-            python -m pytest tests/test_qwen35_vjp_metal.py -q -k "$t" >/dev/null 2>&1
-            echo "ALONE $t EXIT=$?"
+          for m in K L M N O; do
+            python seg_probe.py $m >/dev/null 2>&1
+            echo "MODE $m EXIT=$?"
           done
-
-      - name: DIAG F clear_cache plus synchronize at exit
-        continue-on-error: true
-        run: |
-          printf '%s\n' "import atexit, mlx.core as mx" "def _c():" "    mx.synchronize()" "    mx.clear_cache()" "atexit.register(_c)" "import pytest, sys" "sys.exit(pytest.main(['tests/test_qwen35_vjp_metal.py','-q']))" > diag_f.py
-          set +e; python diag_f.py; echo "DIAG_F_EXIT=$?"
-
-      - name: DIAG G os._exit after pytest
-        continue-on-error: true
-        run: |
-          printf '%s\n' "import pytest, os, sys" "rc = pytest.main(['tests/test_qwen35_vjp_metal.py','-q'])" "sys.stdout.flush()" "os._exit(rc)" > diag_g.py
-          set +e; python diag_g.py; echo "DIAG_G_EXIT=$?"
 
       - name: tests/test_qwen35_vjp_metal.py
         # Metal VJP regressions for the qwen3_5 training patches (issue 6002).
