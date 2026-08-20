@@ -1,0 +1,65 @@
+name: staging-1071 Apple Silicon BEFORE (merge base)
+
+on:
+  push:
+    branches: [pr-1071-xplat-ci]
+  workflow_dispatch:
+
+jobs:
+  apple-silicon-before:
+    name: the #8940 failure on the merge base
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth-zoo
+          ref: 117e6ce1f8ac13b62b25ed41a109b10f56b69cbe
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the same stack as the AFTER job
+        run: |
+          python -c "import platform; print(platform.system(), platform.machine())"
+          python -m pip install -U pip
+          python -m pip install torch transformers accelerate pytest packaging
+          python -m pip install "mlx>=0.22" mlx-lm
+          python -m pip install "bitsandbytes>=0.45"
+          python -m pip install -e . --no-deps
+
+      - name: Merge base -- the stub shadows the real wheel
+        run: |
+          python - <<'PY'
+          import platform, sys
+          assert platform.system() == "Darwin" and platform.machine() == "arm64"
+          import unsloth_zoo
+          bnb = sys.modules.get("bitsandbytes")
+          stubbed = bool(getattr(bnb, "IS_UNSLOTH_STUB", False))
+          print("resident bitsandbytes:", bnb, "| IS_UNSLOTH_STUB:", stubbed)
+          assert stubbed, "expected the merge base to stub a real wheel; it did not"
+          print("CONFIRMED: on the merge base the real arm64 wheel is shadowed")
+          PY
+
+      - name: Merge base -- reproduce "'_Noop' object is not iterable" (#8940)
+        run: |
+          python - <<'PY'
+          import sys
+          import unsloth_zoo
+          import bitsandbytes as bnb
+          devices = getattr(bnb, "supported_torch_devices", set())
+          print("supported_torch_devices:", type(devices).__name__, devices)
+          try:
+              set().intersection(devices)
+              print("intersection did not raise")
+          except TypeError as exc:
+              print("REPRODUCED at the getattr default:", exc)
+          from transformers.integrations.bitsandbytes import validate_bnb_backend_availability
+          try:
+              validate_bnb_backend_availability(raise_exception=False)
+              print("validate_bnb_backend_availability returned cleanly (bug NOT reproduced)")
+          except TypeError as exc:
+              print("REPRODUCED #8940:", exc)
+          except Exception as exc:
+              print("other outcome:", type(exc).__name__, exc)
+          PY
