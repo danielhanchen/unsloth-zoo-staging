@@ -85,4 +85,33 @@ elif MODE == "O":                     # M, then gc.collect registered at exit
     except ValueError as e:
         print("vjp raised:", str(e)[:80])
 
+elif MODE == "P":                     # L (fused forward last) + explicit release
+    import gc
+    cfg, model, rots = build()
+    q, k, pos = inputs(cfg)
+    a, b = rots[0].apply_rotary(q, k, pos, unsqueeze_dim=1)
+    mx.eval(a, b)
+    del a, b, rots, model, q, k, pos
+    gc.collect()
+    mx.synchronize()
+    print("L-shape released and collected")
+
+elif MODE == "Q":                     # L + os._exit, to confirm teardown-only
+    import os as _os, sys as _sys
+    cfg, model, rots = build()
+    q, k, pos = inputs(cfg)
+    a, b = rots[0].apply_rotary(q, k, pos, unsqueeze_dim=1)
+    mx.eval(a, b)
+    print("L-shape done, exiting hard")
+    _sys.stdout.flush()
+    _os._exit(0)
+
+elif MODE == "R":                     # L + gc.collect registered at exit only
+    import atexit, gc
+    atexit.register(gc.collect)
+    cfg, model, rots = build()
+    q, k, pos = inputs(cfg)
+    a, b = rots[0].apply_rotary(q, k, pos, unsqueeze_dim=1)
+    mx.eval(a, b)
+
 print("reached end of", MODE)
