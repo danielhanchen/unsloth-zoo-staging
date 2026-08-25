@@ -2387,6 +2387,26 @@ def _converter_was_oom_killed(exc):
     return "sigkill" in f"{exc}".lower()
 
 
+# Matched with its comparison: a failure that merely names the counter leaves
+# the checkpoint's head intact, and retrying without it would drop that head.
+# `[^\S\r\n]` is horizontal whitespace only -- plain `\s` matches a newline, so
+# it would let the comparison straddle two lines and re-open the very splice
+# the single-line `[^\r\n]*` is there to prevent.
+_MTP_INFERENCE_ASSERTION = re.compile(
+    r"\bassert\b[^\r\n]*\bopt_num_mtp_layers[^\S\r\n]*!=[^\S\r\n]*0"
+)
+
+
+def _converter_needs_no_mtp(text):
+    """Did the converter abort inferring an MTP head the checkpoint does not have?
+
+    The assertion is what proves the head is absent: a declaration would have
+    skipped the branch, and a recognised `mtp.layers.<i>` made the count positive.
+    """
+    if not text: return False
+    return _MTP_INFERENCE_ASSERTION.search(text) is not None
+
+
 def _converter_rejected_no_mtp(text):
     """Did the converter refuse `--no-mtp` because this architecture has no MTP?"""
     if not text: return False
@@ -2403,6 +2423,35 @@ def _drop_no_mtp(command):
     """The same command without `--no-mtp`, or None when it has none to drop."""
     if "--no-mtp" not in command: return None
     return [token for token in command if token != "--no-mtp"]
+
+
+def _add_no_mtp(command):
+    """The same command with `--no-mtp`, or None when it already has it."""
+    if "--no-mtp" in command: return None
+    # The positional model directory must stay last.
+    return command[:-1] + ["--no-mtp", command[-1]]
+
+
+def _checkpoint_has_mtp_tensors(input_folder, num_layers):
+    """Does the checkpoint physically carry an MTP head, whatever it declares?
+
+    The converter's assertion only proves it recognised zero canonical
+    `mtp.layers.<i>` tensors, not that there is nothing to keep, so `--no-mtp`
+    -- which makes it discard every `mtp.*` -- must not be sent on the strength
+    of the assertion alone. Unlike `_keep_mtp` this ignores the declaration,
+    because the checkpoints that reach the assertion are exactly the ones that
+    declare nothing.
+
+    Only consulted after the converter has already failed, so an unreadable
+    index answers "no evidence of a head" and leaves the retry to proceed
+    rather than turning a recoverable export into a hard error.
+    """
+    if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers <= 0:
+        return False
+    try:
+        return _has_mtp_weight_tensors(input_folder, num_layers)
+    except Exception:
+        return False
 
 
 def _retry_with_temp_file(command):
@@ -2692,7 +2741,9 @@ def convert_to_gguf(
         attempted_repair = False
         attempted_temp_file = False
         attempted_no_mtp_drop = False
+        attempted_no_mtp_add = False
         repair_note = ""
+        no_mtp_note = ""
         optional_failed = False
         while True:
             try:
@@ -2709,10 +2760,15 @@ def convert_to_gguf(
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 break
             except subprocess.CalledProcessError as e:
-                captured = ""
+                # Joined on a newline, never concatenated: an unterminated
+                # stderr line glued to stdout's first one splices two harmless
+                # fragments into a line that matches a self-heal signature.
+                captured_streams = []
                 for stream in (getattr(e, "stderr", None), getattr(e, "stdout", None)):
                     if stream:
-                        captured += stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
+                        captured_streams.append(
+                            stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace"))
+                captured = "\n".join(captured_streams)
 
                 # Self-heal: reinstall the converter deps (command[0] = its
                 # interpreter) and retry once instead of failing.
@@ -2733,6 +2789,47 @@ def convert_to_gguf(
                     retry = _drop_no_mtp(command)
                     if retry is not None:
                         attempted_no_mtp_drop = True
+                        command = retry
+                        continue
+
+                # The converter recognised no MTP head while inferring one.
+                # Text runs only: `--no-mtp` never belonged on the projector
+                # command, and a projector failure is degraded, not repaired.
+                if not attempted_no_mtp_add and required and _converter_needs_no_mtp(captured):
+                    retry = _add_no_mtp(command)
+                    if retry is not None and _checkpoint_has_mtp_tensors(input_folder, _num_layers):
+                        # The converter recognised none, but there are `mtp.*`
+                        # tensors here; `--no-mtp` would discard them and call
+                        # the lossy export a success. Surface the disagreement.
+                        no_mtp_note = (
+                            "\n--- unsloth ---\nThe converter could not infer this "
+                            "checkpoint's multi-token prediction (MTP) head, but the "
+                            "checkpoint does contain MTP tensors, so retrying with "
+                            "--no-mtp would silently drop them. Convert with an "
+                            "explicit `mtp_num_hidden_layers` in config.json, or "
+                            "remove the MTP tensors, and try again."
+                        )
+                        attempted_no_mtp_add = True
+                    elif retry is not None:
+                        attempted_no_mtp_add = True
+                        # The one self-heal that changes what the GGUF contains,
+                        # so say so rather than dropping the head silently.
+                        print(
+                            "Unsloth: The GGUF converter recognised no multi-token "
+                            "prediction (MTP) head in this checkpoint. Retrying with "
+                            "--no-mtp; if it succeeds the GGUF will have no MTP head."
+                        )
+                        # The failed attempt can leave a truncated --outfile and,
+                        # with --split-max-size, extra shards beside it. Studio's
+                        # export scans the whole output directory for *.gguf, so
+                        # anything left here is shipped as if it were valid.
+                        _remove_gguf_outputs(output_file)
+                        # Keep the assertion: if the retry fails for its own
+                        # reason, the original cause is otherwise discarded.
+                        no_mtp_note = (
+                            f"\n--- first attempt, before retrying with --no-mtp ---\n"
+                            f"{captured.strip()}"
+                        )
                         command = retry
                         continue
 
@@ -2789,7 +2886,7 @@ def convert_to_gguf(
                         f"(image/audio) input is unavailable in this GGUF."
                     )
                     break
-                raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}")
+                raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}{no_mtp_note}")
 
         # Its partial output was just removed, so validation would fail for nothing.
         if optional_failed:
