@@ -30,6 +30,7 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
           pip install pytest==9.0.3
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main"
       - name: Preference suite
         run: python -m pytest tests/test_mlx_preference.py -q
       - name: Import integrity (no mlx must be imported)
