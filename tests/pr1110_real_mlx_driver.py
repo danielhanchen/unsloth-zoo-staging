@@ -313,7 +313,33 @@ def main():
                 "traceback": traceback.format_exc().splitlines()[-6:],
             }
     print(json.dumps(OUT, indent=1, sort_keys=True, default=str))
+    # No step here has an expected failure, so every ERROR and every ok=False is
+    # a real one. Walk the whole tree rather than the top level: the per-row
+    # results nest, and a step that caught its own error would otherwise report
+    # a green job while the section it was measuring never ran.
+    failures = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            if "ERROR" in node:
+                failures.append(f"{path or '<root>'}: {node['ERROR']}")
+            if node.get("ok") is False:
+                failures.append(f"{path or '<root>'}: {node.get('error', 'ok=False')}")
+            for key, value in node.items():
+                walk(value, f"{path}.{key}" if path else str(key))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{path}[{index}]")
+
+    walk(OUT, "")
+    if failures:
+        print(f"\nFAILED: {len(failures)} real-MLX failure(s)")
+        for failure in failures:
+            print(f"  {failure}")
+        return 1
+    print("\nOK: real MLX driver clean")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
