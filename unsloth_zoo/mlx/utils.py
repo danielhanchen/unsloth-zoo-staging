@@ -28,6 +28,7 @@ import mlx.utils
 import ast
 import collections
 import contextlib
+import contextvars
 import copy
 import inspect
 import importlib
@@ -397,6 +398,138 @@ def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
         _set_mlx_norm_output_cast_classes(enabled, norm_classes)
 
 
+# MLX raises instead of returning zero when a backward pass reaches a
+# gather/scatter index, aborting every graph that derives indices from activations:
+# MoE routing, SwitchGLU's gather-sort, GLM-5.x's sparse mask. Detaching changes no
+# forward value; producers are wrapped too, since `__getitem__` hides the consumer.
+_MLX_INDEX_PRODUCERS = ("argpartition", "argsort", "argmax", "argmin")
+_MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
+    "take": (1,), "take_along_axis": (1,), "put_along_axis": (1,),
+    "gather_mm": (2, 3), "gather_qmm": (4, 5)}
+_MLX_INDEX_KEYWORDS = frozenset(("indices", "lhs_indices", "rhs_indices"))
+_MLX_INDEX_OP_NAMES = _MLX_INDEX_PRODUCERS + tuple(_MLX_INDEX_CONSUMERS)
+_MLX_INDEX_GRADIENT_LOCK = threading.RLock()
+# Two depths, with different scopes. Physical: how many runs still need `mlx.core`
+# wrapped. Global under the lock, since unpatching is process-wide.
+_MLX_TRAINING_PATCH_DEPTH = 0
+# Logical: is THIS context inside a training step. Context-local because a global
+# one is wrong both ways -- never cleared, a nested evaluation reads as training;
+# always cleared, one trainer's evaluation clears the flag under another that is
+# still differentiating, and a call site passing no `use_kernel` (GLM-5.x) then
+# routes its backward to the fused kernel, which has no VJP. ContextVar covers
+# threads and asyncio Tasks; `threading.local` would cover only the first.
+_MLX_TRAINING_ACTIVE_DEPTH = contextvars.ContextVar(
+    "unsloth_mlx_training_active_depth", default=0)
+# Tuple, not list: a mutable ContextVar default is shared by every context that
+# never set one, putting the stack straight back in global scope.
+_MLX_TRAINING_PAUSE_STACK = contextvars.ContextVar(
+    "unsloth_mlx_training_pause_stack", default=())
+# MLX differentiates integer arrays, so only real index positions are detached.
+_MLX_INTEGER_DTYPES = frozenset((mx.int8, mx.int16, mx.int32, mx.int64,
+                                 mx.uint8, mx.uint16, mx.uint32, mx.uint64))
+
+
+def _detach_if_index(value):
+    return (mx.stop_gradient(value)
+            if getattr(value, "dtype", None) in _MLX_INTEGER_DTYPES else value)
+
+
+def _wrap_mlx_index_op(name, original):
+    positions = _MLX_INDEX_CONSUMERS.get(name)
+
+    @wraps(original)
+    def wrapper(*args, **kwargs):
+        if positions is None:  # producer: the result is entirely an index
+            return mx.stop_gradient(original(*args, **kwargs))
+        return original(
+            *(_detach_if_index(arg) if i in positions else arg
+              for i, arg in enumerate(args)),
+            **{key: _detach_if_index(value) if key in _MLX_INDEX_KEYWORDS
+               else value for key, value in kwargs.items()},
+        )
+
+    wrapper._unsloth_index_stop_gradient = True
+    wrapper._unsloth_index_original = original
+    return wrapper
+
+
+def _set_mlx_index_gradient_stop(enabled: bool) -> None:
+    for name in _MLX_INDEX_OP_NAMES:
+        current = getattr(mx, name, None)
+        if current is None:
+            continue
+        patched = bool(getattr(current, "_unsloth_index_stop_gradient", False))
+        if enabled and not patched:
+            setattr(mx, name, _wrap_mlx_index_op(name, current))
+        elif not enabled and patched:
+            setattr(mx, name, current._unsloth_index_original)
+
+
+def acquire_mlx_training_patches() -> None:
+    """Reference-counted: the `mlx.core` patches are process-wide while trainer
+    runs are not, so an inner run must not unpatch an outer one."""
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            _set_mlx_index_gradient_stop(True)
+        _MLX_TRAINING_PATCH_DEPTH += 1
+    _MLX_TRAINING_ACTIVE_DEPTH.set(_MLX_TRAINING_ACTIVE_DEPTH.get() + 1)
+
+
+def release_mlx_training_patches() -> None:
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            return
+        _MLX_TRAINING_PATCH_DEPTH -= 1
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            _set_mlx_index_gradient_stop(False)
+    _MLX_TRAINING_ACTIVE_DEPTH.set(max(0, _MLX_TRAINING_ACTIVE_DEPTH.get() - 1))
+
+
+def pause_mlx_training_patches() -> bool:
+    """Evaluation runs under `model.eval()` but inside the trainer's window, which
+    would otherwise route it down the training paths.
+
+    Always clears the logical flag, but only for THIS context, so a second trainer
+    on another thread keeps its own. The return value reports only whether the
+    process-wide patches came off: they stay while another run needs them, which
+    costs nothing, since they stop gradients into gather indices and evaluation
+    takes none.
+    """
+    global _MLX_TRAINING_PATCH_DEPTH
+    _MLX_TRAINING_PAUSE_STACK.set(
+        _MLX_TRAINING_PAUSE_STACK.get() + (_MLX_TRAINING_ACTIVE_DEPTH.get(),))
+    _MLX_TRAINING_ACTIVE_DEPTH.set(0)
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if _MLX_TRAINING_PATCH_DEPTH != 1:
+            return False
+        _MLX_TRAINING_PATCH_DEPTH = 0
+        _set_mlx_index_gradient_stop(False)
+        return True
+
+
+def resume_mlx_training_patches(paused: bool) -> None:
+    """Reopen at the depth `pause_mlx_training_patches` closed from.
+
+    Deliberately not `acquire()`: that would count a second run, and the pause
+    never released one.
+    """
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if paused and _MLX_TRAINING_PATCH_DEPTH == 0:
+            _set_mlx_index_gradient_stop(True)
+            _MLX_TRAINING_PATCH_DEPTH = 1
+    stack = _MLX_TRAINING_PAUSE_STACK.get()
+    if stack:
+        _MLX_TRAINING_ACTIVE_DEPTH.set(stack[-1])
+        _MLX_TRAINING_PAUSE_STACK.set(stack[:-1])
+
+
+def mlx_training_patches_active() -> bool:
+    return _MLX_TRAINING_ACTIVE_DEPTH.get() > 0
+
+
 def _get_transformer_layers(model):
     """Find transformer layers, unwrapping VLM wrappers if needed.
 
@@ -433,6 +566,21 @@ def _get_vision_encoder_layers(model):
     return None
 
 
+def _detach_integer_arrays(value):
+    """`mx.checkpoint` makes every argument a primal of the recomputed function,
+    so a layer that embeds the token ids it was handed derives a gather index."""
+    if isinstance(value, list):
+        return [_detach_integer_arrays(v) for v in value]
+    if isinstance(value, tuple):
+        detached = tuple(_detach_integer_arrays(v) for v in value)
+        # A NamedTuple is a tuple subclass; rebuilding it as a plain tuple would
+        # turn a layer's `payload.ids` into an AttributeError.
+        return type(value)(*detached) if hasattr(value, "_fields") else detached
+    if isinstance(value, dict):
+        return {k: _detach_integer_arrays(v) for k, v in value.items()}
+    return _detach_if_index(value)
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -444,6 +592,8 @@ def _patch_layer_class_for_gc(layer_cls):
         if slot is None:
             def inner_fn(params, *args, **kwargs):
                 self.update(params)
+                args = tuple(_detach_integer_arrays(a) for a in args)
+                kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
                 return fn(self, *args, **kwargs)
             return mx.checkpoint(inner_fn)(
                 self.trainable_parameters(), *args, **kwargs)
@@ -453,6 +603,8 @@ def _patch_layer_class_for_gc(layer_cls):
         def inner_fn(params, borrowed, *args, **kwargs):
             self.update(params)
             slot.install(borrowed)
+            args = tuple(_detach_integer_arrays(a) for a in args)
+            kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
             out = fn(self, *args, **kwargs)
             return out, slot.recorded()
 
@@ -1752,17 +1904,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
 
 def _model_logits(output):
     """mlx_lm models return the logits array; mlx-vlm wrappers wrap them."""
-    logits = getattr(output, "logits", None)
-    if logits is not None:
-        return logits
-    if hasattr(output, "logits"):
-        # Unwrapping to None instead leaves a `'NoneType' has no attribute 'ndim'`
-        # inside cross-entropy.
-        raise ValueError(
-            "Unsloth: the model returned an output wrapper whose `logits` is "
-            "None, so there is nothing to compute a loss from."
-        )
-    return output
+    return output.logits if hasattr(output, "logits") else output
 
 
 def make_baseline_loss_fn(label_smoothing=0.0):
@@ -2696,36 +2838,17 @@ def _normalize_grid_thw(grid_thw):
     return tuple(normalized)
 
 
-def _mlx_vlm_canonical_model_type(model_type):
-    """The name mlx-vlm resolves this config's `model_type` to.
-
-    mlx-vlm lower-cases the value and sends it through MODEL_REMAPPING to pick the
-    module, never writing the result back, so a family set keyed on the canonical
-    spelling has to resolve the same way or an aliased checkpoint misses it. Hyphens
-    are folded too, since MODEL_REMAPPING carries only the aliases it has met.
-
-    Any failure leaves the name alone: an mlx-vlm too old to have MODEL_REMAPPING is
-    exactly the case where the raw spelling is the only spelling.
-    """
-    if not model_type:
-        return ""
-    name = str(model_type).lower()
-    try:
-        from mlx_vlm.utils import MODEL_REMAPPING
-        name = MODEL_REMAPPING.get(name, name)
-    except Exception:
-        pass
-    return name.replace("-", "_")
-
-
-# Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
-# `.prod()`, `[:, 1:]`). Everything else keeps the tuple the Qwen/Paddle compile
-# patches trace: an array becomes a tracer under mx.compile and `.tolist()` raises.
+# Families reaching mlx-vlm code that indexes the vision grid as an array
+# (`.tolist()`, `.prod()`, `[:, 1:]`). Everything else keeps the Python tuple
+# form, which is what the Qwen/Paddle compile patches trace: an array turns
+# into a tracer under mx.compile and its `.tolist()` raises.
 _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "glm4v",
     "glm_ocr",
-    # Not compile-patched, and opens with `grid_thw.tolist()`.
+    # Muse Glimmer's vision tower is not compile-patched and opens with
+    # `grid_thw.tolist()`.
     "muse_glimmer",
+    "glm5_next",
 })
 
 
@@ -3174,6 +3297,7 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen3_vl_moe",
     "qwen3_5",
     "qwen3_5_moe",
+    "qwen4_exp",
 })
 _VLM_POSITION_GENERATING_MODEL_TYPES = (
     _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}
@@ -3412,11 +3536,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    # Resolved, not raw: an aliased config is routed to the canonical family's tower,
-    # so the grid form has to follow it there.
-    grid_as_array = (
-        _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
-    )
+    grid_as_array = model_type in _VLM_ARRAY_GRID_MODEL_TYPES
     if image_grid_thw is not None:
         batch_dict["image_grid_thw"] = (
             _grid_thw_to_mx_array(image_grid_thw) if grid_as_array else image_grid_thw
@@ -14270,9 +14390,10 @@ def _vlm_gguf_name_candidates(name):
         if value not in candidates:
             candidates.append(value)
 
-    # An encoder MLX keeps at the top level sits under "model." in the HF layout these
-    # converters read. llama.cpp drops a tensor whose name it does not recognize, so a
-    # missed prefix costs the mmproj its projector and only fails at load time.
+    # A multimodal encoder MLX keeps at the top level sits under "model." in the HF
+    # layout these converters read. The projector counts: llama.cpp drops a tensor whose
+    # name it does not recognize, so a missed prefix here costs the mmproj its projector
+    # and the file only fails later, when something tries to load it.
     if name.startswith(
         (
             "audio_tower.",
@@ -15265,81 +15386,17 @@ def _install_llama_cpp_macos(llama_cpp_folder=None):
     print("Unsloth: llama.cpp installed successfully.")
 
 
-# Markers naming a repackaging, not a different model. The imatrix is published against the base,
-# so these peel one per match, repeatedly, after the verbatim name is tried: -unsloth-bnb-4bit
-# goes all the way down. \d+-?bit covers both spellings mlx-community uses (-4bit and -4-bit).
-_REPACKAGED_MODEL_SUFFIX = re.compile(
-    r"-(?:\d+-?bit|int\d+|bf16|fp16|f16|fp8|mxfp4|float16|float32|mlx|awq|gptq|hqq|bnb|unsloth)$",
-    re.IGNORECASE,
-)
-
-
-def _exported_gguf_files(save_directory, imatrix_source=None):
-    """The *.gguf files this export produced, excluding a caller-supplied imatrix.
-
-    imatrix_file may point inside save_directory. It is copied out before use, but the original
-    stays put, and both the summary and the Hub upload glob save_directory, so without this it
-    would be published as though it were an exported model.
-    """
-    files = sorted(Path(save_directory).glob("*.gguf"))
-    if imatrix_source is None:
-        return files
-    return [f for f in files if not _is_same_file(f, imatrix_source)]
-
-
-def _is_same_file(a, b):
-    """True when two paths name one file, asked of the filesystem rather than of the strings.
-
-    The on-disk spelling is the filesystem's to choose: a case-insensitive mount folds case, APFS
-    stores NFD, and a symlink defeats equality outright. The fallback covers a path already gone.
-    """
-    try:
-        return os.path.samefile(a, b)
-    except OSError:
-        a, b = os.path.abspath(str(a)), os.path.abspath(str(b))
-        norm = lambda p: unicodedata.normalize("NFC", os.path.normcase(p))
-        return norm(a) == norm(b)
-
-
-def _gguf_imatrix_repo_candidates(model):
-    """unsloth/<base>-GGUF repo ids that may ship an upstream imatrix for this model."""
-    repos = []
-    sources = (
-        getattr(model, "_hf_repo", None),
-        # Text models keep their config as a dict in _config; VLMs expose an object as .config.
-        _config_get(getattr(model, "_config", None), "_name_or_path"),
-        _config_get(getattr(model, "config", None), "_name_or_path"),
-    )
-    for raw in sources:
-        name = str(raw or "").strip()
-        if not name or os.path.isdir(name):
-            continue
-        if name.endswith("-GGUF"):
-            stems = [name]
-        else:
-            stem = name.split("/")[-1]
-            stems = [stem]
-            while True:
-                stripped = _REPACKAGED_MODEL_SUFFIX.sub("", stems[-1])
-                if stripped == stems[-1] or not stripped:
-                    break
-                stems.append(stripped)
-            stems = [f"unsloth/{s}-GGUF" for s in stems]
-        for repo in stems:
-            if repo not in repos:
-                repos.append(repo)
-    return repos
-
-
 _GGUF_SHARD_SUFFIX = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
 
 
 def _gguf_shard_family(first_file, produced_files):
     """`first_file` plus the shards llama.cpp wrote for the same `--outfile`.
 
-    A vision projector is a separate `--outfile` and so carries a different stem.
-    Grouping by stem keeps it out without pattern-matching filenames, which would
-    misfire on a model legitimately named `example-mmproj-model`.
+    A conversion can also emit a vision projector, which is a separate `--outfile`
+    and so carries a different stem. Grouping by stem keeps it out without asking
+    what any filename looks like: a model may legitimately be named
+    `example-mmproj-model`, or `example-mmproj.gguf`, which the converter uses
+    verbatim.
     """
     def shard_stem(path):
         name = os.path.basename(path)
@@ -15350,6 +15407,8 @@ def _gguf_shard_family(first_file, produced_files):
     if stem is None:
         return [first_file]
     return [f for f in produced_files if shard_stem(f) == stem]
+
+
 def save_pretrained_gguf(
     model,
     tokenizer,
@@ -15630,9 +15689,10 @@ def save_pretrained_gguf(
                 raise RuntimeError(
                     "Unsloth: the GGUF converter reported no output file to quantize."
                 )
-            # What the converter reported, never the requested --outfile name: past
-            # --split-max-size it writes shards instead, and llama.cpp finds the rest
-            # from shard 1's split.count. The model always converts before any projector.
+            # Take what the converter reported first, never the requested --outfile
+            # name: past --split-max-size it writes shards under that name instead,
+            # and llama.cpp finds the rest from shard 1's split.count. The model is
+            # always converted before any vision projector, so it comes first.
             base_gguf = produced_files[0]
             base_files = _gguf_shard_family(base_gguf, produced_files)
             final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
