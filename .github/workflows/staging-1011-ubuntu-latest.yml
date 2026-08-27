@@ -28,8 +28,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e .[core]
-          pip install "mlx>=0.22.0" mlx-cpu pytest==9.0.3
+          pip install -e .[core] "mlx>=0.22.0" mlx-cpu
+          # unsloth_zoo/__init__.py refuses to import without unsloth present;
+          # --no-deps so it cannot drag transformers past this project's cap.
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          pip install pytest==9.0.3
       - name: Confirm real mlx, not the simulation shim
         run: |
           python -c "
