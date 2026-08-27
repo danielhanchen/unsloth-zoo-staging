@@ -1,0 +1,46 @@
+name: "staging 1110 ubuntu"
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: staging-1110-ubuntu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu:
+    name: "ubuntu-latest py${{ matrix.python }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13']
+    env:
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_COMPILE_DISABLE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.4.0,<2.11.0"
+          pip install -e .[core]
+          pip install pytest==9.0.3
+      - name: Preference suite
+        run: python -m pytest tests/test_mlx_preference.py -q
+      - name: Import integrity (no mlx must be imported)
+        run: |
+          python - <<'PY'
+          import sys
+          import unsloth_zoo
+          leaked = [n for n in sys.modules if n == "mlx" or n.startswith("mlx.")]
+          assert not leaked, f"importing unsloth_zoo pulled in mlx: {leaked}"
+          from unsloth_zoo.mlx.runtime import is_mlx_available
+          assert is_mlx_available() is False
+          print("import integrity OK")
+          PY
