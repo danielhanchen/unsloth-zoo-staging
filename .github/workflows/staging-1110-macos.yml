@@ -1,0 +1,48 @@
+name: "staging 1110 macos apple silicon"
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: staging-1110-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: "macos-15 Apple Silicon, real MLX"
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install zoo with MLX extras
+        # pyproject gates torch OFF on darwin+arm64, but tests/mlx_simulation
+        # imports it unconditionally, so install the wheel first as mlx-ci does.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+      - name: Report the MLX backend
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          from importlib.metadata import version
+          print("mlx", version("mlx"))
+          print("default_device", mx.default_device())
+          print("metal available", mx.metal.is_available())
+          PY
+      - name: MLX module import smoke
+        run: |
+          python -c "import unsloth_zoo.mlx_utils; print('mlx_utils OK')"
+          python -c "import unsloth_zoo.mlx_trainer; print('mlx_trainer OK')"
+          python -c "import unsloth_zoo.mlx.preference; print('mlx.preference OK')"
+      - name: Preference suite (torch-simulated MLX)
+        run: python -m pytest tests/test_mlx_preference.py -q
+      - name: Preference on REAL MLX (Metal)
+        # The suite above installs the torch shim unconditionally, so it cannot
+        # reach real MLX even here. This driver imports the module directly.
+        run: python tests/pr1110_real_mlx_driver.py
