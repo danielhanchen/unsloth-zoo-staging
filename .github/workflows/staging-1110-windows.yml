@@ -1,6 +1,9 @@
 name: "staging 1110 windows"
 
 on:
+  push:
+    branches:
+      - pr-1110-fix-xplat
   pull_request:
   workflow_dispatch:
 
