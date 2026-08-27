@@ -2,8 +2,7 @@ name: "staging-1011 windows-latest"
 on:
   push:
     branches: ["pr-1011-xplat-ci"]
-    paths-ignore:
-      - '**/*.md'
+    paths-ignore: ['**/*.md']
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,11 +14,12 @@ defaults:
     shell: bash
 jobs:
   test:
+    name: Import smoke on Windows (mlx absent, as on every non-Apple host)
     runs-on: windows-latest
     timeout-minutes: 30
     env:
+      UNSLOTH_ZOO_DISABLE_GPU_INIT: '1'
       UNSLOTH_COMPILE_DISABLE: '1'
-      UNSLOTH_IS_PRESENT: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,5 +27,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
-      - run: rc=0; PYTHONPATH=studio/backend python -m pytest tests/test_mlx_preference.py tests/test_mlx_trainer_internals.py tests/test_mlx_training_e2e_metal.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && ! grep -qE "^(FAILED|ERROR) " pytest_out.txt; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && ! grep -qE "^ERROR " pytest_out.txt; then tot=$(grep -cE "^FAILED " pytest_out.txt); dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt); if [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; fi; exit "$rc"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .[core]
+          pip install pytest==9.0.3
+      # This PR only changes unsloth_zoo/mlx/*. The Windows contract is that a
+      # non-Apple install still imports and never loads either changed file.
+      - name: unsloth_zoo imports and does not pull in the changed modules
+        run: |
+          python -c "
+          import sys, unsloth_zoo
+          bad = [m for m in ('unsloth_zoo.mlx.trainer','unsloth_zoo.mlx.preference') if m in sys.modules]
+          print('loaded changed modules:', bad or 'NONE')
+          assert not bad, bad
+          print('unsloth_zoo import OK on Windows without mlx')
+          "
