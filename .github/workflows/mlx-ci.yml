@@ -45,7 +45,11 @@ jobs:
         # needed: with only `pinned` the pin goes stale unnoticed, and with only
         # `latest` the supported combination is never exercised on Apple hardware
         # at all, since PR runs are opt-in behind the `mlx` label.
-        mlx: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["pinned", "latest"]' || '["pinned"]') }}
+        # STAGING ONLY: both legs run on the pull_request event too. PR 1120 claims
+        # support for architectures that only exist in mlx-vlm 0.6.17, which the
+        # pinned leg cannot reach, so the review needs both the environment a user
+        # actually gets and the one the feature requires.
+        mlx: ["pinned", "latest"]
     # The detection leg reports, it does not gate. It deliberately installs
     # combinations nobody supports yet, so letting it fail the workflow would
     # turn every upstream release into a red main until someone bumps the pin.
@@ -124,6 +128,40 @@ jobs:
               except Exception as error:
                   print(f"{name}: {error}")
           PY
+
+      - name: PR 1120 review probe - can this environment reach the architectures?
+        # STAGING ONLY. PR 1120 adds qwen4_exp and glm5_next to the mlx-vlm text
+        # path allow-list. Those model packages first ship in mlx-vlm 0.6.17, which
+        # requires transformers>=5.14 against this repo's <=5.5.0 cap. This prints
+        # what the leg actually resolved, so the review can say whether a supported
+        # install can load them at all. Never fails the job; it reports.
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import importlib.util as u
+          from importlib.metadata import version
+          for name in ("mlx", "mlx-lm", "mlx-vlm", "transformers"):
+              try:
+                  print(f"{name}=={version(name)}")
+              except Exception as error:
+                  print(f"{name}: {error}")
+          import mlx.core as mx
+          print("metal:", mx.metal.is_available())
+          for mod in ("mlx_vlm.models.qwen4_exp", "mlx_vlm.models.glm5_next",
+                      "mlx_vlm.models.qwen3_5", "mlx_vlm.models.gated_delta",
+                      "mlx_vlm.models.text_models.gated_delta",
+                      "mlx_lm.models.gated_delta"):
+              try:
+                  print(f"{mod}: {'present' if u.find_spec(mod) else 'ABSENT'}")
+              except Exception as error:
+                  print(f"{mod}: ABSENT ({type(error).__name__})")
+          PY
+
+      - name: tests/test_mlx_gated_delta_vjp.py
+        # STAGING ONLY. This file carries 9 of PR 1120's 10 new tests and is run by
+        # no lane in either workflow, so on the PR as it stands nothing executes
+        # them. Running it here is the point of the exercise.
+        run: python -m pytest tests/test_mlx_gated_delta_vjp.py -v -rs
 
       - name: MLX module import smoke
         run: |
