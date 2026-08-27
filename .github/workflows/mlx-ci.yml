@@ -129,6 +129,8 @@ jobs:
       - name: PR 1120 backwards-compat probe (Metal)
         # STAGING ONLY. Does the PR move any number for qwen3_5 / qwen3_next /
         # kimi_linear, which already worked, on the real Metal backend?
+        # Reports: a problem in this review harness must not hide the suites below.
+        continue-on-error: true
         run: python -m pytest tests/test_pr1120_backcompat_metal.py -v -rs -s
 
       - name: tests/test_mlx_gated_delta_vjp.py

@@ -227,15 +227,22 @@ def test_training_gradient_is_unchanged_by_the_pr(pristine):
 def test_index_window_is_load_bearing_on_metal(monkeypatch):
     """The motivating failure, reproduced and fixed, on the real backend."""
     monkeypatch.syspath_prepend(ZOO_ROOT)
-    # Importing the real package pulls optional extras (bitsandbytes) into
-    # sys.modules; the repo's leak guard fails the test unless they are restored.
+    # Importing the real package both ADDS modules and REPLACES stubs other test
+    # infrastructure installed (bitsandbytes is the one that bites). The repo's
+    # leak guard checks identity, so restore by identity: snapshot first, then put
+    # back anything whose object changed, and drop anything newly added.
     before = dict(sys.modules)
     for name in [n for n in sys.modules if n.startswith("unsloth_zoo")]:
         monkeypatch.delitem(sys.modules, name, raising=False)
-    from unsloth_zoo.mlx.utils import (acquire_mlx_training_patches,
-                                       release_mlx_training_patches)
-    for name in [n for n in sys.modules if n not in before]:
-        monkeypatch.delitem(sys.modules, name, raising=False)
+    try:
+        from unsloth_zoo.mlx.utils import (acquire_mlx_training_patches,
+                                           release_mlx_training_patches)
+    finally:
+        for name, was in before.items():
+            if sys.modules.get(name) is not was:
+                monkeypatch.setitem(sys.modules, name, was)
+        for name in [n for n in list(sys.modules) if n not in before]:
+            monkeypatch.delitem(sys.modules, name, raising=False)
 
     x = mx.random.normal((2, 16, 32))
     w = mx.random.normal((32, 8))
