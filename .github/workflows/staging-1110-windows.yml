@@ -19,6 +19,7 @@ jobs:
     env:
       UNSLOTH_IS_PRESENT: '1'
       UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_ALLOW_CPU: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
