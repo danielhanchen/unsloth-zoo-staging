@@ -2572,6 +2572,7 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     # Muse Glimmer's vision tower is not compile-patched and opens with
     # `grid_thw.tolist()`.
     "muse_glimmer",
+    "glm5_next",
 })
 
 
@@ -3020,6 +3021,7 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen3_vl_moe",
     "qwen3_5",
     "qwen3_5_moe",
+    "qwen4_exp",
 })
 _VLM_POSITION_GENERATING_MODEL_TYPES = (
     _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}
