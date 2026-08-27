@@ -1110,9 +1110,7 @@ def _gguf_export_scaffold(
     monkeypatch.setattr(mutils, "save_merged_model", fake_save_merged_model)
     monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: mmproj)
     monkeypatch.setattr(
-        mutils,
-        "_prepare_mlx_gguf_export_directory",
-        lambda path, model=None, replay_sanitizers=True: 0,
+        mutils, "_prepare_vlm_gguf_export_directory", lambda path, model=None: 0
     )
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "unused"))
     monkeypatch.setattr(
