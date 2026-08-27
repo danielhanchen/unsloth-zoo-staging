@@ -45,7 +45,8 @@ jobs:
         # needed: with only `pinned` the pin goes stale unnoticed, and with only
         # `latest` the supported combination is never exercised on Apple hardware
         # at all, since PR runs are opt-in behind the `mlx` label.
-        mlx: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["pinned", "latest"]' || '["pinned"]') }}
+        # STAGING ONLY: both legs on the pull_request event as well.
+        mlx: ["pinned", "latest"]
     # The detection leg reports, it does not gate. It deliberately installs
     # combinations nobody supports yet, so letting it fail the workflow would
     # turn every upstream release into a red main until someone bumps the pin.
@@ -124,6 +125,11 @@ jobs:
               except Exception as error:
                   print(f"{name}: {error}")
           PY
+
+      - name: tests/test_mlx_gated_delta_vjp.py
+        # STAGING ONLY. Carries PR 1120's new tests, including the training-window
+        # regression tests, and runs in no lane upstream.
+        run: python -m pytest tests/test_mlx_gated_delta_vjp.py -v -rs
 
       - name: MLX module import smoke
         run: |
