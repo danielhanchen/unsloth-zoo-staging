@@ -132,10 +132,19 @@ jobs:
         run: python -m pytest tests/test_mlx_preference.py -v -rs
 
       - name: tests/test_mlx_training_e2e_metal.py (preference half)
-        # The only place MLXDPOTrainer / MLXORPOTrainer meet real Metal.
+        # The only place MLXDPOTrainer / MLXORPOTrainer meet real Metal. Those
+        # tests arrived with #1011, so at this PR's merge base the selection is
+        # empty; exit 5 is pytest's "no tests ran", which is a fact about the
+        # base, not a failure. A real failure (exit 1) still fails the job.
         run: |
+          rc=0
           python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs \
-            -k "preference or dpo or orpo or text_loss"
+            -k "preference or dpo or orpo or text_loss" || rc=$?
+          if [ "$rc" = "5" ]; then
+            echo "no preference e2e test exists at this base"
+            rc=0
+          fi
+          exit "$rc"
 
       - name: tests/test_mlx_shape_guard.py
         # The preference batch planner feeds the shape guard.
