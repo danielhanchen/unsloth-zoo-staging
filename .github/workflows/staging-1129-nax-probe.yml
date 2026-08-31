@@ -1,0 +1,48 @@
+# Disposable staging-only workflow for unslothai/unsloth-zoo#1129. Not for upstream:
+# it exists to answer the questions the PR's own @metal_only tests leave open on hosted
+# Apple silicon. Deleted with the branch.
+
+name: "staging-1129 NAX guard probe"
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: nax-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: NAX guard probe (Apple Silicon, no neural accelerator)
+    # Only this PR's branch; the staging repo carries other disposable branches.
+    if: github.head_ref == 'pr-1129-ci' || github.ref_name == 'pr-1129-ci'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo with MLX extras
+        # torch first for the same reason mlx-ci.yml does it: pyproject gates torch off
+        # on darwin+arm64, but the package imports it on paths this probe can touch.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+
+      - name: Record the resolved MLX runtime
+        run: |
+          python -c "import mlx.core as mx, platform; print(platform.platform(), platform.machine()); print('metal', mx.metal.is_available(), mx.default_device())"
+          python -c "from importlib.metadata import version; print('mlx', version('mlx'))"
+
+      - name: NAX guard probe
+        run: python tools/nax_probe.py
