@@ -1,0 +1,142 @@
+name: "staging-1110-head real MLX on Apple Silicon"
+
+# Disposable staging lane for unslothai/unsloth_zoo#1110.
+#
+# The shipped mlx-ci.yml is the only Apple Silicon lane, and it never runs
+# tests/test_mlx_preference.py; the Linux job that does runs it against the
+# torch shim. So nothing on real hardware covers this PR. This job installs
+# real mlx on an M-series runner and exercises the changed surfaces there.
+
+on:
+  push:
+    branches: ["pr-1110-head-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-metal:
+    runs-on: macos-15   # Apple Silicon hosted runner
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo with MLX extras
+        # pyproject gates torch OFF on darwin+arm64, but tests/mlx_simulation/
+        # imports it unconditionally, so install the wheel explicitly first.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+
+      - name: Assert this is real mlx, not the torch shim
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          origin = mx.__file__ or ""
+          assert "mlx_simulation" not in origin, f"shim, not real mlx: {origin}"
+          assert int(mx.array([1, 2, 3]).sum()) == 6, "mlx cannot add"
+          print("real mlx at", origin)
+          PY
+
+      - name: Import smoke for the changed package
+        # mlx-ci.yml still imports unsloth_zoo.mlx_loader and friends, which the
+        # package refactor removed; these are the paths that exist today.
+        run: |
+          python -c "import unsloth_zoo.mlx.loader; print('mlx.loader OK')"
+          python -c "import unsloth_zoo.mlx.compile; print('mlx.compile OK')"
+          python -c "import unsloth_zoo.mlx.utils; print('mlx.utils OK')"
+          python -c "import unsloth_zoo.mlx.preference; print('mlx.preference OK')"
+          python -c "import unsloth_zoo.mlx.trainer; print('mlx.trainer OK')"
+
+      - name: Preference tokenization against a real tokenizer under real mlx
+        # tests/test_mlx_preference.py forces the torch shim in an autouse
+        # fixture, so it cannot reach real mlx even here. This drives the PR's
+        # headline paths (implicit prompt recovery, DPO independent encoding,
+        # ORPO combined encoding) on a real Qwen3 tokenizer with real mlx loaded.
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          from transformers import AutoTokenizer
+          from unsloth_zoo.mlx.preference import (
+              resolve_preference_length_policy, tokenize_preference_row,
+          )
+          from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXORPOConfig
+
+          tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+
+          # strict=True rows are well formed and must tokenize; strict=False rows
+          # are the narrow shapes the PR documents as refusable, so a clear
+          # refusal there is a pass and only a crash-free result is required.
+          rows = [
+              (True, {"prompt": "What is 2+2?", "chosen": " Four.", "rejected": " Five."}),
+              (False, {"chosen": "foobar", "rejected": "foobaz"}),   # mid-token prefix
+              (False, {"chosen": "abc", "rejected": "abd"}),         # one-token prompt
+              (True, {"prompt": [{"role": "user", "content": "hi"}],
+                      "chosen": [{"role": "assistant", "content": "hello"}],
+                      "rejected": [{"role": "assistant", "content": "yo"}]}),
+              (True, {"chosen": [{"role": "user", "content": "hi"},
+                                 {"role": "assistant", "content": "hello"}],
+                      "rejected": [{"role": "user", "content": "hi"},
+                                   {"role": "assistant", "content": "yo"}]}),
+          ]
+
+          failures = []
+          for kind, config in (("dpo", MLXDPOConfig), ("orpo", MLXORPOConfig)):
+              policy = resolve_preference_length_policy(
+                  kind, config(), max_seq_length=1024,
+              )
+              for index, (strict, row) in enumerate(rows):
+                  try:
+                      out = tokenize_preference_row(tok, row, length_policy=policy)
+                  except ValueError as error:
+                      print(f"{kind} row {index}: refused: {error}")
+                      if strict:
+                          failures.append(f"{kind} row {index}: refused: {error}")
+                      continue
+                  except Exception as error:
+                      failures.append(f"{kind} row {index}: {type(error).__name__}: {error}")
+                      continue
+                  print(f"{kind} row {index}: "
+                        f"prompt={len(out.chosen_prompt_ids)}/{len(out.rejected_prompt_ids)} "
+                        f"response={len(out.chosen_ids)}/{len(out.rejected_ids)} "
+                        f"total={len(out.chosen)}/{len(out.rejected)}")
+                  # a branch with no response tokens trains on nothing
+                  if not out.chosen_ids or not out.rejected_ids:
+                      failures.append(f"{kind} row {index}: empty response branch")
+                  if len(out.chosen) > policy.max_seq_length:
+                      failures.append(f"{kind} row {index}: chosen exceeds max_seq_length")
+
+          if failures:
+              raise SystemExit("real-mlx preference failures:\n" + "\n".join(failures))
+          print("all rows tokenized under real mlx")
+          PY
+
+      - name: tests/test_mlx_preference.py
+        # Runs against the torch shim by design (autouse fixture), but on macOS
+        # arm64 python 3.12 rather than only the Linux lane.
+        run: python -m pytest tests/test_mlx_preference.py -v -rs
+
+      - name: tests/test_mlx_training_e2e_metal.py (preference half)
+        # The only place MLXDPOTrainer / MLXORPOTrainer meet real Metal.
+        run: |
+          python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs \
+            -k "preference or dpo or orpo or text_loss"
+
+      - name: tests/test_mlx_shape_guard.py
+        # The preference batch planner feeds the shape guard.
+        run: python -m pytest tests/test_mlx_shape_guard.py -v -rs
