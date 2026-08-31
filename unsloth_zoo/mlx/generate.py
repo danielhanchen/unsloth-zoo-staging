@@ -23,7 +23,9 @@ import importlib
 import inspect
 import math
 import os
+import sys
 import threading
+import types
 import warnings
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -650,6 +652,172 @@ def _generation_cache_hygiene():
                 )
             except BaseException:
                 pass
+
+
+_ARRAYS_CACHE_ADVANCE_LOCK = threading.Lock()
+_ARRAYS_CACHE_ADVANCE_RESOLVED = False
+_VLM_ARRAYS_CACHE_ADVANCE_RESOLVED = False
+
+
+def _adopt_deferred_metadata(cache):
+    """Move a cache built before the patch onto the deferred slots.
+
+    Only a field the descriptors already mediate is moved. Installation assigns the
+    two properties one at a time, and a thread reading a cache in that window would
+    otherwise strip the field whose descriptor is not in place yet into a private
+    slot nothing reads, leaving ``cache.left_padding`` raising ``AttributeError``.
+    """
+
+    state = cache.__dict__
+    for name in ("lengths", "left_padding"):
+        if name in state and isinstance(getattr(type(cache), name, None), property):
+            state["_" + name] = state.pop(name)
+            state["_" + name + "_pending"] = 0
+
+
+def _deferred_metadata(name):
+    stored = "_" + name
+    pending = stored + "_pending"
+
+    def read(self):
+        _adopt_deferred_metadata(self)
+        value = getattr(self, stored)
+        outstanding = getattr(self, pending)
+        if outstanding and value is not None:
+            value = value - outstanding
+            setattr(self, stored, value)
+            setattr(self, pending, 0)
+        return value
+
+    def write(self, value):
+        _adopt_deferred_metadata(self)
+        setattr(self, stored, value)
+        setattr(self, pending, 0)
+
+    return property(read, write)
+
+
+def _deferred_advance(self, N):
+    _adopt_deferred_metadata(self)
+    if not isinstance(N, int):
+        # Stock accepts whatever the array subtraction accepts, including a
+        # per-row array. That cannot go in a Python counter, and testing it for
+        # truth later would force the sync this patch exists to avoid, so keep
+        # the stock arithmetic for it.
+        if self._lengths is not None:
+            self.lengths = self.lengths - N
+        if self._left_padding is not None:
+            self.left_padding = self.left_padding - N
+        return
+    if self._lengths is not None:
+        self._lengths_pending += N
+    if self._left_padding is not None:
+        self._left_padding_pending += N
+
+
+# Compared against the installed mlx-lm, never installed, never called. Comparing the
+# compiled body and signature identifies the implementation this patch reproduces
+# without depending on source files or formatting, and separates it from one whose
+# `advance` means something else.
+def _stock_advance(self, N):
+    if self.lengths is not None:
+        self.lengths -= N
+    if self.left_padding is not None:
+        self.left_padding -= N
+
+
+def _advance_identity(function):
+    code = function.__code__
+    return (
+        inspect.signature(function),
+        code.co_code,
+        code.co_consts,
+        code.co_names,
+        code.co_varnames,
+    )
+
+
+def _has_replaceable_advance(arrays_cache):
+    """Identify the exact ``advance`` this patch reproduces."""
+
+    if any(
+        hasattr(type(inspect.getattr_static(arrays_cache, name, None)), "__set__")
+        for name in ("lengths", "left_padding")
+    ):
+        return False
+    # A plain attribute read unwraps staticmethod and classmethod, so a candidate
+    # whose `advance` is not an ordinary method would be judged on a body that is
+    # bound differently from the one being installed.
+    if not isinstance(
+        inspect.getattr_static(arrays_cache, "advance", None), types.FunctionType
+    ):
+        return False
+    return _advance_identity(arrays_cache.advance) == _advance_identity(_stock_advance)
+
+
+def _install_deferred_metadata(arrays_cache):
+    """Put the deferred slots, descriptors and ``advance`` on one cache class."""
+
+    arrays_cache._lengths = None
+    arrays_cache._lengths_pending = 0
+    arrays_cache._left_padding = None
+    arrays_cache._left_padding_pending = 0
+    arrays_cache.lengths = _deferred_metadata("lengths")
+    arrays_cache.left_padding = _deferred_metadata("left_padding")
+    # Keep the replaced implementation reachable, and leave a marker, so a patched
+    # class is recognisable when someone is diffing behaviour against upstream.
+    arrays_cache._unsloth_stock_advance = arrays_cache.advance
+    arrays_cache.advance = _deferred_advance
+    arrays_cache._unsloth_advance_patched = True
+
+
+def _install_arrays_cache_advance_fix():
+    """Keep mlx-lm's ``ArraysCache.advance`` from stranding a Metal buffer per call.
+
+    ``advance`` rebinds ``lengths``/``left_padding`` with ``-=``, building an
+    unevaluated subtract whose integer operand is materialised as a scalar array that
+    owns a live buffer. The metadata is absent from ``ArraysCache.state``, and during
+    batched decoding only the cache owning the shared mask has its chain forced each
+    step, so every other linear-attention layer strands one buffer per token until
+    Metal refuses to allocate. Deferring the subtraction into a Python counter keeps
+    the arithmetic and allocates nothing until the value is read.
+
+    mlx-vlm is visited too. It re-exports mlx-lm's class up to 0.5.x, vendors its own
+    copy carrying this same body from 0.6.4, and only defers for itself from 0.6.17,
+    so on the pinned range the vision batch path leaks through a second class that
+    patching mlx-lm alone does not reach. It is visited only once it is already
+    imported, so a text-only run does not pull in an optional dependency.
+    """
+
+    global _ARRAYS_CACHE_ADVANCE_RESOLVED, _VLM_ARRAYS_CACHE_ADVANCE_RESOLVED
+    with _ARRAYS_CACHE_ADVANCE_LOCK:
+        if _ARRAYS_CACHE_ADVANCE_RESOLVED and _VLM_ARRAYS_CACHE_ADVANCE_RESOLVED:
+            return
+        seen = []
+        if not _ARRAYS_CACHE_ADVANCE_RESOLVED:
+            try:
+                arrays_cache = importlib.import_module("mlx_lm.models.cache").ArraysCache
+                replaceable = _has_replaceable_advance(arrays_cache)
+            except Exception:
+                # A failed attempt is not a decision: retry on the next call.
+                return
+            # Any other body keeps stock.
+            if replaceable:
+                _install_deferred_metadata(arrays_cache)
+            seen.append(arrays_cache)
+            _ARRAYS_CACHE_ADVANCE_RESOLVED = True
+        if not _VLM_ARRAYS_CACHE_ADVANCE_RESOLVED and "mlx_vlm" in sys.modules:
+            try:
+                vlm_cache = importlib.import_module("mlx_vlm.models.cache").ArraysCache
+                # Up to mlx-vlm 0.5.x this is mlx-lm's class, already decided above.
+                replaceable = vlm_cache not in seen and _has_replaceable_advance(
+                    vlm_cache
+                )
+            except Exception:
+                return
+            if replaceable:
+                _install_deferred_metadata(vlm_cache)
+            _VLM_ARRAYS_CACHE_ADVANCE_RESOLVED = True
 
 
 class _StopStringScanner:
@@ -1699,6 +1867,7 @@ def generate_batch(
             if is_vlm
             else "Text batched generation requires a tokenizer."
         )
+    _install_arrays_cache_advance_fix()
     with generation_mode(model):
         with _generation_cache_hygiene():
             adapter = (
