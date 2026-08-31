@@ -616,7 +616,7 @@ from .preference import (
     encode_generation_prompt_text,
     make_dpo_loss_fn,
     make_orpo_loss_fn,
-    make_preference_eval_fn,
+    resolve_preference_length_policy,
 )
 from .compile import (
     build_compile_policy,
@@ -1330,10 +1330,10 @@ class MLXTrainingConfig:
             "disable_dropout",
             "reference_free",
             "label_smoothing",
-            "generate_during_eval",
-            "num_generation_prompts",
-            "generation_max_tokens",
-            "generation_temperature",
+            "max_length",
+            "max_prompt_length",
+            "max_completion_length",
+            "truncation_mode",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1345,6 +1345,11 @@ class MLXTrainingConfig:
         self._unsloth_mlx_warmup_steps_explicit = (
             "warmup_steps" in provided and not copied_default_warmup_with_ratio
         )
+        # The preference configs default max_length to TRL's 1024, which is below
+        # the usual max_seq_length, so a run that predates those fields would be
+        # budgeted more tightly than before without ever saying so. Record whether
+        # the caller chose the value so the resolver can tell the two apart.
+        self._unsloth_mlx_max_length_explicit = "max_length" in provided
         if self.compile_max_variants is not None:
             resolve_compile_max_variants(self.compile_max_variants)
 
@@ -1389,16 +1394,21 @@ class MLXTrainingConfig:
 
 @dataclass(init=False)
 class MLXORPOConfig(MLXTrainingConfig):
-    """Configuration owned by MLXORPOTrainer."""
+    """Configuration owned by MLXORPOTrainer.
+
+    max_completion_length only applies to encoder-decoder models, so it is inert
+    here. A branch whose capped prompt plus the longer answer still overruns
+    max_length has its answer sliced to max_length minus max_prompt_length
+    instead, which trims the answer's tail when max_prompt_length stands above
+    max_length.
+    """
 
     beta: float = field(default=0.1, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
-    # Batched decoding is not batch-invariant, so a prompt can decode
-    # differently depending on what shares its batch.
-    generate_during_eval: bool = field(default=False, kw_only=True)
-    num_generation_prompts: int = field(default=8, kw_only=True)
-    generation_max_tokens: int = field(default=128, kw_only=True)
-    generation_temperature: float = field(default=0.0, kw_only=True)
+    max_length: int | None = field(default=1024, kw_only=True)
+    max_prompt_length: int | None = field(default=512, kw_only=True)
+    max_completion_length: int | None = field(default=None, kw_only=True)
+    truncation_mode: str = field(default="keep_end", kw_only=True)
 
 
 @dataclass(init=False)
@@ -1409,11 +1419,10 @@ class MLXDPOConfig(MLXTrainingConfig):
     reference_free: bool = field(default=False, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
-    # As MLXORPOConfig; a referenced run also samples the frozen base policy.
-    generate_during_eval: bool = field(default=False, kw_only=True)
-    num_generation_prompts: int = field(default=8, kw_only=True)
-    generation_max_tokens: int = field(default=128, kw_only=True)
-    generation_temperature: float = field(default=0.0, kw_only=True)
+    max_length: int | None = field(default=1024, kw_only=True)
+    max_prompt_length: int | None = field(default=512, kw_only=True)
+    max_completion_length: int | None = field(default=None, kw_only=True)
+    truncation_mode: str = field(default="keep_end", kw_only=True)
 
 
 def _shape_guard_report(
@@ -8050,7 +8059,10 @@ class MLXTrainer:
                 train_dataset,
                 self.tokenizer,
                 batch_size=args.per_device_train_batch_size,
-                max_seq_length=args.max_seq_length,
+                length_policy=resolve_preference_length_policy(
+                    self.preference_kind, args,
+                    max_seq_length=args.max_seq_length,
+                ),
                 num_batches=total_batches_needed,
                 num_epochs=preference_epochs,
                 grad_accum=args.gradient_accumulation_steps,

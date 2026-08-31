@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import sys
 import types
+import warnings
 
 import pytest
 
@@ -78,6 +79,73 @@ class MappingTokenizer:
         return self.mapping[text]
 
 
+class CapturingTokenizer(Tokenizer):
+    """Records every rendering, so which messages were rendered is observable."""
+
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        return super().apply_chat_template(messages, **kwargs)
+
+
+class SpecialTokenizer(Tokenizer):
+    """Character-level, but its add_special_tokens actually adds a special.
+
+    The tokenizers above accept the flag and ignore it, so nothing they encode
+    can tell an explicit override from the default.
+    """
+
+    bos_token = "<bos>"
+    bos_token_id = 1
+    trailing_special = False
+
+    def encode(self, text, add_special_tokens=True):
+        values = super().encode(text, add_special_tokens)
+        if add_special_tokens:
+            values.insert(0, self.bos_token_id)
+            if self.trailing_special:
+                values.append(self.eos_token_id)
+        return values
+
+
+class TrailingSpecialTokenizer(SpecialTokenizer):
+    """Also closes with its EOS, as tokenizers with add_eos_token set do."""
+
+    trailing_special = True
+
+
+class TemplateScriptTokenizer(Tokenizer):
+    """Renders a row's three texts from a script and merges the given pairs.
+
+    A template can re-render the prompt's final turn once a completion follows
+    it, leaving the prompt no longer a text prefix of one branch or of either,
+    and a merge stops a character prefix from being a token prefix. Scripting
+    the renderings is the smallest fixture that reaches those branches.
+    """
+
+    def __init__(self, renders, merges=()):
+        self.renders = list(renders)
+        self.merges = tuple(merges)
+
+    def encode(self, text, add_special_tokens=True):
+        values = []
+        position = 0
+        while position < len(text):
+            pair = text[position:position + 2]
+            if pair in self.merges:
+                values.append(46 + self.merges.index(pair))
+                position += 2
+            else:
+                values.append(3 + (ord(text[position]) % 43))
+                position += 1
+        return values
+
+    def apply_chat_template(self, messages, **kwargs):
+        return self.renders.pop(0)
+
+
 def rows(count=6):
     return [
         {"prompt": f"question {index}: ", "chosen": "yes", "rejected": "no"}
@@ -85,10 +153,21 @@ def rows(count=6):
     ]
 
 
+def policy(kind="dpo", **kwargs):
+    from unsloth_zoo.mlx.preference import PreferenceLengthPolicy
+    options = dict(
+        max_length=64, max_prompt_length=None, max_completion_length=None,
+        truncation_mode="keep_end",
+    )
+    options.update(kwargs)
+    options.setdefault("max_seq_length", options["max_length"])
+    return PreferenceLengthPolicy(kind=kind, **options)
+
+
 def build_plan(**kwargs):
     from unsloth_zoo.mlx.preference import create_preference_batch_plan
     options = dict(
-        batch_size=2, max_seq_length=64, dataset_order="sequential",
+        batch_size=2, length_policy=policy(), dataset_order="sequential",
         grad_accum=2,
     )
     options.update(kwargs)
@@ -144,10 +223,24 @@ def test_default_order_randomizes_length_batches_from_first_visit():
         for size in range(1, 8)
     ]
     plan = create_preference_batch_plan(
-        dataset, Tokenizer(), batch_size=2, max_seq_length=64,
+        dataset, Tokenizer(), batch_size=2, length_policy=policy(),
         num_batches=4, grad_accum=1, dataset_order="default", seed=1,
     )
     assert plan.schedule == ((6,), (4, 5), (0, 1), (2, 3))
+
+
+def test_a_refused_row_names_its_index():
+    from unsloth_zoo.mlx.preference import create_preference_batch_plan
+
+    dataset = rows(3)
+    dataset[1] = {"prompt": "", "chosen": "y", "rejected": "n"}
+    with pytest.raises(ValueError, match="dataset row 1") as error:
+        create_preference_batch_plan(
+            dataset, Tokenizer(), batch_size=1, length_policy=policy(max_length=8),
+            num_batches=1, grad_accum=1, dataset_order="sequential", append_eos=False,
+        )
+    assert "anything before it to predict from" in str(error.value)
+    assert isinstance(error.value.__cause__, ValueError)
 
 
 def test_prompt_only_eos_does_not_consume_first_response_token():
@@ -161,7 +254,7 @@ def test_prompt_only_eos_does_not_consume_first_response_token():
             return values
 
     tokenized = tokenize_preference_row(
-        PromptEOSTokenizer(), rows(1)[0], max_seq_length=64,
+        PromptEOSTokenizer(), rows(1)[0], length_policy=policy(),
     )
     expected_first = Tokenizer().encode("question 0: yes")[len(
         Tokenizer().encode("question 0: ")
@@ -189,7 +282,7 @@ def test_prompt_only_eos_does_not_consume_first_response_token():
         ),
     ],
 )
-def test_boundary_merges_preserve_each_branch(mapping, row, expected):
+def test_orpo_boundary_merges_preserve_each_branch(mapping, row, expected):
     from unsloth_zoo.mlx.preference import (
         create_preference_batch_plan,
         tokenize_preference_row,
@@ -197,14 +290,14 @@ def test_boundary_merges_preserve_each_branch(mapping, row, expected):
 
     tokenizer = MappingTokenizer(mapping)
     tokenized = tokenize_preference_row(
-        tokenizer, row, max_seq_length=8,
+        tokenizer, row, length_policy=policy("orpo", max_length=8),
     )
     chosen, rejected, prompt_lengths = expected
     assert tokenized.chosen == chosen
     assert tokenized.rejected == rejected
 
     _, lengths, _ = create_preference_batch_plan(
-        [row], tokenizer, batch_size=1, max_seq_length=8,
+        [row], tokenizer, batch_size=1, length_policy=policy("orpo", max_length=8),
         num_batches=1, grad_accum=1, dataset_order="sequential",
     )[0]
     assert lengths.tolist() == [
@@ -224,9 +317,28 @@ def test_sft_and_preference_share_boundary_merge_tolerance():
     assert labels == [-100, 3, 4]
 
 
-def test_prompt_mismatch_before_the_boundary_is_rejected():
+
+
+
+def test_sft_rejects_a_prompt_mismatch_before_the_boundary():
+    from unsloth_zoo.mlx.utils import _tokenize_mlx_prompt_completion
+
+    # SFT tokenizes the prompt from the same text it re-tokenizes, so a
+    # mismatch earlier than the last token is a real error rather than a
+    # boundary that has to land mid-token.
+    with pytest.raises(ValueError, match="differ before the final prompt token"):
+        _tokenize_mlx_prompt_completion(
+            MappingTokenizer({"abc": [1, 2, 3], "abcd": [9, 2, 4, 5]}),
+            "abc", "d", completion_only_loss=True,
+        )
+
+
+def test_orpo_steps_back_one_token_the_way_trl_does():
     from unsloth_zoo.mlx.preference import tokenize_preference_row
 
+    # ORPOTrainer.build_tokenized_answer drops one prompt token whenever the
+    # prompt is not a token prefix and verifies nothing further, which is what
+    # keeps a recovered prompt that lands mid-token trainable.
     tokenizer = MappingTokenizer(
         {
                 "abc": [1, 2, 3],
@@ -235,35 +347,347 @@ def test_prompt_mismatch_before_the_boundary_is_rejected():
         }
     )
 
-    with pytest.raises(ValueError, match="differ before the final prompt token"):
+    tokenized = tokenize_preference_row(
+        tokenizer,
+        {"prompt": "abc", "chosen": "d", "rejected": "e"},
+        length_policy=policy("orpo", max_length=8),
+    )
+    assert (tokenized.chosen_prompt_ids, tokenized.chosen_ids) == ((9, 2), (4, 5))
+    assert (tokenized.rejected_prompt_ids, tokenized.rejected_ids) == ((8, 2), (6, 7))
+
+
+def test_orpo_refuses_two_prompts_that_disagree_beyond_a_merge():
+    from unsloth_zoo.mlx.preference import tokenize_preference_row
+
+    # One differing prompt token is a tokenizer merge, which the test above
+    # keeps trainable. Two is not reachable that way: the branches would be
+    # answering different contexts, and ORPOTrainer.tokenize_row refuses the
+    # row rather than averaging across them.
+    tokenizer = MappingTokenizer(
+        {
+            "abc": [1, 2, 3],
+            "abcd": [9, 7, 4, 5],
+            "abce": [8, 6, 6, 7],
+        }
+    )
+
+    with pytest.raises(ValueError, match="only the last prompt token may move"):
         tokenize_preference_row(
             tokenizer,
             {"prompt": "abc", "chosen": "d", "rejected": "e"},
-            max_seq_length=8,
+            length_policy=policy("orpo", max_length=8),
         )
 
 
-def test_long_prompt_truncation_keeps_response_and_prompt_end():
+# Distinct characters, so a head slice can never pass for a tail slice.
+PROMPT, CHOSEN, REJECTED = "abcdefghijklmnopqrst", "uvwxyzABCD", "EFGH"
+LONG_ROW = {"prompt": PROMPT, "chosen": CHOSEN, "rejected": REJECTED}
+SWAPPED = {"prompt": PROMPT, "chosen": REJECTED, "rejected": CHOSEN}
+TURN = [{"role": "user", "content": "Q1"}, {"role": "assistant", "content": "A1"}]
+ANSWER, OTHER = {"role": "assistant", "content": "A2"}, {"role": "assistant", "content": "A3"}
+
+
+def encoded(text, *, eos=False):
+    ids = tuple(Tokenizer().encode(text))
+    return ids + (Tokenizer.eos_token_id,) if eos else ids
+
+
+def tokenize(row=None, kind="dpo", tokenizer=None, append_eos=True, **kwargs):
     from unsloth_zoo.mlx.preference import tokenize_preference_row
 
-    row = {"prompt": "abcdefghijklmnopqrstuvwxyz", "chosen": "GOOD", "rejected": "BAD"}
-    tokenized = tokenize_preference_row(Tokenizer(), row, max_seq_length=8)
-    assert tokenized.chosen_prompt_ids and tokenized.rejected_prompt_ids
-    assert tokenized.chosen_ids and tokenized.rejected_ids
-    assert len(tokenized.chosen) <= 8
-    assert len(tokenized.rejected) <= 8
+    return tokenize_preference_row(
+        tokenizer or Tokenizer(), LONG_ROW if row is None else row,
+        length_policy=policy(kind, **kwargs), append_eos=append_eos)
+
+
+def resolved(kind="dpo", **kwargs):
+    from unsloth_zoo.mlx.preference import resolve_preference_length_policy
+
+    options = dict(max_length=1024, max_prompt_length=512,
+                   max_completion_length=None, truncation_mode="keep_end")
+    options.update(kwargs)
+    return resolve_preference_length_policy(
+        kind, types.SimpleNamespace(**options),
+        max_seq_length=options.pop("max_seq_length", 2048))
+
+
+@pytest.mark.parametrize(
+    "kind,options,chosen,rejected,row",
+    [
+        # DPO caps the prompt keep-end and each completion keep-start, then
+        # truncates the pair, eating a response head only once its prompt is gone.
+        ("dpo", dict(max_prompt_length=5, max_completion_length=3),
+         ((-5, None), (None, 3)), ((-5, None), (None, 3)), LONG_ROW),
+        ("dpo", dict(max_length=8),
+         ((0, 0), (-8, None)), ((-3, None), (None, None)), LONG_ROW),
+        # ORPO caps both prompts against the longer response whichever branch
+        # carries it, then cuts by max_length minus the prompt bound.
+        ("orpo", dict(max_length=14, max_prompt_length=8),
+         ((-8, None), (None, 6)), ((-8, None), (None, 6)), LONG_ROW),
+        ("orpo", dict(max_length=14, max_prompt_length=8),
+         ((-8, None), (None, 6)), ((-8, None), (None, 6)), SWAPPED),
+        ("orpo", dict(max_length=25, max_prompt_length=8, truncation_mode="keep_start"),
+         ((None, 8), (None, None)), ((None, 8), (None, None)), LONG_ROW),
+    ],
+)
+def test_truncation_follows_each_trl_trainer(kind, options, chosen, rejected, row):
+    tokenized = tokenize(row, kind, **options)
+    for side, (prompt, response) in (("chosen", chosen), ("rejected", rejected)):
+        assert getattr(tokenized, side) == encoded(PROMPT)[slice(*prompt)] + \
+            encoded(row[side], eos=True)[slice(*response)]
+
+
+@pytest.mark.parametrize(
+    "kind,row,options,message",
+    [
+        # A cut inside the prompt, a lone token in one branch or in both, and a
+        # bound whose tail cut overflows the batch; one lone branch stops ORPO.
+        ("dpo", {"prompt": PROMPT, "chosen": CHOSEN, "rejected": CHOSEN[::-1]},
+         dict(max_length=15, truncation_mode="keep_start"), "anything before it to predict from"),
+        ("dpo", {"prompt": "", "chosen": "y", "rejected": "n"},
+         dict(max_length=8, append_eos=False), "anything before it to predict from"),
+        ("dpo", {"prompt": "", "chosen": "y", "rejected": "no"},
+         dict(max_length=8, append_eos=False), None),
+        ("orpo", {"prompt": "", "chosen": "y", "rejected": "no"},
+         dict(max_length=8, append_eos=False), "anything before it to predict from"),
+        ("orpo", {"prompt": "", "chosen": "no", "rejected": "y"},
+         dict(max_length=8, append_eos=False), "anything before it to predict from"),
+        ("orpo", {"prompt": "", "chosen": CHOSEN, "rejected": CHOSEN[::-1]},
+         dict(max_length=1, max_prompt_length=1), "anything before it to predict from"),
+        ("orpo", {"prompt": "p" * 6, "chosen": "c" * 20, "rejected": "d" * 4},
+         dict(max_length=8, max_prompt_length=12), "more than the 8 a batch can hold"),
+        ("orpo", {"prompt": "p" * 6, "chosen": "d" * 4, "rejected": "c" * 20},
+         dict(max_length=8, max_prompt_length=12), "more than the 8 a batch can hold"),
+    ],
+)
+def test_the_length_guards_refuse_only_untrainable_rows(kind, row, options, message):
+    if message is None:
+        flipped = {**row, "chosen": row["rejected"], "rejected": row["chosen"]}
+        assert tokenize(row, kind, **options) and tokenize(flipped, kind, **options)
+        return
+    with pytest.raises(ValueError, match=message):
+        tokenize(row, kind, **options)
+
+
+@pytest.mark.parametrize(
+    "kind,overrides,expected,warning",
+    [
+        # ORPO spends max_length minus the prompt bound on the answer, so it
+        # cannot leave either open and clamping max_length to the batch width
+        # brings its prompt bound down too, where DPO's caps the prompt alone.
+        ("orpo", dict(max_length=None), (512, 512), "is not set"),
+        ("orpo", dict(max_prompt_length=None), (1024, 128), "is not set"),
+        ("dpo", dict(max_length=None, max_prompt_length=None, max_seq_length=300),
+         (300, None), None),
+        ("orpo", dict(max_seq_length=512), (512, 256), "no longer leaves room"),
+        ("orpo", dict(max_seq_length=400), (400, 200), "no longer leaves room"),
+        ("orpo", dict(max_length=8, max_prompt_length=12, max_seq_length=4), (4, 12), None),
+        ("dpo", dict(max_seq_length=512), (512, 512), None),
+    ],
+)
+def test_the_resolved_budget_matches_each_objectives_arithmetic(
+    kind, overrides, expected, warning,
+):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        length_policy = resolved(kind, **overrides)
+    said = " ".join(str(record.message) for record in caught)
+    assert (length_policy.max_length, length_policy.max_prompt_length) == expected
+    assert length_policy.max_seq_length == overrides.get("max_seq_length", 2048)
+    assert length_policy.max_completion_length is None
+    assert warning in said if warning else "no longer leaves room" not in said
+
+
+def test_an_inherited_max_length_says_it_narrowed_the_budget():
+    from unsloth_zoo.mlx.preference import resolve_preference_length_policy
+
+    def resolve(max_seq_length, explicit, kind="dpo"):
+        args = types.SimpleNamespace(
+            max_length=1024, max_prompt_length=512,
+            max_completion_length=None, truncation_mode="keep_end",
+            _unsloth_mlx_max_length_explicit=explicit,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resolve_preference_length_policy(
+                kind, args, max_seq_length=max_seq_length,
+            )
+        return [str(item.message) for item in caught]
+
+    said = resolve(2048, explicit=False)
+    assert len(said) == 1 and "budgeted more tightly" in said[0]
+    assert "max_prompt_length=None" in said[0]
+    # ORPO has already turned an open prompt bound into 128, so telling an ORPO
+    # caller to pass None would cap their prompts rather than widen them.
+    orpo = resolve(2048, explicit=False, kind="orpo")
+    assert len(orpo) == 1 and "max_prompt_length=None" not in orpo[0]
+    assert "resolves to 128" in orpo[0]
+    # A value the caller chose is theirs to mean, and a width the budget already
+    # fills has nothing to report.
+    assert resolve(2048, explicit=True) == []
+    assert resolve(1024, explicit=False) == []
+
+
+def test_orpo_says_what_an_open_prompt_bound_costs_only_when_it_matters():
+    from unsloth_zoo.mlx.preference import tokenize_preference_row
+
+    # A row that fits never consults the bound, so leaving it open still works.
+    open_bound = policy("orpo", max_length=64, max_prompt_length=None)
+    assert open_bound.max_prompt_length is None
+    assert tokenize_preference_row(
+        Tokenizer(), {"prompt": "ab", "chosen": "cd", "rejected": "ef"},
+        length_policy=open_bound,
+    )
+    # One that overruns used to negate the None inside a slice.
+    with pytest.raises(ValueError, match="cannot be left open here"):
+        tokenize_preference_row(
+            Tokenizer(),
+            {"prompt": PROMPT, "chosen": CHOSEN, "rejected": CHOSEN[::-1]},
+            length_policy=policy("orpo", max_length=8, max_prompt_length=None),
+        )
+
+
+@pytest.mark.parametrize(
+    "row,expected",
+    [
+        # The prompt is the common prefix less its joining space. It splits on
+        # whole messages, and a wrong-kind prompt is re-derived.
+        ({"chosen": "The sky is blue.", "rejected": "The sky is green."},
+         ("The sky is", " blue.", " green.")),
+        ({"prompt": "Q1", "chosen": TURN + [ANSWER], "rejected": TURN + [OTHER]},
+         (TURN, [ANSWER], [OTHER])),
+    ],
+)
+def test_an_implicit_prompt_is_recovered_the_way_trl_recovers_it(row, expected):
+    from unsloth_zoo.mlx.preference import _maybe_extract_prompt
+
+    recovered, was_recovered = _maybe_extract_prompt(dict(row))
+    keys = ("prompt", "chosen", "rejected")
+    assert (*(recovered[key] for key in keys), was_recovered) == (*expected, True)
+
+
+def test_dpo_tokenizes_the_prompt_and_each_completion_the_way_trl_does():
+    # DPO never tokenizes the pair the way ORPO does, so a prompt recovered from
+    # plain text -- a character prefix, so mid-token here -- splits there rather
+    # than the row being refused.
+    tokenized = tokenize(
+        {"chosen": "foobar", "rejected": "foobaz"}, max_length=16,
+        tokenizer=MappingTokenizer({"fooba": [1, 2], "foobar": [3], "foobaz": [4],
+                                    "r": [5], "z": [6]}),
+    )
+    assert (tokenized.chosen, tokenized.rejected) == ((1, 2, 5), (1, 2, 6))
+    assert tokenized.chosen_prompt_ids == tokenized.rejected_prompt_ids == (1, 2)
+
+
+def test_encode_honours_an_explicit_special_token_override():
+    from unsloth_zoo.mlx.utils import encode_mlx_text
+
+    tokenizer = SpecialTokenizer()
+    plain = [3 + (ord(character) % 43) for character in "ab"]
+    assert encode_mlx_text(tokenizer, "ab") == [tokenizer.bos_token_id] + plain
+    assert encode_mlx_text(tokenizer, "ab", add_special_tokens=False) == plain
+
+
+# A user-ended prompt, so a scripted template renders exactly prompt, chosen,
+# rejected in that order.
+SCRIPTED_ROW = {
+    "prompt": [{"role": "user", "content": "p"}],
+    "chosen": [{"role": "assistant", "content": "c"}],
+    "rejected": [{"role": "assistant", "content": "r"}],
+}
+
+
+def test_orpo_scans_for_the_boundary_only_once_the_prompt_stops_being_a_prefix():
+    # Neither branch still starts with the rendered prompt, so verifying every
+    # token but the last would refuse a row that only has to split earlier.
+    tokenized = tokenize(
+        SCRIPTED_ROW, "orpo", append_eos=False, max_length=8, max_prompt_length=4,
+        tokenizer=TemplateScriptTokenizer(["abc", "aXY", "aXZ"]),
+    )
+    assert tokenized.chosen_prompt_ids == encoded("a")
+    assert tokenized.chosen_ids == encoded("XY")
+    assert tokenized.rejected_ids == encoded("XZ")
+
+
+def test_orpo_keeps_only_the_boundary_both_branches_prove_shared():
+    # One branch still starts with the rendered prompt and the other does not,
+    # so the two boundaries disagree and both prompts stop at the lower one.
+    tokenized = tokenize(
+        SCRIPTED_ROW, "orpo", append_eos=False, max_length=8, max_prompt_length=4,
+        tokenizer=TemplateScriptTokenizer(["ab", "abc", "aXc"]),
+    )
+    assert tokenized.chosen_prompt_ids == tokenized.rejected_prompt_ids == encoded("a")
+    assert tokenized.chosen_ids == encoded("bc")
+    assert tokenized.rejected_ids == encoded("Xc")
+
+
+def test_dpo_clips_the_prompt_to_what_both_branches_still_agree_with():
+    # The clip lands mid-token, which is exactly what DPO tolerates and what
+    # keeping the whole rendered prompt would turn into an empty response.
+    tokenizer = TemplateScriptTokenizer(
+        ["abXc", "abXd", "abXe"], merges=("Xc", "Xd", "Xe"),
+    )
+    tokenized = tokenize(
+        SCRIPTED_ROW, "dpo", tokenizer=tokenizer, append_eos=False, max_length=16,
+    )
+    assert tokenized.chosen_prompt_ids == tuple(tokenizer.encode("abX"))
+    assert tokenized.chosen_ids == tuple(tokenizer.encode("d"))
+    assert tokenized.rejected_ids == tuple(tokenizer.encode("e"))
+
+
+def test_dpo_tokenizes_each_completion_without_special_tokens():
+    tokenized = tokenize(
+        {"prompt": "ab", "chosen": "cd", "rejected": "ef"}, "dpo",
+        tokenizer=SpecialTokenizer(), append_eos=False, max_length=16,
+    )
+    assert tokenized.chosen_ids == encoded("cd")
+    assert tokenized.rejected_ids == encoded("ef")
+
+
+def test_the_dpo_prompt_keeps_its_bos_and_gains_no_trailing_special():
+    tokenizer = TrailingSpecialTokenizer()
+    tokenized = tokenize(
+        {"prompt": "ab", "chosen": "cd", "rejected": "ef"}, "dpo",
+        tokenizer=tokenizer, append_eos=False, max_length=16,
+    )
+    assert tokenized.chosen_prompt_ids == (tokenizer.bos_token_id,) + encoded("ab")
+    assert tokenized.chosen_ids == encoded("cd")
+
+
+def test_an_explicit_partial_assistant_turn_is_finished_by_its_completions():
+    from unsloth_zoo.mlx.preference import tokenize_preference_row
+
+    tokenizer = CapturingTokenizer()
+    tokenize_preference_row(
+        tokenizer,
+        {
+            "prompt": [{"role": "assistant", "content": "prefix"}],
+            "chosen": [{"role": "assistant", "content": " chosen"}],
+            "rejected": [{"role": "assistant", "content": " rejected"}],
+        },
+        length_policy=policy(),
+    )
+    assert [message["content"] for message in tokenizer.calls[1][0]] == ["prefix chosen"]
+    assert [message["content"] for message in tokenizer.calls[2][0]] == ["prefix rejected"]
+
+
+def test_a_recovered_prompt_never_absorbs_its_completions():
+    from unsloth_zoo.mlx.preference import tokenize_preference_row
+
+    # The prompt was recovered from the completions, so its final assistant
+    # message is a whole turn rather than one the completions continue.
+    tokenizer = CapturingTokenizer()
+    tokenize_preference_row(
+        tokenizer,
+        {"prompt": "Q1", "chosen": TURN + [ANSWER], "rejected": TURN + [OTHER]},
+        length_policy=policy(),
+    )
+    assert [message["content"] for message in tokenizer.calls[1][0]] == ["Q1", "A1", "A2"]
+    assert [message["content"] for message in tokenizer.calls[2][0]] == ["Q1", "A1", "A3"]
 
 
 def test_content_parts_and_chat_template_options_are_preserved():
     from unsloth_zoo.mlx.preference import tokenize_preference_row
-
-    class CapturingTokenizer(Tokenizer):
-        def __init__(self):
-            self.calls = []
-
-        def apply_chat_template(self, messages, **kwargs):
-            self.calls.append((messages, kwargs))
-            return super().apply_chat_template(messages, **kwargs)
 
     tokenizer = CapturingTokenizer()
     row = {
@@ -273,7 +697,7 @@ def test_content_parts_and_chat_template_options_are_preserved():
         "tools": [],
         "chat_template_kwargs": {"flag": 1},
     }
-    result = tokenize_preference_row(tokenizer, row, max_seq_length=64)
+    result = tokenize_preference_row(tokenizer, row, length_policy=policy())
     assert result.chosen != result.rejected
     assert all(call[1]["tools"] == [] and call[1]["flag"] == 1 for call in tokenizer.calls)
     assert tokenizer.calls[0][0][0]["content"] == "Q"
@@ -288,7 +712,7 @@ def test_assistant_ended_prompt_continues_the_same_message():
         "chosen": [{"role": "assistant", "content": " chosen"}],
         "rejected": [{"role": "assistant", "content": " rejected"}],
     }
-    result = tokenize_preference_row(tokenizer, row, max_seq_length=64)
+    result = tokenize_preference_row(tokenizer, row, length_policy=policy())
     assert (
         result.chosen_prompt_ids
         and result.rejected_prompt_ids
@@ -300,16 +724,20 @@ def test_assistant_ended_prompt_continues_the_same_message():
 @pytest.mark.parametrize(
     "row",
     [
-        {"chosen": "a", "rejected": "b"},
         {"prompt": "p", "chosen": [{"role": "assistant", "content": "a"}], "rejected": "b"},
         {"prompt": [{"role": "system", "content": "p"}], "chosen": [], "rejected": []},
+        {
+            "prompt": [{"role": "system", "content": "p"}],
+            "chosen": [{"role": "assistant", "content": "a"}],
+            "rejected": [{"role": "assistant", "content": "b"}],
+        },
     ],
 )
 def test_ambiguous_rows_are_rejected(row):
     from unsloth_zoo.mlx.preference import tokenize_preference_row
 
     with pytest.raises(ValueError):
-        tokenize_preference_row(Tokenizer(), row, max_seq_length=64)
+        tokenize_preference_row(Tokenizer(), row, length_policy=policy())
 
 
 class TinyModel:
@@ -329,11 +757,11 @@ def test_microbatch_loss_matches_one_logical_batch(objective):
     dataset = rows(3)
     from unsloth_zoo.mlx.preference import create_preference_batch_plan
     micro = create_preference_batch_plan(
-        dataset, Tokenizer(), batch_size=2, max_seq_length=64,
+        dataset, Tokenizer(), batch_size=2, length_policy=policy(),
         num_batches=2, grad_accum=2, dataset_order="sequential",
     )
     whole = create_preference_batch_plan(
-        dataset, Tokenizer(), batch_size=3, max_seq_length=64,
+        dataset, Tokenizer(), batch_size=3, length_policy=policy(),
         num_batches=1, grad_accum=1, dataset_order="sequential",
     )
     model = TinyModel()
