@@ -171,6 +171,14 @@ jobs:
         # trimming, the audio fallback contract, and request validation.
         run: python -m pytest tests/test_mlx_generate.py -v -rs
 
+      - name: "PR 1128 probe: generation-stream drain on real MLX"
+        # Staging-only. The PR's own tests replace streams with strings and
+        # mx.synchronize with a lambda, so they cannot see aliased streams, lazy
+        # module __getattr__, the real synchronize call count, or wrong-thread
+        # stream use (mlx-lm#1181 / #1256). This runs the drain against the real
+        # objects, on a worker thread as well as the main one.
+        run: python tests/_probe_1128_stream_drain.py
+
       - name: tests/test_mlx_generate_metal.py
         # Batched generation on real models: batched-vs-sequential greedy
         # equivalence with aligned sampled-token logprobs, memory-limit
