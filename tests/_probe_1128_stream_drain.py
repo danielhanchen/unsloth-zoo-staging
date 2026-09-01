@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import traceback
+import types
 
 import mlx.core as mx
 
@@ -158,6 +159,58 @@ def thread_affinity():
         failures.append(f"D: main-thread drain raised {type(exc).__name__}")
 
 
+def plain_stream_from_a_foreign_thread():
+    """The case the fix exists for: a plain mx.new_stream drained off its own thread.
+
+    mlx-vlm bound generation_stream this way until 0.5.0 and the pin floor 0.4.4 still
+    does, so this is the supported range, not a hypothetical. mlx made command encoders
+    thread local in 0.31.2, so synchronizing one of these from elsewhere raises.
+    """
+    section("F: plain (non thread-local) stream drained from a worker thread")
+    stream = mx.new_stream(mx.default_device())
+    with mx.stream(stream):
+        mx.eval(mx.matmul(mx.random.normal((256, 256)), mx.random.normal((256, 256))))
+    module = types.SimpleNamespace(generation_stream=stream)
+    sys.modules["mlx_vlm.generate"] = module
+    print(f"stream type={type(stream).__module__}.{type(stream).__name__} repr={stream!r}")
+
+    direct = {}
+
+    def raw():
+        try:
+            mx.synchronize(stream)
+            direct["ok"] = True
+        except BaseException as exc:                # noqa: BLE001 - reporting a probe
+            direct["exc"] = exc
+
+    thread = threading.Thread(target=raw, name="probe-raw")
+    thread.start()
+    thread.join(timeout=60)
+    print("bare mx.synchronize(stream) from a worker thread: "
+          + ("OK" if direct.get("ok") else f"{type(direct['exc']).__name__}: {direct['exc']}"))
+
+    box = {}
+
+    def guarded():
+        try:
+            with _generation_cache_hygiene():
+                pass
+            box["ok"] = True
+        except BaseException as exc:                # noqa: BLE001 - reporting a probe
+            box["exc"] = exc
+            box["tb"] = traceback.format_exc()
+
+    thread = threading.Thread(target=guarded, name="probe-guarded")
+    thread.start()
+    thread.join(timeout=120)
+    del sys.modules["mlx_vlm.generate"]
+    if box.get("ok"):
+        print("_generation_cache_hygiene() survived it")
+    else:
+        print(f"RAISED {type(box['exc']).__name__}: {box['exc']}\n{box.get('tb')}")
+        failures.append(f"F: hygiene raised {type(box['exc']).__name__} on a foreign plain stream")
+
+
 def cost():
     section("E: real synchronize count + cost per drain")
     calls = []
@@ -190,6 +243,7 @@ def main():
     real_api_audit()
     cost()
     thread_affinity()
+    plain_stream_from_a_foreign_thread()
     section("verdict")
     if failures:
         for line in failures:
