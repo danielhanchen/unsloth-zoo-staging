@@ -16,10 +16,11 @@ defaults:
 jobs:
   test:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
-      UNSLOTH_COMPILE_DISABLE: '1'
       UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ALLOW_CPU: '1'
+      UNSLOTH_COMPILE_DISABLE: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,7 +28,32 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -e . pytest pytest-asyncio pytest-timeout
-      - run: python -m pip install pytest-timeout
-      - run: python -m pip install mlx mlx-cpu mlx-lm mlx-vlm timm || echo "optional deps unavailable on macos-15"
-      - run: rc=0; python -m pytest tests/test_mlx_get_peft_model_seed_ordering.py tests/test_mlx_lora_group_selection.py tests/test_mlx_save_export_regressions.py tests/test_mlx_training_e2e_metal.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && ! grep -qE "^(FAILED|ERROR) " pytest_out.txt; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && ! grep -qE "^ERROR " pytest_out.txt; then tot=$(grep -cE "^FAILED " pytest_out.txt); dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt); if [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; fi; exit "$rc"
+      - name: Install (strict - a dep an assertion needs must not be best-effort)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3 timm
+      - name: Report the runtime under test
+        run: |
+          python -c "import platform; print(platform.platform(), platform.machine())"
+          python - <<'EOF'
+          try:
+              import mlx.core as mx
+              origin = str(getattr(mx, "__file__", "") or "")
+              assert "mlx_simulation" not in origin, f"shim, not real mlx: {origin}"
+              print("real mlx at", origin, "| sum", int(mx.array([1, 2, 3]).sum()))
+          except ImportError as exc:
+              print("no mlx on this runner:", exc)
+          EOF
+      - name: PR 1199 test files
+        run: |
+          python -m pytest tests/test_mlx_get_peft_model_seed_ordering.py tests/test_mlx_lora_group_selection.py tests/test_mlx_save_export_regressions.py tests/test_mlx_training_e2e_metal.py -q --tb=short -p no:cacheprovider \
+            > pytest_out.txt 2>&1 || rc=$?
+          cat pytest_out.txt
+          # A lane that installed nothing collects nothing and exits 0. Assert the
+          # executed count so green cannot mean "ran no tests".
+          passed=$(grep -oE '[0-9]+ passed' pytest_out.txt | tail -1 | grep -oE '^[0-9]+' || echo 0)
+          echo "passed=$passed (floor 150)"
+          [ "${passed:-0}" -ge "150" ] || { echo "::error::only $passed passed, expected >= 150 - this lane proved nothing"; exit 1; }
+          exit "${rc:-0}"

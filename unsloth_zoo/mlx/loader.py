@@ -424,9 +424,10 @@ def linear_to_lora_layers(model, num_layers, config, *, dry_run=False):
         wanted = _layer_wanted(index)
         selected.append((layer, [(name, module) for name, module in layer.named_modules()
                                  if name in wanted]))
-    root_modules = [(name, module) for name, module in model.named_modules()
+    root_modules = [(name, module)
+                    for name, module in (root.named_modules() if root is not None else ())
                     if name in shared]
-    for _, modules in [*selected, (model, root_modules)]:
+    for _, modules in [*selected, (root, root_modules)]:
         for _, module in modules:
             _check_mlx_lora_base(module)
     if dry_run:
