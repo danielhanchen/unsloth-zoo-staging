@@ -4798,6 +4798,27 @@ def _vlm_token_messages(processor, messages):
     return rendered
 
 
+def _mark_vlm_image_parts(messages, image_token):
+    """Replace image parts with a literal image token, sharing everything else.
+
+    Shallow by construction: the copy exists to swap one part dict, and deep
+    copying would duplicate the row's PIL images on every render.
+    """
+    if not image_token:
+        return messages
+    marked = []
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            message = {**message, "content": [
+                {"type": "text", "text": image_token}
+                if isinstance(part, dict) and part.get("type") == "image" else part
+                for part in content
+            ]}
+        marked.append(message)
+    return marked
+
+
 def _render_vlm_messages(
     processor,
     messages,
@@ -4818,7 +4839,7 @@ def _render_vlm_messages(
         )
 
     render_messages = _vlm_token_messages(processor, messages)
-    if not _processor_accepts_assistant_list_content(processor):
+    if not _processor_accepts_assistant_list_content(renderer):
         render_messages = _collapse_vlm_assistant_content(render_messages)
     image_count = _count_vlm_image_parts(messages)
     image_tokens = {token for token in (image_token, getattr(processor, "boi_token", None),
@@ -8295,6 +8316,15 @@ def validate_legacy_image_batch(batch):
         )
 
 
+def _ensure_vlm_pad_token(processor):
+    tokenizer = _get_processor_tokenizer(processor)
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        eos = getattr(tokenizer, "eos_token", None)
+        if eos is not None:
+            tokenizer.pad_token = eos
+    return tokenizer
+
+
 def _processor_vlm_inputs(
     processor,
     texts,
@@ -8308,6 +8338,12 @@ def _processor_vlm_inputs(
     legacy = legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation)
     if legacy is not None:
         return legacy
+    tokenizer = _ensure_vlm_pad_token(processor)
+    images = _format_vlm_images_for_processor(all_images, processor=processor)
+    audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
+    text_only = images is None and audio is None and callable(tokenizer)
+    if text_only:
+        processor = tokenizer
     base_kwargs = dict(
         text=texts,
         padding=True,
