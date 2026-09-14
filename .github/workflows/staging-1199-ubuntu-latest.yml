@@ -41,40 +41,53 @@ jobs:
           python -c "import mlx.core as mx, sys; o=str(getattr(mx,'__file__','')); sys.exit('shim, not real mlx: '+o) if 'mlx_simulation' in o else print('real mlx at', o, '| sum', int(mx.array([1,2,3]).sum()))" || echo "no mlx on this runner"
       - name: "tests/test_mlx_get_peft_model_seed_ordering.py"
         id: mlx_get_peft_model_seed_ordering
+        if: always()
         run: |
           rc=0
           python -m pytest tests/test_mlx_get_peft_model_seed_ordering.py -q --tb=short -p no:cacheprovider > out_mlx_get_peft_model_seed_ordering.txt 2>&1 || rc=$?
           cat out_mlx_get_peft_model_seed_ordering.txt
           grep -oE '[0-9]+ passed' out_mlx_get_peft_model_seed_ordering.txt | tail -1 | grep -oE '^[0-9]+' > passed_mlx_get_peft_model_seed_ordering.txt || echo 0 > passed_mlx_get_peft_model_seed_ordering.txt
-          exit "$rc"
+          echo "$rc" > rc_mlx_get_peft_model_seed_ordering.txt
+          grep -E '^FAILED ' out_mlx_get_peft_model_seed_ordering.txt >> failed_all.txt || true
       - name: "tests/test_mlx_lora_group_selection.py"
         id: mlx_lora_group_selection
+        if: always()
         run: |
           rc=0
           python -m pytest tests/test_mlx_lora_group_selection.py -q --tb=short -p no:cacheprovider > out_mlx_lora_group_selection.txt 2>&1 || rc=$?
           cat out_mlx_lora_group_selection.txt
           grep -oE '[0-9]+ passed' out_mlx_lora_group_selection.txt | tail -1 | grep -oE '^[0-9]+' > passed_mlx_lora_group_selection.txt || echo 0 > passed_mlx_lora_group_selection.txt
-          exit "$rc"
+          echo "$rc" > rc_mlx_lora_group_selection.txt
+          grep -E '^FAILED ' out_mlx_lora_group_selection.txt >> failed_all.txt || true
       - name: "tests/test_mlx_save_export_regressions.py"
         id: mlx_save_export_regressions
+        if: always()
         run: |
           rc=0
           python -m pytest tests/test_mlx_save_export_regressions.py -q --tb=short -p no:cacheprovider > out_mlx_save_export_regressions.txt 2>&1 || rc=$?
           cat out_mlx_save_export_regressions.txt
           grep -oE '[0-9]+ passed' out_mlx_save_export_regressions.txt | tail -1 | grep -oE '^[0-9]+' > passed_mlx_save_export_regressions.txt || echo 0 > passed_mlx_save_export_regressions.txt
-          exit "$rc"
+          echo "$rc" > rc_mlx_save_export_regressions.txt
+          grep -E '^FAILED ' out_mlx_save_export_regressions.txt >> failed_all.txt || true
       - name: "tests/test_mlx_training_e2e_metal.py"
         id: mlx_training_e2e_metal
+        if: always()
         run: |
           rc=0
           python -m pytest tests/test_mlx_training_e2e_metal.py -q --tb=short -p no:cacheprovider > out_mlx_training_e2e_metal.txt 2>&1 || rc=$?
           cat out_mlx_training_e2e_metal.txt
           grep -oE '[0-9]+ passed' out_mlx_training_e2e_metal.txt | tail -1 | grep -oE '^[0-9]+' > passed_mlx_training_e2e_metal.txt || echo 0 > passed_mlx_training_e2e_metal.txt
-          exit "$rc"
-      - name: Assert this lane actually executed tests
+          echo "$rc" > rc_mlx_training_e2e_metal.txt
+          grep -E '^FAILED ' out_mlx_training_e2e_metal.txt >> failed_all.txt || true
+      - name: Verdict
         if: always()
         run: |
           total=0
           for f in passed_*.txt; do [ -f "$f" ] && total=$((total + $(cat "$f"))); done
           echo "executed(passed)=$total floor=150"
+          echo "----- failures across all files -----"
+          cat failed_all.txt 2>/dev/null || echo "(none)"
+          bad=0
+          for f in rc_*.txt; do [ -f "$f" ] && [ "$(cat "$f")" != "0" ] && bad=1; done
           [ "$total" -ge "150" ] || { echo "::error::only $total passed, expected >= 150 - this lane proved nothing"; exit 1; }
+          exit "$bad"
