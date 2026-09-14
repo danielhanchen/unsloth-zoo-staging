@@ -20,7 +20,8 @@ import linecache
 import sys
 
 import torch
-from .common import TEMPORARY_PATCHES, logger
+import os
+from .common import TEMPORARY_PATCHES, torch_compile
 from .utils import raise_error, patch_function
 
 
@@ -76,7 +77,10 @@ class _Gemma4KVSharedSafeProxy:
         object.__setattr__(self, "_real", real)
 
     def __getattr__(self, name):
-        # Only invoked when normal attribute lookup fails.
+        # Only invoked when normal attribute lookup fails (i.e. not a slot
+        # and not a method of this proxy class).
+        # Return AttributeError for num_kv_shared_layers so hasattr() returns False
+        # This fixes the cache constructor bug: layer_types[:-0] == []
         if name == "num_kv_shared_layers":
             raise AttributeError(
                 "num_kv_shared_layers is 0 (no KV sharing) -- hidden from "
@@ -90,13 +94,14 @@ class _Gemma4KVSharedSafeProxy:
 
     # ---- dict-like dunder forwarding (used by config validators) ----
     def __iter__(self):
-        # Hide num_kv_shared_layers, like __getattr__/__contains__/__getitem__:
-        # validate_token_ids does `for n in cfg: getattr(cfg, n)`, so yielding it
-        # would re-raise the AttributeError from __getattr__. See unslothai/unsloth#6089.
-        for name in object.__getattribute__(self, "_real"):
-            if name == "num_kv_shared_layers":
-                continue
-            yield name
+        # Must agree with __getattr__ / __contains__ / __getitem__, which all
+        # hide num_kv_shared_layers. Upstream's validate_token_ids does
+        # `for name in text_config: getattr(text_config, name)`, so yielding a
+        # name whose getattr raises turns validation into an AttributeError.
+        return (
+            name for name in object.__getattribute__(self, "_real")
+            if name != "num_kv_shared_layers"
+        )
 
     def __len__(self):
         # Consistent with __iter__ (hidden attr excluded).
@@ -1000,190 +1005,52 @@ TEMPORARY_PATCHES.append(patch_Gemma4TextMLP)
 
 
 # ============================================================================
-# Gemma-4 vision pooler float16 overflow fix (transformers 5.5.0 - 5.9.x and
-# the yanked 5.10.0; fixed upstream in >= 5.10.1 by PR #46277).
-#
-# Root cause: Gemma4VisionPooler.forward scales by sqrt(hidden_size) in the
-# input dtype (hidden_states *= self.root_hidden_size). On the 26B-A4B / 31B
-# tower (hidden 1152, sqrt 33.94, use_clipped_linears = False) fp16 activations
-# ~2300 scale to ~79k, past the fp16 max 65504 -> inf -> NaN loss via
-# embed_vision / masked_scatter. Engages under Unsloth forced-float32 mode
-# (fp16 request on non-bf16 GPUs keeps the fp16 vision tower with autocast
-# off). E2B / E4B (hidden 768, clipped linears) and bf16 / fp32 are safe.
-#
-# Fix mirrors upstream >= 5.10.1: run the pooler in fp32 (dtype-preserving ops
-# make the cast input match the fixed output up to fp16 rounding, never
-# overflowing), let fp32 carry through the caller's standardization (std_bias
-# cancels the large values; buffer amax 53760 is in fp16 range), then cast
-# last_hidden_state back in Gemma4VisionModel.forward to the actual embedder
-# output dtype (inputs_embeds.dtype). Only fp16 towers engage, so bf16 / fp32
-# stay bit-identical to upstream. Wrappers call the original forwards to
-# preserve HF decorators (@merge_with_config_defaults / @capture_outputs); on
-# already-fixed upstream the cast-back is a no-op.
-#
-# Source-pattern classification (not version compares) stays correct on every
-# release including the yanked 5.10.0: fixed sources skip, unknown (future
-# drift) sources are left untouched, transformers without gemma4 no-ops via
-# ImportError. The pooler runs eager, so no compiler-cache companion is needed.
+# Gemma4MultimodalEmbedder patch - force float32 for projection stability
+# The projection (embedding_projection) loses spatial precision in bf16/fp16.
+# Mirror of patch_Gemma3nMultimodalEmbedder_forward.
 # ============================================================================
 
-def _gemma4_vision_pooler_status(pooler_cls):
-    """Classify Gemma4VisionPooler.forward source: "buggy" (dtype-preserving
-    scale, <= 5.9.x), "fixed" (fp32 scale, >= 5.10.1) or "unknown" (source
-    unavailable or drifted - fail open to upstream)."""
-    import inspect
+@torch_compile
+def _Gemma4MultimodalEmbedder_RMSNorm_forward(self, x: torch.Tensor) -> torch.Tensor:
+    output = self._norm(x.float())
+    if getattr(self, "with_scale", True) and hasattr(self, "weight"):
+        output = output * self.weight.float()
+    return output.type_as(x)
+
+def patch_Gemma4MultimodalEmbedder_forward():
+    """Force float32 computation for Gemma4MultimodalEmbedder to preserve spatial precision."""
     try:
-        source = inspect.getsource(pooler_cls.forward)
-    except Exception:
-        return "unknown"
-    source = source.replace(" ", "")
-    if (
-        "hidden_states*=self.root_hidden_size" in source
-        or "hidden_states=hidden_states*self.root_hidden_size" in source
-    ):
-        return "buggy"
-    if "hidden_states.float()*self.root_hidden_size" in source:
-        return "fixed"
-    return "unknown"
-pass
+        import transformers.models.gemma4.modeling_gemma4 as mod
+        Gemma4MultimodalEmbedder = mod.Gemma4MultimodalEmbedder
+    except (ImportError, AttributeError) as e:
+        return raise_error("Gemma4MultimodalEmbedder.forward", e)
 
-
-def _gemma4_vision_cast_dtype(vision_model, pixel_values):
-    """Fallback cast dtype when the vision wrapper's embedder hook saw nothing:
-    approximate inputs_embeds.dtype from the input_proj weight (pixels are cast
-    to it outside autocast), then from the pixel dtype if the embedder drifts."""
-    embedder = getattr(vision_model, "patch_embedder", None)
-    weight = getattr(getattr(embedder, "input_proj", None), "weight", None)
-    if torch.is_tensor(weight):
-        return weight.dtype
-    if torch.is_tensor(pixel_values):
-        return pixel_values.dtype
-    if isinstance(pixel_values, (list, tuple)) and len(pixel_values) > 0 \
-            and torch.is_tensor(pixel_values[0]):
-        return pixel_values[0].dtype
-    return None
-pass
-
-
-def _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls):
-    """Install the fp16-overflow wrappers on a (pooler, vision) pair; returns
-    the action ("already"/"repaired"/"fixed"/"unknown"/"patched"). The vision
-    wrapper goes on before the pooler wrapper (the pooler marker is the commit
-    point) so an interrupt can never leave an fp32-emitting pooler without the
-    cast-back; a missing vision wrapper beside a marked pooler is "repaired"."""
-    import functools
-    pooler_marked = getattr(pooler_cls.forward, "_unsloth_vision_pooler_fp16", False)
-    vision_marked = getattr(vision_cls.forward, "_unsloth_vision_pooler_fp16", False)
-    if pooler_marked and vision_marked:
-        return "already"
-    if not pooler_marked:
-        status = _gemma4_vision_pooler_status(pooler_cls)
-        if status == "fixed":
-            return "fixed"
-        if status == "unknown":
-            raise_error(
-                "Gemma4VisionPooler.forward fp16 overflow fix",
-                "unrecognized upstream pooler source - skipping",
-            )
-            return "unknown"
-
-    if not vision_marked:
-        _original_vision_forward = vision_cls.forward
-
-        @functools.wraps(_original_vision_forward)
-        def vision_forward(self, *args, **kwargs):
-            pixel_values = args[0] if args else kwargs.get("pixel_values", None)
-            # Capture the actual embedder output dtype (inputs_embeds.dtype):
-            # under bf16 autocast an fp16-weight input_proj emits bf16, which
-            # must stay untouched.
-            seen = {}
-            handle = None
-            embedder = getattr(self, "patch_embedder", None)
-            if isinstance(embedder, torch.nn.Module):
-                def _capture_embed_dtype(module, hook_args, hook_output):
-                    if torch.is_tensor(hook_output):
-                        seen["dtype"] = hook_output.dtype
-                handle = embedder.register_forward_hook(_capture_embed_dtype)
-            try:
-                output = _original_vision_forward(self, *args, **kwargs)
-            finally:
-                if handle is not None:
-                    handle.remove()
-            target_dtype = seen.get("dtype")
-            if target_dtype is None:
-                target_dtype = _gemma4_vision_cast_dtype(self, pixel_values)
-            # fp16 towers only; bf16 / fp32 stay bit-identical to upstream.
-            if target_dtype != torch.float16:
-                return output
-            is_tuple = isinstance(output, tuple)
-            hidden_states = (
-                output[0] if is_tuple and len(output) > 0
-                else getattr(output, "last_hidden_state", None)
-            )
-            if (
-                torch.is_tensor(hidden_states)
-                and hidden_states.is_floating_point()
-                and hidden_states.dtype != target_dtype
-            ):
-                # Also covers standardize = False checkpoints.
-                cast = hidden_states.to(target_dtype)
-                if is_tuple:
-                    # Swap the pre-cast tensor wherever it appears, including
-                    # one level down (return_dict=False may nest the tuple).
-                    output = tuple(
-                        cast if element is hidden_states else (
-                            tuple(cast if item is hidden_states else item for item in element)
-                            if isinstance(element, tuple) else element
-                        )
-                        for element in output
-                    )
-                else:
-                    # Keep captured hidden_states consistent: the capture
-                    # wrapper ties its final entry to the pre-cast final state.
-                    extra = getattr(output, "hidden_states", None)
-                    if isinstance(extra, tuple) and len(extra) > 0 \
-                            and extra[-1] is hidden_states:
-                        output.hidden_states = extra[:-1] + (cast,)
-                    output.last_hidden_state = cast
-            return output
-
-        vision_forward._unsloth_vision_pooler_fp16 = True
-        vision_cls.forward = vision_forward
-    if pooler_marked:
-        return "repaired"
-
-    _original_pooler_forward = pooler_cls.forward
-
-    @functools.wraps(_original_pooler_forward)
-    def pooler_forward(self, *args, **kwargs):
-        # fp16 only; bf16 / fp32 stay bit-identical to upstream.
-        if args and torch.is_tensor(args[0]) and args[0].dtype == torch.float16:
-            args = (args[0].float(),) + args[1:]
-        elif torch.is_tensor(kwargs.get("hidden_states", None)) and \
-                kwargs["hidden_states"].dtype == torch.float16:
-            kwargs["hidden_states"] = kwargs["hidden_states"].float()
-        return _original_pooler_forward(self, *args, **kwargs)
-
-    pooler_forward._unsloth_vision_pooler_fp16 = True
-    pooler_cls.forward = pooler_forward
-    return "patched"
-pass
-
-
-def patch_Gemma4VisionPoolerFP16():
+    def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        old_dtype = inputs_embeds.dtype
+        # Compute norm in float32
+        emb_norm = _Gemma4MultimodalEmbedder_RMSNorm_forward(self.embedding_pre_projection_norm, inputs_embeds)
+        # Call the module rather than reading `.weight`: PEFT replaces
+        # `embedding_projection` with a `lora.Linear` whose delta is applied only
+        # inside its `forward`, and `.weight` on the wrapper resolves to the
+        # frozen base weight. Reading it drops the LoRA contribution entirely,
+        # so an adapter on this projector would train to zero effect
+        # (`finetune_vision_layers` / `finetune_audio_layers` attach one here).
+        # The projector is in SKIP_QUANTIZATION_MODULES, so in a real load both
+        # the base GEMM and the LoRA delta still run in fp32. Matches gemma3n.
+        projection = self.embedding_projection
+        # Feed the projection the dtype its weights actually hold. When the
+        # projector is kept in fp32 (the SKIP_QUANTIZATION_MODULES case) this is
+        # fp32 and the spatial precision is preserved; when it is not, passing
+        # fp32 into a half-precision Linear would raise rather than upcast.
+        weight = getattr(projection, "weight", None)
+        compute_dtype = torch.float32 if weight is None else weight.dtype
+        emb_norm_proj = projection(emb_norm.to(compute_dtype))
+        return emb_norm_proj.to(old_dtype)
     try:
-        import transformers.models.gemma4.modeling_gemma4 as modeling_gemma4
-    except ImportError:
-        return
+        patch_function(
+            Gemma4MultimodalEmbedder, "forward", forward, fullgraph=True,
+        )
     except Exception as e:
-        return raise_error("Gemma4VisionPooler.forward", e)
-    pooler_cls = getattr(modeling_gemma4, "Gemma4VisionPooler", None)
-    vision_cls = getattr(modeling_gemma4, "Gemma4VisionModel", None)
-    if pooler_cls is None or vision_cls is None:
-        return
-    try:
-        _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls)
-    except Exception as e:
-        return raise_error("Gemma4VisionPooler.forward", e)
+        return raise_error("Gemma4MultimodalEmbedder.forward", e)
 pass
-TEMPORARY_PATCHES.append(patch_Gemma4VisionPoolerFP16)
+TEMPORARY_PATCHES.append(patch_Gemma4MultimodalEmbedder_forward)
