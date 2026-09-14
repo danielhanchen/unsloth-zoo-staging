@@ -4468,10 +4468,13 @@ DISABLE_COMPILE_MODULES = [
     "Qwen3NextGatedDeltaNet",
     "GatedDeltaNet",
     "Qwen3_5MoeGatedDeltaNet",
-    # DeepSeek-V4 hyper-connection mixers: Inductor's fused backward of their
-    # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
-    "DeepseekV4HyperConnection",
-    "DeepseekV4HyperHead",
+    # Vision components - prevent torch.compile on vision encoders and embedders
+    # to avoid numerical precision issues in spatial localization (Issue #6028)
+    "Gemma4VisionPatchEmbedder",
+    "Gemma4VisionModel",
+    "Gemma4VisionEncoder",
+    "Gemma4VisionEncoderLayer",
+    "Gemma4MultimodalEmbedder",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -5491,7 +5494,12 @@ def unsloth_compile_transformers(
             pass
         pass
     pass
-    # Add back to functions since failed compiling
+    # Add back to functions since failed compiling.
+    # `functions` is the import allow-list for the generated cache (see
+    # `create_new_function`), not a compile list: compilation is gated by the
+    # `bad_torch_modules` checks further down. Modules that failed to compile
+    # are still *referenced* by the emitted classes, so they must stay
+    # importable or the cache raises NameError when it constructs them.
     functions += list(bad_torch_modules)
 
     if len(pretrained_modules) > 0:
