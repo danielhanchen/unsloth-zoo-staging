@@ -20,7 +20,7 @@ import linecache
 import sys
 
 import torch
-from .common import TEMPORARY_PATCHES, logger
+from .common import TEMPORARY_PATCHES, logger, torch_compile
 from .utils import raise_error, patch_function
 
 
@@ -1187,3 +1187,54 @@ def patch_Gemma4VisionPoolerFP16():
         return raise_error("Gemma4VisionPooler.forward", e)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4VisionPoolerFP16)
+
+
+# Gemma4MultimodalEmbedder patch - force float32 for projection stability
+# The projection (embedding_projection) loses spatial precision in bf16/fp16.
+# Mirror of patch_Gemma3nMultimodalEmbedder_forward.
+# ============================================================================
+
+@torch_compile
+def _Gemma4MultimodalEmbedder_RMSNorm_forward(self, x: torch.Tensor) -> torch.Tensor:
+    output = self._norm(x.float())
+    if getattr(self, "with_scale", True) and hasattr(self, "weight"):
+        output = output * self.weight.float()
+    return output.type_as(x)
+
+def patch_Gemma4MultimodalEmbedder_forward():
+    """Force float32 computation for Gemma4MultimodalEmbedder to preserve spatial precision."""
+    try:
+        import transformers.models.gemma4.modeling_gemma4 as mod
+        Gemma4MultimodalEmbedder = mod.Gemma4MultimodalEmbedder
+    except (ImportError, AttributeError) as e:
+        return raise_error("Gemma4MultimodalEmbedder.forward", e)
+
+    def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        old_dtype = inputs_embeds.dtype
+        # Compute norm in float32
+        emb_norm = _Gemma4MultimodalEmbedder_RMSNorm_forward(self.embedding_pre_projection_norm, inputs_embeds)
+        # Call the module rather than reading `.weight`: PEFT replaces
+        # `embedding_projection` with a `lora.Linear` whose delta is applied only
+        # inside its `forward`, and `.weight` on the wrapper resolves to the
+        # frozen base weight. Reading it drops the LoRA contribution entirely,
+        # so an adapter on this projector would train to zero effect
+        # (`finetune_vision_layers` / `finetune_audio_layers` attach one here).
+        # The projector is in SKIP_QUANTIZATION_MODULES, so in a real load both
+        # the base GEMM and the LoRA delta still run in fp32. Matches gemma3n.
+        projection = self.embedding_projection
+        # Feed the projection the dtype its weights actually hold. When the
+        # projector is kept in fp32 (the SKIP_QUANTIZATION_MODULES case) this is
+        # fp32 and the spatial precision is preserved; when it is not, passing
+        # fp32 into a half-precision Linear would raise rather than upcast.
+        weight = getattr(projection, "weight", None)
+        compute_dtype = torch.float32 if weight is None else weight.dtype
+        emb_norm_proj = projection(emb_norm.to(compute_dtype))
+        return emb_norm_proj.to(old_dtype)
+    try:
+        patch_function(
+            Gemma4MultimodalEmbedder, "forward", forward, fullgraph=True,
+        )
+    except Exception as e:
+        return raise_error("Gemma4MultimodalEmbedder.forward", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4MultimodalEmbedder_forward)

@@ -1,0 +1,69 @@
+name: "staging-729 macos-15"
+on:
+  push:
+    branches: ["pr-729-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ZOO_DISABLE_GPU_INIT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CPU deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "transformers>=5.10" peft accelerate pytest
+      - name: Gemma4 projection + LoRA tests
+        run: PYTHONPATH=. python -m pytest tests/test_gemma4_spatial_localization.py -q --tb=short
+      - name: Compiler import-list regression (the bad_torch_modules fix)
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          import importlib, io, contextlib, os, re, sys
+          from unsloth_zoo import compiler
+          failures = []
+          for mt in ["gemma3n", "gemma4"]:
+              try:
+                  mod = importlib.import_module(f"transformers.models.{mt}.modeling_{mt}")
+              except Exception as exc:
+                  print(f"{mt}: skipped ({type(exc).__name__})"); continue
+              if hasattr(mod, "__UNSLOTH_PATCHED__"): delattr(mod, "__UNSLOTH_PATCHED__")
+              with contextlib.redirect_stdout(io.StringIO()):
+                  compiler.unsloth_compile_transformers(mt, disable=True)
+              folder, _ = compiler.get_compile_folder()
+              path = os.path.join(folder, f"unsloth_compiled_module_{mt}.py")
+              if not os.path.isfile(path):
+                  print(f"{mt}: no cache emitted"); continue
+              src = open(path, encoding="utf-8").read()
+              imported = set()
+              for m in re.finditer(r"from transformers\.models\.[\w.]+ import \(([^)]*)\)", src):
+                  imported |= {x.strip() for x in m.group(1).split(",") if x.strip()}
+              # every modeling name the cache CONSTRUCTS must be imported or defined
+              defined = set(re.findall(r"^class (\w+)", src, re.M)) | set(re.findall(r"^def (\w+)", src, re.M))
+              used = set(re.findall(r"= (\w+)\(", src)) & set(dir(mod))
+              missing = sorted(used - imported - defined)
+              print(f"{mt}: unbound modeling names = {missing}")
+              if missing: failures.append((mt, missing))
+          if failures:
+              sys.exit(f"cache would raise NameError: {failures}")
+          print("OK: no unbound modeling names in any generated cache")
+          PY
