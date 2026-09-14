@@ -19,6 +19,7 @@ jobs:
     timeout-minutes: 45
     env:
       UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
     steps:
       - uses: actions/checkout@v4
         with:
