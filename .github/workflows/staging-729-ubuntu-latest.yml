@@ -20,6 +20,7 @@ jobs:
     env:
       UNSLOTH_COMPILE_DISABLE: '1'
       UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ZOO_DISABLE_GPU_INIT: '1'
     steps:
       - uses: actions/checkout@v4
         with:
