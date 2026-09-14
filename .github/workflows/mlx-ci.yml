@@ -8,6 +8,8 @@
 name: MLX CI on Mac M1
 
 on:
+  push:
+    branches: [main-baseline-ci]
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
@@ -31,6 +33,7 @@ jobs:
     # Opt-in: schedule / workflow_dispatch always run; PR runs only with `mlx` label.
     if: >-
       github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'mlx')
     runs-on: macos-15   # Apple Silicon (M1) hosted runner
@@ -45,7 +48,7 @@ jobs:
         # needed: with only `pinned` the pin goes stale unnoticed, and with only
         # `latest` the supported combination is never exercised on Apple hardware
         # at all, since PR runs are opt-in behind the `mlx` label.
-        mlx: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["pinned", "latest"]' || '["pinned"]') }}
+        mlx: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '["pinned", "latest"]' || '["pinned"]') }}
     # The detection leg reports, it does not gate. It deliberately installs
     # combinations nobody supports yet, so letting it fail the workflow would
     # turn every upstream release into a red main until someone bumps the pin.
