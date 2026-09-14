@@ -33,6 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || echo "unsloth unavailable; the darwin+arm64 path does not need it"
           pip install pytest==9.0.3
       - name: Report the runtime under test
         run: |
