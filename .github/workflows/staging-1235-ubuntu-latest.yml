@@ -41,6 +41,10 @@ jobs:
         run: |
           set -euxo pipefail
           python -m pip install -e . pytest pytest-timeout
+          # unsloth_zoo refuses to import when the unsloth distribution is absent
+          # (find_spec("unsloth") is None -> ImportError), and every case here imports it
+          # in a fresh subprocess, so install it without pulling its own zoo pin back in.
+          python -m pip install --no-deps unsloth
       - name: Allocator and Tegra detection tests
         run: |
           set -euxo pipefail
