@@ -60,6 +60,11 @@ jobs:
       - name: Fail if nothing actually ran
         run: python ci_mlx/assert_ran.py pytest_head.txt 8
 
+      - name: Why is or is not a real qwen3_5 layer eligible
+        run: |
+          python ci_mlx/diagnose_1191.py --model mlx-community/Qwen3.5-0.8B-4bit \
+            --revision da28692b5f139cb0ec58a356b437486b7dac7462
+
       - name: Real recurrent model end to end
         run: |
           python ci_mlx/small_models_1191.py --model mlx-community/Qwen3.5-0.8B-4bit \
