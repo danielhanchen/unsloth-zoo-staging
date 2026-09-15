@@ -1,0 +1,103 @@
+name: "staging-1178 mlx apple silicon"
+
+on:
+  push:
+    branches: ["pr-1178-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  mlx:
+    name: "PR 1178 on Apple Silicon"
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      HF_HOME: ${{ github.workspace }}/.hf
+      UNSLOTH_COMPILE_DISABLE: '1'
+      NEW_TESTS: >-
+        test_vlm_only_text_routing_checks_remapped_module_presence or
+        test_native_name_sanitizer_preserves_vlm_expert_export or
+        test_cacheless_text_positions_match_language_wrapper or
+        test_cached_position_attribute_does_not_imply_multiaxis_rope or
+        test_native_vlm_names_preserve_source_remaps_and_transforms or
+        test_recurrent_language_layers_receive_one_adapter_each
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the supported MLX pins
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3 timm
+          python -m pip list | grep -iE "^(mlx|mlx-lm|mlx-vlm|transformers|torch) " || true
+
+      - name: Metal probe (hard gate)
+        run: python ci_mlx/metal_probe.py
+
+      - name: The PR's own tests
+        # One pytest process per file: tests/mlx_simulation/ replaces
+        # sys.modules["mlx.core"] process-wide the moment a file that calls
+        # simulate_mlx_on_torch() is collected, and every later metal file then
+        # runs against the torch shim. That is why the repo's own mlx-ci.yml
+        # gives each file its own `run:` line.
+        run: |
+          set -o pipefail
+          rc=0
+          for f in tests/test_mlx_distributed_loader.py \
+                   tests/test_mlx_gguf_moe_export_metal.py \
+                   tests/test_mlx_lora_group_selection.py \
+                   tests/test_mlx_training_e2e_metal.py; do
+            echo "::group::$f"
+            python -m pytest "$f" -v -rs 2>&1 | tee -a pytest_head.txt || rc=$?
+            echo "::endgroup::"
+          done
+          echo "AGGREGATE EXIT $rc"
+          exit "$rc"
+
+      - name: Fail if nothing actually ran
+        run: python ci_mlx/assert_ran.py pytest_head.txt 20
+
+      - name: Isolate an exit-139 in test_mlx_training_e2e_metal.py
+        # Every test can pass and the interpreter still die on the way out, which is
+        # what actually fails the job. `set +e` because the job shell runs with -e,
+        # so the first non-zero pytest would otherwise abort this step before it
+        # prints a single verdict.
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          F=tests/test_mlx_training_e2e_metal.py
+          for t in test_cacheless_text_positions_match_language_wrapper \
+                   test_cached_position_attribute_does_not_imply_multiaxis_rope \
+                   test_native_vlm_names_preserve_source_remaps_and_transforms \
+                   test_recurrent_language_layers_receive_one_adapter_each; do
+            python -m pytest "$F" -k "$t" -q > /dev/null 2>&1
+            echo "BISECT alone $t -> exit $?"
+          done
+          python -m pytest "$F" -q -k "not ($NEW_TESTS)" > /dev/null 2>&1
+          echo "BISECT file WITHOUT the new tests -> exit $?"
+          python -m pytest "$F" -q -k "$NEW_TESTS" > /dev/null 2>&1
+          echo "BISECT only the new tests -> exit $?"
+          python -m pytest "$F" -q > /dev/null 2>&1
+          echo "BISECT whole file -> exit $?"
+          exit 0
