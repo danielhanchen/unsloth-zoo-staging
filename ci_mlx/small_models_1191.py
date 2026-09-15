@@ -14,104 +14,136 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""PR 1191 on a real mlx-community checkpoint: same tokens, kernel actually used.
+"""PR 1191 against a real mlx-community checkpoint's own recurrent layers.
 
-`fused_decode_conv_silu` has no production call site on that branch, so this
-enters the scope explicitly. It asserts the Metal kernel really fires during
-single-token decode (and never during the prefill of an ineligible model), that
-greedy text is unchanged, and that every instance class is restored on exit.
+The PR's own tests build `Qwen3_5GatedDeltaNet` from a hand-written config. This
+runs the same prefill/decode contract on the 18 layers of a downloaded 4-bit
+Qwen3.5 checkpoint, with their real quantized weights, on real Metal.
+
+Load through mlx-vlm, not mlx-lm. This checkpoint carries a `vision_config`, so
+`unsloth_zoo.mlx.loader._is_vlm` is True and unsloth builds it with mlx-vlm,
+whose `Qwen3_5GatedDeltaNet` exposes the `_causal_conv1d_decode` fast path the
+fusion matches. mlx-lm's own `GatedDeltaNet` has no such method, so loading the
+same files with `mlx_lm.load` yields zero eligible layers and measures nothing.
 """
 
 import argparse
 import json
 import sys
 
-from mlx_lm import load
-from mlx_lm.generate import generate
+import mlx.core as mx
+import numpy as np
+from huggingface_hub import snapshot_download
+from mlx_vlm import load
+from mlx_vlm.models.qwen3_5 import language as native
 
 from unsloth_zoo.mlx import inference
 
-PROMPT = "List three prime numbers."
-MAX_TOKENS = 24
+PREFILL, DECODE = 3, 1
 
 
-def _greedy(model, tokenizer):
-    return generate(model, tokenizer, prompt = PROMPT, max_tokens = MAX_TOKENS, verbose = False)
+def _bits(array):
+    return np.array(array.view(mx.uint8))
 
 
-def _count_kernel(fn):
-    """Run `fn` with the fused conv+SiLU kernel entry point counted."""
-    calls = [0]
-    original = inference._decode_conv_silu
-
-    def counting(x, weight):
-        calls[0] += 1
-        return original(x, weight)
-
-    inference._decode_conv_silu = counting
-    try:
-        result = fn()
-    finally:
-        inference._decode_conv_silu = original
-    return result, calls[0]
-
-
-def _patched_count(model, classes):
-    return sum(1 for _, module in model.named_modules() if type(module) in classes)
+def _hidden_size(model, path):
+    for source in (getattr(getattr(model, "config", None), "text_config", None),
+                   getattr(model, "config", None)):
+        size = getattr(source, "hidden_size", None)
+        if size:
+            return int(size)
+    config = json.load(open(f"{path}/config.json", encoding = "utf-8"))
+    return int(config.get("text_config", config).get("hidden_size"))
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required = True)
     parser.add_argument("--revision", default = None)
-    parser.add_argument("--expect-recurrent", action = "store_true",
-                        help = "fail unless at least one layer is eligible and the kernel fires")
+    parser.add_argument("--expect-recurrent", action = "store_true")
     args = parser.parse_args()
 
-    kwargs = {"revision": args.revision} if args.revision else {}
-    model, tokenizer = load(args.model, **kwargs)
+    path = snapshot_download(args.model, revision = args.revision)
+    model, _ = load(path)
+    hidden = _hidden_size(model, path)
 
-    native_text, native_calls = _count_kernel(lambda: _greedy(model, tokenizer))
+    recurrent = [(name, module) for name, module in model.named_modules()
+                 if isinstance(module, native.Qwen3_5GatedDeltaNet)]
+    print(f"{len(recurrent)} recurrent layers, hidden_size={hidden}, "
+          f"kernel_compiled={inference._decode_conv_silu_kernel() is not None}")
 
-    with inference.fused_decode_conv_silu(model) as scoped:
-        # The scope builds one subclass per eligible base class; identify them by name.
-        patched_types = {type(m) for _, m in scoped.named_modules()
-                         if type(m).__name__.startswith("_FusedDecodeConvSiLU")}
-        eligible = _patched_count(scoped, patched_types)
-        fused_text, fused_calls = _count_kernel(lambda: _greedy(scoped, tokenizer))
-    leftover = _patched_count(model, patched_types)
+    mx.random.seed(3407)
+    samples = [mx.random.normal((1, n, hidden)).astype(mx.bfloat16)
+               for n in (PREFILL, DECODE, DECODE)]
 
+    # Native reference first, while nothing is patched.
+    expected = {}
+    for name, module in recurrent:
+        cache = native.ArraysCache(size = 2)
+        steps = []
+        for x in samples:
+            out = module(x, cache = cache)
+            mx.eval(out, cache.state)
+            steps.append((out, list(cache.state)))
+        expected[name] = steps
+
+    calls = []
+    original = inference._decode_conv_silu
+
+    def counting(*call_args):
+        calls.append(None)
+        return original(*call_args)
+
+    inference._decode_conv_silu = counting
+    failures, patched_count, prefill_calls, decode_calls = [], 0, 0, 0
+    try:
+        with inference.fused_decode_conv_silu(model) as scoped:
+            patched_count = sum(
+                1 for _, module in scoped.named_modules()
+                if type(module).__name__.startswith("_FusedDecodeConvSiLU"))
+            for name, module in recurrent:
+                cache = native.ArraysCache(size = 2)
+                for x, (out, states) in zip(samples, expected[name]):
+                    calls.clear()
+                    actual = module(x, cache = cache)
+                    mx.eval(actual, cache.state)
+                    if not np.array_equal(_bits(actual), _bits(out)):
+                        failures.append(f"{name}: output differs at T={x.shape[1]}")
+                    for index, (state, reference) in enumerate(zip(cache.state, states)):
+                        if not np.array_equal(_bits(state), _bits(reference)):
+                            failures.append(f"{name}: cache[{index}] differs at T={x.shape[1]}")
+                    if x.shape[1] == DECODE:
+                        decode_calls += len(calls)
+                    else:
+                        prefill_calls += len(calls)
+    finally:
+        inference._decode_conv_silu = original
+
+    leftover = sum(1 for _, module in model.named_modules()
+                   if type(module).__name__.startswith("_FusedDecodeConvSiLU"))
     report = {
         "model": args.model,
-        "eligible_layers": eligible,
+        "recurrent_layers": len(recurrent),
+        "patched_in_scope": patched_count,
         "still_patched_after_exit": leftover,
-        "kernel_calls_native": native_calls,
-        "kernel_calls_fused": fused_calls,
-        "text_identical": native_text == fused_text,
-        "native_text": native_text,
-        "fused_text": fused_text,
+        "kernel_calls_during_decode": decode_calls,
+        "kernel_calls_during_prefill": prefill_calls,
+        "bitwise_mismatches": len(failures),
     }
     print(json.dumps(report, indent = 2))
 
-    failures = []
-    if not report["text_identical"]:
-        failures.append("greedy output changed under the fusion scope")
     if leftover:
         failures.append(f"{leftover} modules left patched after the scope exited")
-    if native_calls:
-        failures.append(f"kernel fired {native_calls} times outside the scope")
+    if prefill_calls:
+        failures.append(f"the kernel fired {prefill_calls} times during prefill")
     if args.expect_recurrent:
-        if eligible == 0:
-            failures.append("no recurrent layer was eligible; the fusion never ran")
-        elif fused_calls == 0:
-            failures.append("layers were patched but the kernel never fired during decode")
-    else:
-        if eligible:
-            failures.append(f"control model unexpectedly patched {eligible} layers")
-        if fused_calls:
-            failures.append(f"control model fired the kernel {fused_calls} times")
+        if patched_count != len(recurrent) or not recurrent:
+            failures.append(f"patched {patched_count} of {len(recurrent)} recurrent layers")
+        # Two single-token decode steps per layer, one fused call each.
+        if decode_calls != 2 * len(recurrent):
+            failures.append(f"expected {2 * len(recurrent)} fused decode calls, got {decode_calls}")
 
-    for failure in failures:
+    for failure in failures[:12]:
         print(f"::error::{failure}")
     print("RESULT_1191:", "FAIL" if failures else "PASS")
     return 1 if failures else 0
