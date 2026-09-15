@@ -1,0 +1,77 @@
+name: "staging-1191 mlx apple silicon"
+
+on:
+  push:
+    branches: ["pr-1191-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  mlx:
+    name: "PR 1191 on ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # A hand-written Metal kernel is the most image-sensitive change here, so
+        # it runs on both Apple Silicon images the fleet offers.
+        os: [macos-15, macos-26]
+    env:
+      HF_HOME: ${{ github.workspace }}/.hf
+      UNSLOTH_COMPILE_DISABLE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the supported MLX pins
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3 timm
+          python -m pip list | grep -iE "^(mlx|mlx-lm|mlx-vlm|transformers|torch) " || true
+
+      - name: Metal probe (hard gate)
+        run: python ci_mlx/metal_probe.py
+
+      - name: The PR's own tests
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_mlx_decode_metal.py -v -rs 2>&1 | tee pytest_head.txt
+
+      - name: Fail if nothing actually ran
+        run: python ci_mlx/assert_ran.py pytest_head.txt 8
+
+      - name: Why is or is not a real qwen3_5 layer eligible
+        run: |
+          python ci_mlx/diagnose_1191.py --model mlx-community/Qwen3.5-0.8B-4bit \
+            --revision da28692b5f139cb0ec58a356b437486b7dac7462
+
+      - name: Real recurrent model end to end
+        run: |
+          python ci_mlx/small_models_1191.py --model mlx-community/Qwen3.5-0.8B-4bit \
+            --revision da28692b5f139cb0ec58a356b437486b7dac7462 --expect-recurrent
+
+      - name: Non-recurrent control (the kernel must stay idle)
+        run: |
+          rm -rf "$HF_HOME"
+          python ci_mlx/small_models_1191.py --model mlx-community/SmolLM-135M-Instruct-4bit \
+            --revision 642e06afe3fab57fd6cc518637c471af0a569e1e
