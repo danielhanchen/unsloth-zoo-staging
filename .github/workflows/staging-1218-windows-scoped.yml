@@ -1,0 +1,31 @@
+name: "staging-1218 windows scoped"
+on:
+  push:
+    branches: ["pr-1218-xplat-ci"]
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e ".[core]" "pytest==9.0.3" "pyyaml==6.0.2"
+      - run: python -m pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+      # Only the files this PR adds. The pre-existing
+      # test_gc_rewriter_bound_keywords.py imports unsloth_zoo.compiler, which
+      # imports triton, and triton ships no Windows wheels - a collection error
+      # there aborts the whole invocation and says nothing about these tests.
+      - run: python -m pytest tests/test_offloaded_checkpoint_simulation.py tests/test_offloaded_checkpoint_rng.py -q --tb=short
