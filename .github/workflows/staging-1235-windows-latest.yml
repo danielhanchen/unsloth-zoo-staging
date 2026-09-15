@@ -1,0 +1,55 @@
+name: "staging-1235 windows-latest"
+on:
+  push:
+    branches: ["pr-1235-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CPU torch first, except on Apple Silicon where the package declares none
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          if [ "$RUNNER_OS" = "macOS" ] && [ "$(uname -m)" = "arm64" ]; then
+            echo "Apple Silicon: unsloth-zoo declares no torch here, MLX path"
+          else
+            python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+              --extra-index-url https://pypi.org/simple 'torch>=2.4,<2.13'
+          fi
+      - name: Install unsloth-zoo and pytest
+        run: |
+          set -euxo pipefail
+          python -m pip install -e . pytest pytest-timeout
+          # unsloth_zoo refuses to import when the unsloth distribution is absent
+          # (find_spec("unsloth") is None -> ImportError), and every case here imports it
+          # in a fresh subprocess, so install it without pulling its own zoo pin back in.
+          python -m pip install --no-deps unsloth
+      - name: Allocator and Tegra detection tests
+        run: |
+          set -euxo pipefail
+          python -c "import platform, sys; print(platform.platform(), platform.machine(), sys.version)"
+          # test_alloc_conf_platform_matrix.py is the pre-existing Linux only suite (it fakes a
+          # Linux CUDA host too), so it is run on ubuntu-latest only.
+          python -m pytest tests/test_tegra_expandable_segments.py tests/test_alloc_conf_tegra_matrix.py \
+            -q --tb=short -rs -p no:cacheprovider
