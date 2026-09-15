@@ -49,5 +49,7 @@ jobs:
         run: |
           set -euxo pipefail
           python -c "import platform, sys; print(platform.platform(), platform.machine(), sys.version)"
+          # test_alloc_conf_platform_matrix.py is the pre-existing Linux only suite (it fakes a
+          # Linux CUDA host too), so it is run on ubuntu-latest only.
           python -m pytest tests/test_tegra_expandable_segments.py tests/test_alloc_conf_tegra_matrix.py \
-            tests/test_alloc_conf_platform_matrix.py -q --tb=short -p no:cacheprovider
+            -q --tb=short -rs -p no:cacheprovider

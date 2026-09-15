@@ -50,4 +50,4 @@ jobs:
           set -euxo pipefail
           python -c "import platform, sys; print(platform.platform(), platform.machine(), sys.version)"
           python -m pytest tests/test_tegra_expandable_segments.py tests/test_alloc_conf_tegra_matrix.py \
-            tests/test_alloc_conf_platform_matrix.py -q --tb=short -p no:cacheprovider
+            tests/test_alloc_conf_platform_matrix.py -q --tb=short -rs -p no:cacheprovider
