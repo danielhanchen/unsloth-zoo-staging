@@ -20,6 +20,8 @@ jobs:
     env:
       UNSLOTH_COMPILE_DISABLE: '1'
       UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ALLOW_CPU: '1'
+      HF_HUB_OFFLINE: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,5 +29,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
-      - run: rc=0; PYTHONPATH=studio/backend python -m pytest tests/test_merge_e2e_partial_refusal.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && ! grep -qE "^(FAILED|ERROR) " pytest_out.txt; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && ! grep -qE "^ERROR " pytest_out.txt; then tot=$(grep -cE "^FAILED " pytest_out.txt); dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt); if [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; fi; exit "$rc"
+      - run: python -m pip install pytest
+      - run: python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.4'
+      # .[core] brings the real dependency set, which is what the repository's own
+      # drift lanes install; a --no-deps editable install left `requests` missing and
+      # every test module failed at collection.
+      - run: python -m pip install -e '.[core]'
+      # unsloth_zoo/__init__.py raises on a missing `unsloth` spec before it reaches
+      # the UNSLOTH_IS_PRESENT check, so the package has to be importable even though
+      # nothing here uses it. --no-deps keeps it from moving torch or transformers.
+      - run: python -m pip install --no-deps 'unsloth @ git+https://github.com/unslothai/unsloth@main' || echo "unsloth unavailable"
+      - run: python -m pip install 'bitsandbytes>=0.45' || echo "optional deps unavailable on windows-latest"
+      - run: rc=0; python -m pytest tests/test_merge_e2e_partial_refusal.py tests/test_merge_e2e_dense.py tests/test_merge_e2e_vision_passthrough.py tests/test_merge_e2e_classification_head.py tests/test_merge_e2e_resized.py tests/test_saving_utils_lora_remap_count.py tests/test_dora_merge.py tests/test_moe_merge_e2e_cpu.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && ! grep -qE "^(FAILED|ERROR) " pytest_out.txt; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && ! grep -qE "^ERROR " pytest_out.txt; then tot=$(grep -cE "^FAILED " pytest_out.txt); dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt); if [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; fi; exit "$rc"
