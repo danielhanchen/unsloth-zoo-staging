@@ -1,4 +1,4 @@
-name: "staging-1240 ubuntu-24.04-arm"
+name: "staging-1240-BASE macos-15"
 on:
   push:
     branches: ["pr-1240-xplat-ci"]
@@ -15,7 +15,7 @@ defaults:
     shell: bash
 jobs:
   test:
-    runs-on: ubuntu-24.04-arm
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       UNSLOTH_COMPILE_DISABLE: '1'

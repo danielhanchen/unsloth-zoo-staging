@@ -1,4 +1,4 @@
-name: "staging-1240 ubuntu-latest"
+name: "staging-1240-BASE windows-latest"
 on:
   push:
     branches: ["pr-1240-xplat-ci"]
@@ -15,7 +15,7 @@ defaults:
     shell: bash
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 30
     env:
       UNSLOTH_COMPILE_DISABLE: '1'
