@@ -236,6 +236,41 @@ def add_new_tokens(
 pass
 
 
+# datasets' own default for Dataset.map(batched=True), so the fallback below and the
+# .map path it stands in for allocate the same size transient.
+_COUNT_INPUT_IDS_BATCH_SIZE = 1000
+
+
+def _count_input_ids(train_dataset, mapping):
+    """Apply `mapping` over the dataset's input_ids in batches.
+
+    Everything else in fix_untrained_tokens only needs len() and [j], so a plain list of
+    rows gets this far; only .map is datasets specific. Fall back to a direct batched call
+    instead of raising AttributeError. Same row convention as the checks above: a row
+    without an "input_ids" key is skipped."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if hasattr(train_dataset, "map"):
+        train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
+        return
+    pass
+    # Same batch size as the .map path above, for the same reason. `mapping` flattens the
+    # batch it is given into one array of every token in it, so handing it the whole
+    # dataset at once is an O(total tokens) transient allocation where .map is bounded.
+    # It accumulates into a counter rather than returning anything, which is what makes
+    # chunking exactly equivalent -- .map(batched=True) already calls it once per batch.
+    batch = []
+    for row in train_dataset:
+        if "input_ids" not in row: continue
+        batch.append(row["input_ids"])
+        if len(batch) >= _COUNT_INPUT_IDS_BATCH_SIZE:
+            mapping({"input_ids" : batch})
+            batch = []
+        pass
+    pass
+    if batch: mapping({"input_ids" : batch})
+pass
+
+
 @_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
@@ -461,7 +496,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         counter = np.fromiter(itertools.chain.from_iterable(input_ids), dtype = np.int32)
         np.add.at(final_counts, counter, 1)
     pass
-    train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
+    _count_input_ids(train_dataset, mapping)
 
     # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
