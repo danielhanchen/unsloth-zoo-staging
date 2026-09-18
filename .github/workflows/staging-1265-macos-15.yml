@@ -28,5 +28,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -e . pytest pytest-asyncio pytest-timeout && python -m pip install --no-deps git+https://github.com/unslothai/unsloth
+      # macOS arm64: pyproject gates torch OFF and the MLX deps ON, so a plain
+      # `pip install -e .` leaves mlx absent (every MLX test would skip, reporting
+      # green having executed nothing) and torch absent (test_mlx_trainer_internals
+      # cannot even be imported). Mirror .github/workflows/mlx-ci.yml instead.
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torch>=2.4.0,<2.13.0"
+          python -m pip install -e .[mlx]
+          python -m pip install pytest pytest-asyncio pytest-timeout timm
+          python -m pip install --no-deps git+https://github.com/unslothai/unsloth
+          python -c "import mlx.core as mx; print('metal available:', mx.metal.is_available())"
       - run: rc=0; python -m pytest tests/test_mlx_preference.py tests/test_mlx_trainer_internals.py tests/test_mlx_training_e2e_metal.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && ! grep -qE "^(FAILED|ERROR) " pytest_out.txt; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && ! grep -qE "^ERROR " pytest_out.txt; then tot=$(grep -cE "^FAILED " pytest_out.txt); dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt); if [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; fi; exit "$rc"
