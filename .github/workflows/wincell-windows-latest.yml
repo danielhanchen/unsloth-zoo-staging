@@ -1,0 +1,32 @@
+name: "wincell windows-latest"
+on:
+  push:
+    branches: ["pr-1255-wincell-ci"]
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ZOO_DISABLE_GPU_INIT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e . pytest pytest-asyncio pytest-timeout && python -m pip install --no-deps git+https://github.com/unslothai/unsloth
+      - run: python -m pip install torch peft
+      - name: the new cell only
+        run: |
+          python -m pytest tests/test_compiled_cache_fail_closed.py -q -rs -rf -v --tb=long -p no:cacheprovider -k "windows_read_only or planted_read_only or unlandable_rewrite" 2>&1 | tail -60
+      - name: whole file
+        run: |
+          python -m pytest tests/test_compiled_cache_fail_closed.py -q -rs -rf --tb=short -p no:cacheprovider 2>&1 | tail -30

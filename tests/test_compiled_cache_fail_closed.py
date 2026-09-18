@@ -765,3 +765,36 @@ def test_a_source_suffix_that_is_not_py_cannot_shadow_the_verified_module(
     # And the verified `.py` beside it is still perfectly loadable: the refusal
     # is about the shadow, not about the directory.
     assert not _planted_ran()
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason = "Windows-only: MoveFileEx honours the destination's read-only attribute",
+)
+def test_a_read_only_planted_cache_file_recovers_to_temp_on_windows(cache_dir):
+    """The Windows half of the read-only case, with nothing simulated.
+
+    On POSIX os.replace ignores the destination's own mode, so the same input
+    is REPAIRED (test_planted_read_only_cache_file_is_not_executed), and the
+    recovery is only reachable by monkeypatching _replace_compiled_cache_file
+    (test_unlandable_rewrite_over_planted_bytes_is_not_imported). Windows
+    refuses both the in-place write (errno 13) and MoveFileEx over a read-only
+    destination (WinError 5), so it reaches that recovery for real, and nothing
+    asserted that: every mode-enforcement cell is skipped there.
+    """
+    name = "UnslothFailClosedProbeWindowsReadOnly"
+    planted = _plant(cache_dir, name, 0o444)
+    try:
+        module = _emit(name)
+
+        assert not _planted_ran(), "the planted cache file was imported and executed"
+        assert module.probe() == "genuine"
+        # Never repaired on Windows, and never imported either.
+        assert planted.read_text() == _PLANTED_SOURCE
+        assert os.path.realpath(module.__file__).startswith(
+            os.path.realpath(tempfile.gettempdir())
+        )
+    finally:
+        # The file fixture restores directories, not files, and a read-only file
+        # defeats rmtree on Windows.
+        os.chmod(planted, 0o644)
