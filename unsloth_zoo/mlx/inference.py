@@ -1054,8 +1054,11 @@ def fused_moe_router(model):
     try:
         with _MOE_ROUTER_LOCK:
             modules = model.named_modules() if hasattr(model, "named_modules") else ()
+            # GATE A.2 SURGICAL REVERT: the scope still exists, every symbol the tests import
+            # still exists, but no module is ever patched. Any test that still passes is testing
+            # its own mocks rather than the fusion.
             if (not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
-                    and _moe_router_kernel() is not None):
+                    and _moe_router_kernel() is not None and False):
                 for _, module in modules:
                     # Type before `training`: named_modules() may yield plain stand-ins.
                     if not isinstance(module, dict) or module.training or "__call__" in module:
