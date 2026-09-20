@@ -18253,7 +18253,7 @@ def save_pretrained_gguf(
         install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
-        internal_scripts_dir_pin,
+        _converter_dir_is_incomplete,
     )
 
     quant_map = {
@@ -18426,12 +18426,28 @@ def save_pretrained_gguf(
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
         supported_text_archs = None
         supported_vision_archs = None
-        # internal_scripts_dir_pin rather than setting the variable here: this
-        # points the patcher at an install Unsloth just made, and deriving trust
-        # from the variable alone made that converter look user-pinned, which
-        # turned UNSLOTH_CONVERTER_SCAN_STRICT off for this whole path.
-        with _LLAMA_CPP_PATCHER_ENV_LOCK, internal_scripts_dir_pin(llama_cpp_folder):
-            result = _download_convert_hf_to_gguf()
+        with _LLAMA_CPP_PATCHER_ENV_LOCK:
+            old_scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+            # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR outranks UNSLOTH_LLAMA_CPP_CONVERTER_TAG,
+            # so synthesizing it unconditionally made that escape hatch inert here.
+            # A real user override still wins: it is already set, so this is skipped.
+            # An install whose entrypoint imports conversion/ without that package
+            # on disk is excluded too: pinning it as authoritative is what stops the
+            # staged resolver from repairing the very install this change is for.
+            _synthesize = (
+                old_scripts_dir is None
+                and not os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip()
+                and not _converter_dir_is_incomplete(llama_cpp_folder)
+            )
+            if _synthesize:
+                os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = llama_cpp_folder
+            try:
+                result = _download_convert_hf_to_gguf()
+            finally:
+                if _synthesize:
+                    os.environ.pop("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", None)
+                elif old_scripts_dir is not None:
+                    os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = old_scripts_dir
         if isinstance(result, tuple) and len(result) >= 3:
             converter, supported_text_archs, supported_vision_archs = result[:3]
         elif isinstance(result, str):
