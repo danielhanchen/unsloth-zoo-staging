@@ -656,6 +656,14 @@ def _allowlist_builtins():
 pass
 
 
+# Match statement nodes only exist on 3.10+ and this module still has to
+# import on 3.9, so they are looked up instead of named. An empty tuple makes
+# every isinstance below simply false.
+_MATCH_CLASS_NODES = tuple(
+    node for node in (getattr(ast, "MatchClass", None),) if node is not None
+)
+
+
 def _reject_dunder_access(tree):
     """
     Restricted builtins alone do not stop `().__class__.__bases__[0].__subclasses__()`,
@@ -687,6 +695,21 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Name '{node.id}' is not allowed in generated code."
             )
+        # A match class-pattern getattrs the subject with the names in
+        # kwd_attrs, which are strings on the node: `case object(__class__=x)`
+        # is the subclasses walk with no Attribute node anywhere in the source.
+        # This is the one identifier-as-string field that reads an attribute;
+        # the others (arg.arg, keyword.arg, alias, except/match capture names,
+        # global/nonlocal) only BIND a name, and binding a dunder reaches
+        # nothing while the Name rule above refuses every read of it. Rejecting
+        # those as well cost 11 working programs -- `dict(__class__ = "label")`
+        # among them -- and closed nothing, so the rule stops here.
+        if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
+            for attr in (node.kwd_attrs or []):
+                if attr.startswith("_") or attr in _DENIED_ATTR_NAMES:
+                    raise RuntimeError(
+                        f"Attribute '{attr}' is not allowed in generated code."
+                    )
 pass
 
 
@@ -1046,20 +1069,31 @@ import random
 import subprocess
 
 def is_port_open(host, port):
-    """ Check if the port like localhost:8000 is open or closed """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    """ Check if the port like localhost:8000 is open or closed
+
+    The family comes from getaddrinfo, not from AF_INET: an IPv6 host is
+    unreachable over an AF_INET socket, and a dual-stack `localhost` resolves to
+    both 127.0.0.1 and ::1 with the listener on only one of them, so every
+    candidate is tried before the port is called closed.
+    """
     try:
-        sock.settimeout(1)  # Set a timeout for the connection attempt
-        result = sock.connect_ex((host, port))
-        if result == 0:
-            return True  # Port is open
-        else:
-            return False # Port is closed or connection failed
+        candidates = socket.getaddrinfo(host, port, type = socket.SOCK_STREAM)
     except socket.error as e:
         print(f"Socket error: {e}")
         return False
-    finally:
-        sock.close()
+    for family, socktype, proto, _, sockaddr in candidates:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(1)  # Set a timeout for the connection attempt
+            # sockaddr passes through unmodified: AF_INET6 carries flowinfo and
+            # scope_id, and a rebuilt (host, port) pair would drop the scope.
+            if sock.connect_ex(sockaddr) == 0:
+                return True  # Port is open
+        except socket.error as e:
+            print(f"Socket error: {e}")
+        finally:
+            sock.close()
+    return False # Port is closed or connection failed
 pass
 
 
@@ -1086,6 +1120,36 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
         return f"{working_directory}{os.pathsep}{src_path}"
 
 
+# Ports this process actually spawned an OpenEnv child on, keyed to the Popen
+# handle. /health is unauthenticated and its body is a fixed word, so it says
+# "something is listening", never "my server is listening"; the handle is the
+# only thing that can tell the two apart.
+_OPENENV_CHILDREN = {}
+
+
+def _openenv_url(client_host, port):
+    """ http://host:port, bracketing an IPv6 literal as RFC 3986 3.2.2 requires
+
+    Unbracketed, `http://::1:9000` reads as host `` with the rest as the port.
+    A colon cannot appear in a DNS name, so it identifies the literal.
+    """
+    if ":" in client_host: client_host = f"[{client_host}]"
+    return f"http://{client_host}:{port}"
+pass
+
+
+def _openenv_child_alive(port):
+    """ Is the child we spawned on this port still the process holding it? """
+    child = _OPENENV_CHILDREN.get(port, None)
+    if child is None: return False
+    if child.poll() is not None:
+        # It exited, so the port is free for anyone else to take.
+        _OPENENV_CHILDREN.pop(port, None)
+        return False
+    return True
+pass
+
+
 def launch_openenv(
     port : int = 8111,
     openenv_process = None,
@@ -1093,14 +1157,30 @@ def launch_openenv(
     server : str = "envs.openspiel_env.server.app:app",
     environment = {},
     openenv_class = None,
+    host : str = "127.0.0.1",
 ):
-    """ Finds a new port or checks if the old open port actually works """
+    """ Finds a new port or checks if the old open port actually works
+
+    `host` is the interface the environment server binds. It defaults to
+    loopback because the OpenEnv app authenticates nobody and every URL below
+    is localhost, so a wider bind only publishes the training run's environment
+    to the host's networks and to anything sharing its container bridge. Pass
+    host yourself if a remote worker genuinely has to reach it.
+
+    `openenv_process` is only reused when this process spawned the child holding
+    `port`. A server started outside this process is therefore NOT adopted even
+    when it is healthy and genuinely yours: a second uvicorn is spawned on a new
+    port and the passed client is dropped. That is the deliberate cost of the
+    check, since /health proves only that something answered, and an externally
+    managed server is indistinguishable from a process that took the port.
+    """
     # Check if OpenEnv is working first
     assert type(environment) is dict
     assert type(port) is int and port >= 0 and port <= (65535-1)
     assert type(working_directory) is str
     assert openenv_class is not None
     assert type(server) is str
+    assert type(host) is str and host != ""
 
     # Auto-fix PYTHONPATH for OpenEnv compatibility
     correct_pythonpath = _get_openenv_pythonpath(working_directory)
@@ -1108,10 +1188,25 @@ def launch_openenv(
         environment = dict(environment)  # Don't mutate original
         environment["PYTHONPATH"] = correct_pythonpath
 
-    localhost = f"http://localhost:{port}"
+    # A wildcard bind has to be dialled through a real address, and it must be
+    # one of the SAME family: asyncio's create_server sets IPV6_V6ONLY on every
+    # AF_INET6 listener unconditionally, so a `::` server answers on ::1 and not
+    # on 127.0.0.1 even where the host is dual stack. `localhost` cannot be that
+    # address, since which family it resolves to is the resolver's choice.
+    client_host = {"0.0.0.0" : "127.0.0.1", "::" : "::1"}.get(host, host)
+    localhost = _openenv_url(client_host, port)
 
     def check_openenv_works(process):
         if process is not None:
+            # A health check only proves someone answered. Unless that someone
+            # is the child we started, it is a local process that took the port
+            # after ours exited, and adopting it hands the training loop its
+            # observations and rewards.
+            if not _openenv_child_alive(port):
+                if hasattr(process, "close"):
+                    try: process.close()
+                    except: pass
+                return None
             try:
                 request = requests.get(f"{localhost}/health", timeout = 0.1).content
                 if b"healthy" not in request and hasattr(process, "close"):
@@ -1131,19 +1226,31 @@ def launch_openenv(
     while openenv_process is None:
         # Port ID must be less than uint16_MAX
         port = random.randint(9000, 65535-1)
-        localhost = f"http://localhost:{port}"
+        localhost = _openenv_url(client_host, port)
+        # Someone already holds it, so uvicorn would fail to bind and we would
+        # end up talking to them instead.
+        if is_port_open(client_host, port):
+            trials += 1
+            if trials == 30:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+            continue
         print(f"Unsloth: Creating new OpenEnv process at port = {port}", end = "")
-        openenv_process = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", server, "--host", "0.0.0.0", "--port", str(port)],
+        openenv_child = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", server, "--host", host, "--port", str(port)],
             env = environment,
             stdout = subprocess.PIPE,
             stderr = subprocess.PIPE,
             text = True,
             cwd = working_directory,
         )
+        _OPENENV_CHILDREN[port] = openenv_child
         # Wait until port is open
         wait_trials = 0
-        while not is_port_open("localhost", port):
+        while not is_port_open(client_host, port):
+            # A child that died cannot be the one that opens this port later.
+            if openenv_child.poll() is not None:
+                _OPENENV_CHILDREN.pop(port, None)
+                break
             time.sleep(0.01)
             if wait_trials % 10 == 0:
                 print(".", end = "")
@@ -1151,6 +1258,11 @@ def launch_openenv(
             if wait_trials == 6000:
                 raise TimeoutError("Unsloth: We tried launching a new OpenEnv Localhost for 60 seconds, but we still failed :(")
         print()
+        if _OPENENV_CHILDREN.get(port, None) is not openenv_child:
+            trials += 1
+            if trials == 30:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+            continue
         openenv_process = openenv_class(base_url = localhost)
         openenv_process = check_openenv_works(openenv_process)
         if openenv_process is not None: break
