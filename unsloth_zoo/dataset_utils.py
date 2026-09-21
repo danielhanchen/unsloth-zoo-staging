@@ -765,6 +765,38 @@ def train_on_responses_only(
     len_Q_must = len(Q_must)
     Q_left_reversed = Q_left[::-1]
     Q_right_forward = Q_right
+
+    # Shared special-token openers (ChatML, Llama, Gemma) delimit every role,
+    # including tool/system. A plain-text common prefix could also occur in an answer.
+    message_start = []
+    for q, a in zip(Q_must, A_must):
+        if q != a: break
+        message_start.append(q)
+    # Every token of that opener must be a registered special token, and at least one
+    # must carry non-whitespace text. `all_special_ids` reports only the attribute
+    # specials (bos/eos/pad/unk/...), so on real tokenizers it holds none of the actual
+    # openers - <|im_start|>, <|start_header_id|>, <start_of_turn> are added tokens and
+    # have to be read from added_tokens_decoder, or this whole branch never fires.
+    # The non-whitespace requirement is what keeps a tokenizer that registers a bare
+    # "\n" as a special token (NVIDIA Nemotron) from ending every span at the first
+    # newline inside an answer.
+    added_tokens = getattr(tokenizer, "added_tokens_decoder", None) or {}
+    special_ids  = {i for i, t in added_tokens.items() if getattr(t, "special", False)}
+    special_ids.update(getattr(tokenizer, "all_special_ids", None) or [])
+    if not all(i in special_ids for i in message_start) or \
+        not any(getattr(added_tokens.get(i), "content", "").strip() for i in message_start):
+        message_start = []
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
+    # Every boundary test below fires only on one of these ids, so one set lookup per
+    # token stands in for four comparisons. The span scan walks every token of every
+    # row, and testing them one at a time cost 81 -> 176 us on a 1540 token row.
+    boundary_first = {A_first}
+    if bos_token_id is not None: boundary_first.add(bos_token_id)
+    if eos_token_id is not None: boundary_first.add(eos_token_id)
+    if message_start: boundary_first.add(message_start[0])
+
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
 
@@ -805,7 +837,7 @@ def train_on_responses_only(
             n_minus_1 = n - 1
             j = 0
 
-            # Collect all (assistant_k, user_j) spans for this sample
+            # Collect assistant spans, stopping at message or sample boundaries.
             spans = []
             while j < n:
                 # Find <assistant>
@@ -827,10 +859,25 @@ def train_on_responses_only(
                     assistant_k = k
 
                     j = assistant_k
-                    # Find the next <user> (or the final item if assistant is last)
+                    # Keep the assistant's EOS, but never span another message/sample.
                     while j < n:
+                        token = input_ids[j]
+                        if token in boundary_first:
+                            if token == eos_token_id:
+                                spans.append((assistant_k, j + 1))
+                                break
+                            if token == bos_token_id or \
+                                (message_start and token == message_start[0] and \
+                                 input_ids[j : j + len(message_start)] == message_start) or \
+                                (token == A_first and input_ids[j : j + len_A_must] == A_must):
+                                spans.append((assistant_k, j))
+                                # Revisit the boundary so a following assistant is not skipped.
+                                j -= 1
+                                break
+                            pass
+                        pass
                         if (j == n_minus_1) or \
-                            ((input_ids[j] == Q_first) and \
+                            ((token == Q_first) and \
                              (input_ids[j : (k := j + len_Q_must)] == Q_must)):
 
                             # Extend over optional tokens, backward then forward
