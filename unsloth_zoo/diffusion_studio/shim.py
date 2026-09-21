@@ -35,12 +35,15 @@ Run:  DG_VISUAL_BIN=.../llama-diffusion-gemma-visual-server \
 import argparse
 import asyncio
 import atexit
+import ipaddress
 import json
 import math
 import os
+import socket
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -53,9 +56,73 @@ _PLAYER_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "can
 # DG_ARTIFACT=1 also appends the legacy replay HTML artifact (export/debug); default is live frames only.
 _WANT_ARTIFACT = os.environ.get("DG_ARTIFACT", "") not in ("", "0", "false", "False", "no", "off")
 
+DEFAULT_HOST = "127.0.0.1"
+# 256 tokens per canvas block, so 64 blocks is a 16384-token answer: far above the
+# 2048-token default, and low enough that one caller cannot hold _LOCK for hours.
+DEFAULT_MAX_BLOCKS = 64
+
 app = FastAPI()
-_STATE = {}          # server (VisualServer), player (html template str)
+_STATE = {}          # server (VisualServer), player (html template str), host (bind address)
 _LOCK = threading.Lock()
+
+
+def _is_local_name(hostname):
+    """Whether a Host/Origin hostname names this machine's own loopback interface."""
+    if not hostname:
+        return False
+    hostname = hostname.strip().lower().rstrip(".")
+    if hostname in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        pass
+    # `127.1` and the other short forms are what a user typed reaching their own
+    # machine, and inet_aton is how the Studio backend's host_policy accepts them.
+    # Widening to these costs nothing: a numeric literal cannot be rebound, so it
+    # names loopback or it fails is_loopback below.
+    try:
+        return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(hostname))).is_loopback
+    except (OSError, ValueError):
+        return False
+
+
+def _hostname_of(value):
+    """The hostname `urlsplit` reads out of an authority or URL, or None when it
+    will not parse. `urlsplit` raises on a malformed bracketed literal such as
+    `[oops]`, which uncaught is a 500 rather than a refusal, and a host nobody can
+    parse is exactly the one not to trust. A `user@host` form is refused outright:
+    that is not Host syntax, and only the part after the `@` would be compared.
+    """
+    try:
+        split = urlsplit(value)
+        return None if "@" in (split.netloc or "") else split.hostname
+    except ValueError:
+        return None
+
+
+@app.middleware("http")
+async def _bind_to_local_caller(request, call_next):
+    """Loopback is not an authorization boundary for a browser: any page the user
+    visits can POST here cross-site with no preflight (a text/plain body is a CORS
+    simple request), and a name rebound to 127.0.0.1 makes the reply readable too.
+    Bind every request to this machine instead: the Host must be a loopback name
+    (which is what breaks rebinding), and an Origin or Referer, when the caller
+    sends one at all, must be local. An ordinary OpenAI client sends neither.
+    """
+    # Only when we are loopback-only. A deliberate --host 0.0.0.0 is the operator
+    # publishing this listener, and then the Host is whatever name they reach it by.
+    if _is_local_name(_STATE.get("host", DEFAULT_HOST)) and \
+        not _is_local_name(_hostname_of("//" + (request.headers.get("host") or ""))):
+        return JSONResponse({"error": "forbidden host"}, status_code = 403)
+    for header in ("origin", "referer"):
+        # Every value, not the first: a proxy or a hand-written client can send the
+        # header twice, and `.get` would answer with a local one while a foreign one
+        # rode along behind it.
+        for value in request.headers.getlist(header):
+            if value and not _is_local_name(_hostname_of(value)):
+                return JSONResponse({"error": "forbidden origin"}, status_code = 403)
+    return await call_next(request)
 
 
 def _close_server():
@@ -193,7 +260,17 @@ def _max_blocks(body):
         mt = int(mt)
     except (TypeError, ValueError):
         mt = 2048
-    return max(1, math.ceil(mt / V.CANVAS))
+    # Clamped so a request cannot name an arbitrary block count. This is a size
+    # bound and not a deadline, and it is not what stops a long generation: the
+    # server answers anything over its own per-turn budget with ERR toolong, and
+    # an explicit --maxtok is already capped at 8192 (32 blocks) by _canvas_maxtok,
+    # below this ceiling. It binds only against an auto-sized budget above 16384.
+    # DG_MAX_BLOCKS raises it, read at the call so Studio can set it after import.
+    try:
+        ceiling = max(1, int(os.environ.get("DG_MAX_BLOCKS", "").strip()))
+    except ValueError:
+        ceiling = DEFAULT_MAX_BLOCKS
+    return max(1, min(ceiling, math.ceil(mt / V.CANVAS)))
 
 
 def _artifact(frames):
@@ -363,7 +440,7 @@ async def chat(req: Request):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--port", type=int, default=8123)
     ap.add_argument("--gpu", default=os.environ.get("DG_GPU", "0"))
     ap.add_argument("--maxtok", type=int, default=0,
@@ -373,6 +450,7 @@ def main():
                          "the model does not fit VRAM (else the load OOMs in cudaMalloc)")
     args = ap.parse_args()
 
+    _STATE["host"] = args.host
     _STATE["player"] = open(_PLAYER_TEMPLATE).read()
     print(f"loading {args.gguf} on GPU {args.gpu} (optimized visual decoder) ...", flush=True)
     _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok, ngl=args.ngl)
