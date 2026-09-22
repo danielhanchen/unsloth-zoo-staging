@@ -23,10 +23,13 @@ except ImportError:
     torch = None
 import functools
 import gc
+import inspect
 import numpy as np
 import itertools
 import datasets
 import re
+
+from .log import logger
 
 __all__ = [
     "mean_of_trained_tokens",
@@ -264,6 +267,22 @@ def _count_input_ids(train_dataset, mapping):
 pass
 
 
+def _requires_arguments(method):
+    """Whether calling `method()` fails on the signature rather than in the body.
+
+    Unreadable signatures (C extensions, exotic wrappers) count as callable, so a
+    TypeError from one propagates instead of being read as an uncallable accessor.
+    """
+    try:
+        inspect.signature(method).bind()
+    except TypeError:
+        return True
+    except (ValueError, AttributeError):
+        return False
+    return False
+pass
+
+
 @_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
@@ -271,8 +290,44 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    embedding_matrix = model.get_input_embeddings ().weight
-    lm_head_matrix   = model.get_output_embeddings().weight
+    # Not every checkpoint can hand back a single embedding matrix, and
+    # `hasattr` does not answer the question. transformers 5 defines
+    # get_input_embeddings on every PreTrainedModel with a base implementation
+    # that raises NotImplementedError, so Qwen3-Omni, which carries a thinker
+    # and a talker, raises here; and remote code can declare a non-standard
+    # signature that cannot be called at all (stepfun-ai/Step-3.7-Flash defines
+    # get_input_embeddings(self, input_ids), which raises TypeError). There is
+    # nothing to reset in either case, so skip the pass instead of failing the
+    # run before training starts.
+    try:
+        input_embeddings  = model.get_input_embeddings ()
+        output_embeddings = model.get_output_embeddings()
+        # A model is also entitled to answer "I have none" by returning None,
+        # and `.weight` on that is an AttributeError several frames from the
+        # cause. Same outcome, so route it through the same skip.
+        if input_embeddings is None or output_embeddings is None:
+            raise NotImplementedError("no input or output embeddings")
+        embedding_matrix = input_embeddings.weight
+        lm_head_matrix   = output_embeddings.weight
+    except (NotImplementedError, TypeError) as error:
+        # A TypeError only means "cannot be called" when the signature says so.
+        # Raised from inside a zero-argument accessor it is a genuine failure in
+        # the model, and swallowing it would train on without the NaN guard, so
+        # let it through.
+        if isinstance(error, TypeError) and not (
+            _requires_arguments(model.get_input_embeddings) or
+            _requires_arguments(model.get_output_embeddings)
+        ):
+            raise
+        # Warning rather than info: skipping means the run loses the NaN guard
+        # this pass provides, and the success path below announces itself with
+        # a plain print, so an invisible skip would be the odd one out.
+        logger.warning(
+            f"Unsloth: Skipping the untrained token fix for "
+            f"{type(model).__name__}, which does not expose a single input "
+            f"embedding."
+        )
+        return
     chat_template = getattr(tokenizer, "chat_template", None)
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
 
