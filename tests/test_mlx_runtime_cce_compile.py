@@ -39,6 +39,81 @@ def _skip_torch_shim():
         pytest.skip("requires real MLX runtime")
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("finalize", [False, True])
+def test_single_simd_forward_preserves_each_row(dtype, finalize):
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import runtime_cce as rt
+
+    mx.random.seed(718)
+    rows, width = 267, 2048
+    targets = mx.where(mx.arange(rows) % 5 == 0, -100, mx.arange(rows) * 17)
+    inputs = [
+        mx.random.normal((rows, width)).astype(dtype), targets,
+        mx.random.uniform(shape=(rows,)), mx.random.uniform(shape=(rows,)),
+        mx.random.normal((rows,)), mx.array([1024], mx.int32),
+        mx.array([-100], mx.int32), mx.array([0.0], mx.float32),
+    ]
+    original = (rt._build_forward_update_finalize_kernel() if finalize
+                else rt._build_forward_update_kernel())
+
+    def unreachable(**kwargs):
+        raise AssertionError("fell back from the single SIMD kernel")
+
+    optimized = rt._with_single_simd_forward(unreachable, finalize)
+    kwargs = dict(
+        inputs=inputs, output_shapes=[(rows,)] * (5 if finalize else 3),
+        output_dtypes=[mx.float32] * (5 if finalize else 3),
+        grid=(rows * 256, 1, 1), threadgroup=(256, 1, 1),
+    )
+    expected, actual = original(**kwargs), optimized(**kwargs)
+    mx.eval(expected, actual)
+    for left, right in zip(expected, actual):
+        assert mx.allclose(left, right, atol=1e-5, rtol=1e-5).item()
+
+
+@pytest.mark.parametrize("frozen,dim", [(False, 512), (False, 1024), (True, 1024)])
+def test_automatic_chunks_reduce_backward_peak(frozen, dim):
+    _skip_torch_shim()
+    import gc
+    from unsloth_zoo.mlx.cce import _get_runtime_cce
+
+    mx.random.seed(812)
+    hidden = mx.random.normal((512, dim)).astype(mx.bfloat16)
+    weight = (mx.random.normal((16384, dim)) * 0.05).astype(mx.bfloat16)
+    targets = mx.where(mx.arange(512) % 7 == 0, -100, mx.arange(512) * 31)
+    mx.eval(hidden, weight, targets)
+    functions = []
+    for chunk in (2048, 0):
+        runtime = _get_runtime_cce(
+            ignore_index=-100, logit_softcap=0, chunk_size=chunk, weight_is_frozen=frozen,
+        )
+        def loss(h, w, runtime=runtime):
+            return runtime(h, w, targets).sum() / 512
+        functions.append(mx.compile(mx.value_and_grad(loss, argnums=0 if frozen else (0, 1))))
+    expected, actual = [fn(hidden, weight) for fn in functions]
+    mx.eval(expected, actual)
+    assert actual[0].item() == pytest.approx(expected[0].item(), abs=2e-5)
+    pairs = [(expected[1], actual[1])] if frozen else zip(expected[1], actual[1])
+    for left, right in pairs:
+        assert mx.allclose(left, right, atol=2e-5, rtol=0.02).item()
+    del expected, actual, left, right, pairs
+    peaks = []
+    for fn in functions:
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        result = fn(hidden, weight)
+        mx.eval(result)
+        peaks.append(mx.get_peak_memory() - resident)
+        del result
+    assert peaks[1] <= peaks[0]
+    if frozen or dim == 512:
+        assert peaks[1] < peaks[0]
+
+
 def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
     # hidden=0 with non-empty targets must raise, not silently drop labels.
     _skip_torch_shim()
@@ -571,3 +646,46 @@ def test_runtime_cce_backward_peak_memory(quantized, budget_mib):
     peak = mx.get_peak_memory() - resident
     assert mx.isfinite(result[0]).item()
     assert peak < budget_mib * 1024**2, f"CCE backward used {peak / 1024**2:.2f} MiB"
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("softcap", [0.0, 5.0])
+def test_frozen_head_gradient_is_built_in_the_forward(monkeypatch, quantized, softcap):
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import runtime_cce
+
+    mx.random.seed(5)
+    hidden = mx.random.normal((67, 64)) * 0.5
+    weight = mx.random.normal((4099, 64)) * 0.3
+    # Targets in every chunk, ignored rows, and one out-of-range label.
+    targets = mx.where(mx.arange(67) % 11 == 7, -100, (mx.arange(67) * 613) % 4099)
+    targets = mx.where(mx.arange(67) == 30, 4099, targets)
+    cotangent = mx.linspace(-0.7, 0.9, 67)
+    if quantized:
+        head = mx.quantize(weight, group_size=64, bits=4)
+        weight = mx.dequantize(*head, group_size=64, bits=4)
+        loss = runtime_cce.make_chunked_cross_entropy_loss(
+            quantized=True, group_size=64, bits=4, chunk_size=1024, logit_softcap=softcap,
+            precompute_hidden_gradient=True)[0]
+    else:
+        head = (weight,)
+        loss = runtime_cce.make_chunked_cross_entropy_loss(
+            weight_is_frozen=True, chunk_size=1024, logit_softcap=softcap, precompute_hidden_gradient=True)[0]
+    reference = runtime_cce.make_chunked_cross_entropy_loss(chunk_size=1024, logit_softcap=softcap)[0]
+
+    def run(fn, h, y, g, *args):
+        return mx.value_and_grad(lambda x: (fn(x, *args, y) * g).sum())(h)
+
+    calls, forward = [], runtime_cce._forward_with_hidden_gradient
+    monkeypatch.setattr(runtime_cce, "_forward_with_hidden_gradient",
+                        lambda *args, **kwargs: (calls.append(1), forward(*args, **kwargs))[1])
+    actual = run(loss, hidden, targets, cotangent, *head)
+    mx.eval(actual)
+    assert calls == [1]
+    compiled = mx.compile(lambda *args: run(loss, *args))(hidden, targets, cotangent, *head)
+    expected = run(reference, hidden, targets, cotangent, mx.stop_gradient(weight))
+    mx.eval(compiled, expected)
+    assert mx.array_equal(loss(hidden, *head, targets), reference(hidden, weight, targets), equal_nan=True).item()
+    for got in (actual, compiled):
+        assert mx.all(mx.isnan(got[1][30])).item()
+        assert mx.allclose(got[1], expected[1], atol=2e-6, rtol=0, equal_nan=True).item()
