@@ -26,6 +26,8 @@ sets truthy `use_cache` flags to False. These tests pin the contract:
 
 from __future__ import annotations
 
+import copy
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -198,3 +200,91 @@ def test_double_prepare_keeps_first_originals():
     prepare_model_for_training(model, use_gradient_checkpointing = True)
     restore_use_cache(model)
     assert model.config.use_cache is True
+
+
+# Configs that never declared use_cache at all. transformers 5 sub-configs
+# inherit no default (measured: True on both 4.57.6 and 5.17.0), so a model
+# whose forward reads self.config.use_cache raised AttributeError under
+# gradient checkpointing rather than training. stepfun-ai/Step-3.7-Flash ships
+# a Step3p7TextConfig of exactly this shape.
+
+
+class _NoUseCacheConfig(PreTrainedConfig):
+    model_type = "unsloth_no_use_cache_probe"
+
+
+def _composite_without_use_cache():
+    config = LlamaConfig(use_cache = True)
+    config.text_config = _NoUseCacheConfig()
+    assert not hasattr(config.text_config, "use_cache")
+    return config
+
+
+def test_absent_use_cache_is_set_so_forward_can_read_it():
+    config = _composite_without_use_cache()
+    model = _ConfigCarrier(config)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing = True, use_reentrant = False,
+    )
+    # The point of the fix: the attribute now exists, so `self.config.use_cache`
+    # returns False instead of raising AttributeError.
+    assert config.text_config.use_cache is False
+
+
+def test_restore_removes_an_invented_use_cache_rather_than_inventing_False():
+    """A config that never had the attribute must not keep one afterwards.
+
+    Without the _ABSENT sentinel the restore would write False back, which is a
+    different config from the one the checkpoint shipped and would disable the
+    KV cache for inference.
+    """
+    config = _composite_without_use_cache()
+    model = _ConfigCarrier(config)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing = True, use_reentrant = False,
+    )
+    assert config.text_config.use_cache is False
+    restore_use_cache(model)
+    assert not hasattr(config.text_config, "use_cache")
+    # the sibling that really had one is restored to its own value, not deleted
+    assert config.use_cache is True
+
+
+def test_absent_use_cache_survives_a_disable_restore_cycle():
+    config = _composite_without_use_cache()
+    model = _ConfigCarrier(config)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing = True, use_reentrant = False,
+    )
+    restore_use_cache(model)
+    disable_use_cache(model)
+    assert config.text_config.use_cache is False
+    restore_use_cache(model)
+    assert not hasattr(config.text_config, "use_cache")
+
+
+@pytest.mark.parametrize(
+    "clone",
+    [
+        pytest.param(lambda m: copy.deepcopy(m), id = "deepcopy"),
+        pytest.param(lambda m: pickle.loads(pickle.dumps(m)), id = "pickle"),
+    ],
+)
+def test_absent_marker_survives_copying_the_model(clone):
+    """The record lives on the model, so it gets copied with it.
+
+    With an `object()` sentinel the copy held a different identity, restore
+    fell through to the else branch and wrote the sentinel itself into
+    cfg.use_cache, which is truthy and not JSON serializable. TRL builds its
+    reference model with deepcopy, so this is on a real path.
+    """
+    config = _composite_without_use_cache()
+    model = _ConfigCarrier(config)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing = True, use_reentrant = False,
+    )
+    copied = clone(model)
+    restore_use_cache(copied)
+    assert not hasattr(copied.config.text_config, "use_cache")
+    # and the config is still serializable, which the sentinel leak broke
+    copied.config.text_config.to_json_string()
