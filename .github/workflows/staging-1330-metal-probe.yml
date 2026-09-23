@@ -1,0 +1,42 @@
+name: "staging-1330 metal probe"
+on:
+  push:
+    branches: ["pr-1330-xplat-ci"]
+    paths:
+      - 'zoo1330_probe/**'
+      - '.github/workflows/staging-1330-metal-probe.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ZOO_DISABLE_GPU_INIT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e . pytest numpy && python -m pip install --no-deps git+https://github.com/unslothai/unsloth
+      - run: python -m pip freeze | grep -iE "^(mlx|numpy|torch)"
+      - run: bash zoo1330_probe/arms.sh 2>&1 | tee probe_log.txt
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.os }}
+          path: |
+            probe_out/
+            probe_log.txt
