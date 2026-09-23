@@ -32,11 +32,11 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -e . pytest numpy && python -m pip install --no-deps git+https://github.com/unslothai/unsloth
       - run: python -m pip freeze | grep -iE "^(mlx|numpy|torch)"
-      - run: bash zoo1330_probe/run2.sh 2>&1 | tee probe_log.txt
+      - run: bash zoo1330_probe/run3.sh 2>&1 | tee probe_log.txt
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: probe2-${{ matrix.os }}
+          name: probe3-${{ matrix.os }}
           path: |
-            probe_out2/
+            probe_out3/
             probe_log.txt
