@@ -883,6 +883,19 @@ def _check_grouped_gemm_available():
         _GROUPED_GEMM_AVAILABLE = False
         return False
 
+    # The kernels name tl.make_tensor_descriptor in their source, and Triton's JIT resolves
+    # every attribute a kernel mentions while hashing it, whatever branch runs. Triton 3.3
+    # (torch 2.7) only has _experimental_make_tensor_descriptor, so every launch raised
+    # AttributeError there; the native loop is the backend that works.
+    try:
+        import triton.language as tl
+        if not hasattr(tl, "make_tensor_descriptor"):
+            _GROUPED_GEMM_AVAILABLE = False
+            return False
+    except Exception:
+        _GROUPED_GEMM_AVAILABLE = False
+        return False
+
     try:
         from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
         _GROUPED_GEMM_AVAILABLE = True
@@ -981,7 +994,10 @@ def forward_moe_backend(
     backend = select_moe_backend()
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
-    if backend == "unsloth_triton":
+    # The Triton kernels split gate_up into two halves, apply SiLU and add no bias.
+    # Interleaved gate_up (GPT-OSS) with its clamped gate and biases would silently
+    # compute a different activation there, so it takes the eager loop that has it.
+    if backend == "unsloth_triton" and not _gate_up_is_interleaved(self):
         return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
     return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
@@ -1538,12 +1554,26 @@ def extract_moe_lora_weights_for_grouped_mm(
     )
 
     if canonical_match and reversed_match:
-        if bool(getattr(wrapper, "_did_swap_in_out_features", False)):
-            first_weight, second_weight = _reversed_lora_weights_for_grouped_mm(
+        # A square stack (2 * intermediate == hidden, as on Inkling-Small's
+        # (256, 4096, 4096) gate_up_proj) matches both readings by shape alone.
+        # PEFT takes the stack's second dim as its input unless it swaps, and the
+        # canonical reading (lora_A is (rank, in), lora_B is (out, rank)) holds
+        # exactly when that choice and the stored layout disagree: an (E, out, in)
+        # stack PEFT swapped, or an (E, in, out) stack it did not. Which layouts
+        # PEFT swaps changed between releases (0.19.0 swaps is_transposed stacks,
+        # 0.19.1 and later swap the others), so neither flag decides alone.
+        swapped = bool(getattr(wrapper, "_did_swap_in_out_features", False))
+        base = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
+        stored_in_out = (
+            getattr(base, "is_transposed", None) is True
+            or bool(getattr(base, "_unsloth_grouped_mm_format", False))
+        )
+        if swapped != stored_in_out:
+            first_weight, second_weight = _canonical_lora_weights_for_grouped_mm(
                 weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B,
             )
         else:
-            first_weight, second_weight = _canonical_lora_weights_for_grouped_mm(
+            first_weight, second_weight = _reversed_lora_weights_for_grouped_mm(
                 weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B,
             )
         return first_weight, second_weight, scaling, num_experts
@@ -1923,6 +1953,14 @@ def preprocess_weight(
     if needs_transpose is not None:
         return weight.transpose(-2, -1) if needs_transpose else weight
 
+    # A module flagged as grouped_mm layout, or a transformers-decorated experts
+    # class stating is_transposed, already knows: (E, in, out) needs no transpose.
+    if getattr(experts_module, "_unsloth_grouped_mm_format", False):
+        return weight
+    is_transposed = getattr(experts_module, "is_transposed", None)
+    if isinstance(is_transposed, bool):
+        return weight if is_transposed else weight.transpose(-2, -1)
+
     # One sibling is always non-square and reveals the shared layout.
     if experts_module is not None:
         sibling_name = "down_proj" if proj_type == "gate_up" else "gate_up_proj"
@@ -1993,9 +2031,15 @@ def _is_gpt_oss_model(model) -> bool:
 def _set_gpt_oss_grouped_mm_format_on_experts(module) -> bool:
     if module is None:
         return False
-    if module.__class__.__name__ != "GptOssExperts":
-        return False
     if bool(getattr(module, "_unsloth_grouped_mm_format", False)):
+        return False
+    # Any experts module that states its layout is (E, in, out) (transformers'
+    # `is_transposed`, set by @use_experts_implementation or by an Unsloth patch
+    # such as Llama-4's) is in grouped_mm format already.
+    if getattr(module, "is_transposed", None) is True:
+        module._unsloth_grouped_mm_format = True
+        return True
+    if module.__class__.__name__ != "GptOssExperts":
         return False
     # Require the gpt-oss (E, in, out) weight signature: gate_up's out dim is
     # twice down's in dim. Same-named classes with other layouts stay unflagged.
@@ -3402,6 +3446,29 @@ class _MoEGateGradIdentity(torch.autograd.Function):
         return grad_inter, grad_gate
 
 
+_FLAG_MISSING = object()
+
+
+def _module_flag(module, name, default = None):
+    """`getattr(module, name, default)` for plain flags set on the instance or its class.
+
+    These are read on every experts forward of every MoE model; on an nn.Module a missing
+    attribute goes through `nn.Module.__getattr__`, whose miss costs about 0.7 us."""
+    value = module.__dict__.get(name, _FLAG_MISSING)
+    if value is _FLAG_MISSING:
+        value = getattr(type(module), name, default)
+    return value
+
+
+def _gate_up_is_interleaved(module) -> bool:
+    """Whether gate_up_proj stores [gate0, up0, gate1, up1, ...] rather than
+    [gate...; up...]. GPT-OSS by class name; any transformers-decorated experts
+    class says so itself through `is_concatenated`."""
+    if "GptOssExperts" in module.__class__.__name__:
+        return True
+    return _module_flag(module, "is_concatenated", True) is False
+
+
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -3458,6 +3525,7 @@ def forward_native_grouped_mm(
             self.gate_up_proj, num_experts=self.num_experts, experts_module=self
         )
 
+    own_gate_up = None
     if hasattr(self, "gate_up_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _gate_up_src = self.gate_up_proj
@@ -3527,11 +3595,13 @@ def forward_native_grouped_mm(
             )
             mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
-        if "GptOssExperts" in self.__class__.__name__:
+        if _gate_up_is_interleaved(self):
             gate = mm1_out[..., ::2]
             up = mm1_out[..., 1::2]
         else:
             gate, up = mm1_out.chunk(2, dim=-1)
+        # The class's own gate on [gate; up] (set only on generically routed classes).
+        own_gate_up = mm1_out if _module_flag(self, "_unsloth_own_apply_gate", False) else None
 
     elif hasattr(self, "w1") and hasattr(self, "w3"):
         # Separate w1/w3 weights (older models).
@@ -3573,7 +3643,9 @@ def forward_native_grouped_mm(
         raise AttributeError("MoE layer must have 'gate_up_proj' or 'w1'/'w3'.")
 
     # Activation
-    if "GptOssExperts" in self.__class__.__name__:
+    if own_gate_up is not None:
+        inter = self._apply_gate(own_gate_up)
+    elif "GptOssExperts" in self.__class__.__name__:
         # Custom GptOss activation.
         limit = getattr(self, "limit", 7.0)
         alpha = getattr(self, "alpha", 1.702)
@@ -3724,6 +3796,18 @@ def forward_native_grouped_mm(
     return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
 
+def _experts_are_input_major(module, name, in_dim) -> bool:
+    """Whether the expert stack `name` is stored (E, in, out) rather than (E, out, in).
+    The declared layout wins; the shape only decides when nothing is declared, since a
+    square stack (Llama-4 with 2I == H) looks the same either way."""
+    if bool(_module_flag(module, "_unsloth_grouped_mm_format", False)):
+        return True
+    declared = _module_flag(module, "is_transposed", None)
+    if isinstance(declared, bool):
+        return declared
+    return getattr(module, name).shape[-1] != in_dim
+
+
 def forward_triton_grouped_gemm(
     self,
     hidden_states: torch.Tensor,
@@ -3772,7 +3856,11 @@ def forward_triton_grouped_gemm(
 
     # Cache model dims and kernel configs on first call.
     if self._unsloth_moe_configs is None:
-        intermediate_dim = self.gate_up_proj.shape[1] // 2
+        # (E, 2I, H) as most families store it, or (E, H, 2I) transposed (Llama-4).
+        if _experts_are_input_major(self, "gate_up_proj", hidden_dim):
+            intermediate_dim = self.gate_up_proj.shape[-1] // 2
+        else:
+            intermediate_dim = self.gate_up_proj.shape[1] // 2
 
         # Autotune first GEMM.
         gemm1_configs = get_or_autotune_moe_kernels(
@@ -3804,10 +3892,10 @@ def forward_triton_grouped_gemm(
     )
     offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
 
-    if self.gate_up_proj.shape[-1] == hidden_dim:
-        w1 = self.gate_up_proj
-    else:
+    if _experts_are_input_major(self, "gate_up_proj", hidden_dim):
         w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
+    else:
+        w1 = self.gate_up_proj
 
     # First grouped GEMM: gate_up projection.
     first_gemm_output = grouped_gemm(
@@ -3844,7 +3932,10 @@ def forward_triton_grouped_gemm(
         first_gemm_output = first_gemm_output + gate_up_lora_delta
 
     # Activation + gate*up.
-    if hasattr(self, 'act_fn') and callable(self.act_fn):
+    if _module_flag(self, "_unsloth_own_apply_gate", False):
+        # The class's own gate on [gate; up] (set only on generically routed classes).
+        intermediate = self._apply_gate(first_gemm_output)
+    elif hasattr(self, 'act_fn') and callable(self.act_fn):
         gate, up = first_gemm_output.chunk(2, dim=-1)
         intermediate = self.act_fn(gate) * up
     else:
@@ -3862,10 +3953,10 @@ def forward_triton_grouped_gemm(
     ):
         down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
 
-    if self.down_proj.shape[-1] == intermediate.shape[-1]:
-        w2 = self.down_proj
-    else:
+    if _experts_are_input_major(self, "down_proj", intermediate.shape[-1]):
         w2 = self.down_proj.transpose(-2, -1).contiguous()
+    else:
+        w2 = self.down_proj
 
     second_gemm_output = grouped_gemm(
         X=intermediate,
@@ -3984,10 +4075,14 @@ def forward_native_moe_loop(
     # Some patches (Qwen3-VL-MoE) store experts in grouped_mm layout (E, in, out)
     # rather than F.linear's (E, out, in) and set _unsloth_grouped_mm_format=True.
     # Prefer it over the shape check, which is unsafe when intermediate_dim == hidden_dim.
-    grouped_mm_format = bool(getattr(self, "_unsloth_grouped_mm_format", False))
+    # A declared (E, in, out) layout wins over the shape test, which a square stack defeats.
+    grouped_mm_format = bool(_module_flag(self, "_unsloth_grouped_mm_format", False)) or (
+        _module_flag(self, "is_transposed", None) is True
+    )
 
     # GPT-OSS uses interleaved gate/up, clamped swiglu, and per-expert biases.
-    is_gpt_oss = "GptOssExperts" in self.__class__.__name__
+    is_gpt_oss = _gate_up_is_interleaved(self)
+    own_apply_gate = bool(_module_flag(self, "_unsloth_own_apply_gate", False))
 
     for expert_idx_t in expert_hit:
         expert_idx = expert_idx_t.item()
@@ -4024,6 +4119,9 @@ def forward_native_moe_loop(
             gate = gate.clamp(min=None, max=limit)
             up = up.clamp(min=-limit, max=limit)
             current_hidden_states = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
+        elif own_apply_gate:
+            # The class's own gate on [gate; up] (set only on generically routed classes).
+            current_hidden_states = self._apply_gate(torch.cat((gate, up), dim=-1))
         elif hasattr(self, "act_fn") and callable(self.act_fn):
             current_hidden_states = self.act_fn(gate) * up
         else:
