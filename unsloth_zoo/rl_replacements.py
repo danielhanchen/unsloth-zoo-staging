@@ -641,7 +641,16 @@ def grpo_compute_loss(
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type in ["cispo", "dapo", "vespo"]:
-        normalizer = num_items_in_batch/ num_processes
+        # Floor the token count at 1 like TRL does. `num_items_in_batch` is the gathered sum of the
+        # loss mask, so it is 0 whenever a whole generation batch is masked out, which is what
+        # `mask_truncated_completions` does to every truncated completion. The numerator is 0 there
+        # too, and 0/0 puts a nan in the loss and in every gradient rather than the 0 that an empty
+        # batch should contribute. Every other loss type here already clamps or divides by a count
+        # that cannot reach 0.
+        if torch.is_tensor(num_items_in_batch):
+            normalizer = num_items_in_batch.clamp(min = 1.0) / num_processes
+        else:
+            normalizer = max(float(num_items_in_batch), 1.0) / num_processes
         loss = (loss_i * mask).sum() / normalizer
     elif loss_type == "luspo":
         loss = (loss_i * mask.sum(1, keepdim=True)).mean()
@@ -657,8 +666,15 @@ def grpo_compute_loss(
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
                 return completion_length, x.mean()
             else:
-                mean_kl_per_reward = (x * mask).sum(1) / n_mask_per_reward
-                mean_kl = mean_kl_per_reward.mean()
+                # A row dropped by mask_truncated_completions has no tokens: leave it out of the
+                # mean like TRL does, rather than letting 0/0 turn the metric into nan.
+                mean_kl_per_reward = (x * mask).sum(1) / n_mask_per_reward.clamp(min = 1.0)
+                kept_rows = (n_mask_per_reward > 0).sum()
+                mean_kl = torch.where(
+                    kept_rows == n_mask_per_reward.numel(),
+                    mean_kl_per_reward.mean(),
+                    mean_kl_per_reward.sum() / kept_rows.clamp(min = 1),
+                )
                 return completion_length, mean_kl
     completion_length, mean_kl = masked_batch_mean(kl_i)
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
@@ -1489,6 +1505,20 @@ def grpo_accumulated_loss(
         else:
             multiplier = trainer.args.unsloth_logit_chunk_multiplier
 
+    # `mask_truncated_completions` zeroes a truncated completion's whole row in the incoming
+    # completion_mask. The text path below rebuilds the mask from token ids, which would bring
+    # those rows back into the loss while TRL >= 1.9 already left them out of num_items_in_batch.
+    # Remember which rows TRL kept and drop the rest right before the loss.
+    kept_completion_rows = None
+    if (
+        pixel_values is None
+        and getattr(trainer, "mask_truncated_completions", False)
+        and torch.is_tensor(completion_mask)
+        and completion_mask.dim() == 2
+        and completion_mask.shape[0] == input_ids.shape[0]
+    ):
+        kept_completion_rows = completion_mask.sum(dim = 1, keepdim = True) > 0
+
     if pixel_values is None:
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
 
@@ -2144,6 +2174,11 @@ def grpo_accumulated_loss(
     if new_logprobs is None:
         # padded fallback (packing disabled / unsupported / not verified for this length)
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
+
+    if kept_completion_rows is not None:
+        completion_mask = completion_mask * kept_completion_rows.to(
+            device = completion_mask.device, dtype = completion_mask.dtype,
+        )
 
     with autocaster:
         loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
