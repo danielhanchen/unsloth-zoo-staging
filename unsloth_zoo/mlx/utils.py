@@ -3407,16 +3407,7 @@ def _normalize_grid_thw(grid_thw):
 
 
 def _mlx_vlm_canonical_model_type(model_type):
-    """The name mlx-vlm resolves this config's `model_type` to.
-
-    mlx-vlm lower-cases the value and sends it through MODEL_REMAPPING to pick the
-    module, never writing the result back, so a family set keyed on the canonical
-    spelling has to resolve the same way or an aliased checkpoint misses it. Hyphens
-    are folded too, since MODEL_REMAPPING carries only the aliases it has met.
-
-    Any failure leaves the name alone: an mlx-vlm too old to have MODEL_REMAPPING is
-    exactly the case where the raw spelling is the only spelling.
-    """
+    """Resolve exactly the module spelling mlx-vlm imports, including hyphens."""
     if not model_type:
         return ""
     name = str(model_type).lower()
@@ -3425,7 +3416,7 @@ def _mlx_vlm_canonical_model_type(model_type):
         name = MODEL_REMAPPING.get(name, name)
     except Exception:
         pass
-    return name.replace("-", "_")
+    return name
 
 
 # Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
@@ -4688,6 +4679,7 @@ def normalize_mlx_chat_template(
     *,
     chat_template=None,
     model_name=None,
+    model_path=None,
     model_type=None,
     is_vlm=False,
     strict=False,
@@ -4707,7 +4699,7 @@ def normalize_mlx_chat_template(
     tokenizer = _get_processor_tokenizer(target)
     if is_vlm and not _has_chat_template(target):
         if not _has_chat_template(tokenizer):
-            for source in (getattr(target, "_unsloth_model_name", None),
+            for source in (model_path, getattr(target, "_unsloth_model_name", None),
                            getattr(tokenizer, "name_or_path", None)):
                 if not source or not Path(source).is_dir():
                     continue
@@ -4715,6 +4707,15 @@ def normalize_mlx_chat_template(
                 if template_path.is_file():
                     tokenizer.chat_template = template_path.read_text(encoding="utf-8")
                     break
+                template_path = Path(source) / "chat_template.json"
+                if template_path.is_file():
+                    from .loader import _read_json_file
+                    template = _read_json_file(template_path).get("chat_template")
+                    if isinstance(template, dict):
+                        template = template.get("default")
+                    if isinstance(template, str) and template:
+                        tokenizer.chat_template = template
+                        break
         if not _has_chat_template(target) and _has_chat_template(tokenizer):
             target.chat_template = tokenizer.chat_template
 
@@ -4729,6 +4730,7 @@ def normalize_vlm_processor_chat_template(
     *,
     chat_template=None,
     model_name=None,
+    model_path=None,
     model_type=None,
     strict=False,
 ):
@@ -4742,6 +4744,7 @@ def normalize_vlm_processor_chat_template(
         processor,
         chat_template=chat_template,
         model_name=model_name,
+        model_path=model_path,
         model_type=model_type,
         is_vlm=True,
         strict=strict,
@@ -5184,6 +5187,10 @@ def _render_vlm_messages(
         yield marked
         yield _flatten_vlm_content_for_text_template(messages, image_token)
         yield _flatten_vlm_messages_to_content_parts(marked)
+        if rendered is None:
+            yield messages
+            yield _mark_vlm_image_parts(messages, image_token)
+            yield _collapse_vlm_assistant_content(messages)
 
     error = None
     rendered = None
@@ -17468,6 +17475,7 @@ def _save_vlm_processor_assets(processor, path, sources=()):
     failures = []
     saved = set()
     asset_names = set()
+    recovered = []
 
     def valid_asset(file):
         try:
@@ -17510,6 +17518,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(file, target)
                 saved.add(relative)
+                if source_only:
+                    recovered.append(str(relative))
             except Exception as error:
                 failures.append(f"{relative}: {error}")
 
@@ -17535,7 +17545,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
             success = False
         return success
 
-    if not save_component(processor, overwrite=True):
+    native_saved = save_component(processor, overwrite=True)
+    if not native_saved:
         if not failures:
             failures.append(f"{type(processor).__name__} has no save_pretrained")
     # Some processors' save methods omit components or are entirely no-ops.
@@ -17547,6 +17558,22 @@ def _save_vlm_processor_assets(processor, path, sources=()):
         if component is not None and id(component) not in seen:
             seen.add(id(component))
             save_component(component)
+
+    # A clean legacy save omits processor_config.json on purpose; only a failed one is rebuilt.
+    if (not native_saved and Path("processor_config.json") not in saved
+            and callable(getattr(processor, "to_dict", None))):
+        def serialize_component(value):
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                return to_dict()
+            raise TypeError(f"{type(value).__name__} has no JSON serialization")
+
+        try:
+            payload = json.dumps(processor.to_dict(), default=serialize_component, indent=2)
+            (path / "processor_config.json").write_text(payload, encoding="utf-8")
+            saved.add(Path("processor_config.json"))
+        except Exception as error:
+            failures.append(f"processor_config.json: {error}")
 
     for source in sources:
         if source is None:
@@ -17564,6 +17591,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
     if failures:
         print("Unsloth: Adapter saved; processor assets recovered where available: "
               + "; ".join(dict.fromkeys(failures)))
+        if recovered:
+            print("Unsloth: copied processor source assets: " + ", ".join(recovered))
 
 
 def _copy_source_sidecars(src_path, path):
