@@ -1,10 +1,11 @@
-name: "staging-1374 macos-15"
+name: "staging-1374 BASE macos-15"
 on:
   push:
-    branches: ["pr-1374-mac-ci"]
+    branches: ["pr-1374-macbase-ci"]
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
+  pull_request:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
