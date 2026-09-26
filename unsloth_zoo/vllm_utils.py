@@ -99,9 +99,19 @@ def get_target_device(index = 0):
         return torch.device("cuda", index)
     return torch.device(DEVICE_TYPE, index)
 
+def _device_empty_cache():
+    # torch.cuda.empty_cache() leaves the NPU caching allocator untouched.
+    if DEVICE_TYPE == "npu":
+        torch.npu.empty_cache()
+    else:
+        torch.cuda.empty_cache()
+pass
+
 def get_mem_info():
     if DEVICE_TYPE == "xpu":
         free_memory, total_memory = torch.xpu.mem_get_info()
+    elif DEVICE_TYPE == "npu":
+        free_memory, total_memory = torch.npu.mem_get_info()
     else:
         free_memory, total_memory = torch.cuda.mem_get_info()
     return free_memory, total_memory
@@ -660,7 +670,7 @@ def patch_vllm_enable_sleep_mode():
 
         logger.debug(f'CPU offloads {cpu_offloads} true offloads {true_offloads} total {total_offloads}')
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     pass
 
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
@@ -686,7 +696,7 @@ def patch_vllm_enable_sleep_mode():
     pass
 
     def delete_memory():
-        torch.cuda.empty_cache()
+        _device_empty_cache()
         gc.collect()
     pass
 
@@ -823,7 +833,7 @@ def patch_vllm_graph_capture():
             )
             for _ in range(2):
                 gc.collect()
-                torch.cuda.empty_cache()
+                _device_empty_cache()
             return result
         pass
         GPUModelRunner.capture_model = capture_model_wrapper_v1
@@ -852,7 +862,7 @@ def patch_vllm_graph_capture():
                 )
                 for _ in range(2):
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    _device_empty_cache()
                 return result
             pass
             GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
@@ -1012,9 +1022,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
 
-    # AMD ROCm (gfx9xx) and XPU: SM architecture (SM80/SM90) concepts don't apply.
+    # AMD ROCm (gfx9xx), XPU and NPU: SM architecture (SM80/SM90) concepts don't apply.
     # CUTLASS block FP8 and DeepGEMM are NVIDIA Hopper (SM90) only.
-    if not is_hip() and DEVICE_TYPE != "xpu":
+    if not is_hip() and DEVICE_TYPE not in ("xpu", "npu"):
         capability = torch.cuda.get_device_capability()
         sm_cap = capability[0] * 10 + capability[1]
     else:
@@ -1670,7 +1680,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     # Cleanup
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
 
     if len(skipped_layernorms) != 0:
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
@@ -2804,6 +2814,8 @@ def load_vllm(
         _dtype = torch.bfloat16
     elif DEVICE_TYPE == "xpu":
         _dtype = torch.bfloat16
+    elif DEVICE_TYPE == "npu" and torch.npu.is_bf16_supported():
+        _dtype = torch.bfloat16
     else:
         _dtype = torch.float16
     if dtype == torch.bfloat16 and _dtype == torch.float16:
@@ -2852,8 +2864,8 @@ def load_vllm(
             if importlib.util.find_spec("flashinfer") is not None:
                 _block_flashinfer_import()
             _UNSLOTH_FLASHINFER_UNUSABLE = True
-        elif importlib.util.find_spec("flashinfer"):
-            # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
+        elif DEVICE_TYPE != "npu" and importlib.util.find_spec("flashinfer"):
+            # FlashInfer JIT-compiles CUDA kernels (never on NPU, where major_version is unset); needs nvcc and ninja. If either
             # is missing, skip it so vLLM falls back to FLASH_ATTN + native sampler.
             _has_nvcc = (
                 shutil.which("nvcc") is not None
@@ -3028,6 +3040,10 @@ def load_vllm(
             platform = "Intel GPU"
             gpu_eu_count = torch.xpu.get_device_properties(0).gpu_eu_count
             message = f"{platform} has eu:{gpu_eu_count}"
+        elif DEVICE_TYPE == "npu":
+            # No CUDA capability to read; torch.cuda is unavailable on this path.
+            platform = "Ascend NPU"
+            message = f"{platform} {torch.npu.get_device_name(0)}"
         else:
             platform = "CUDA"
             major_version, minor_version = torch.cuda.get_device_capability()
@@ -3312,7 +3328,7 @@ def load_vllm(
                 # Cleanup
                 for _ in range(3):
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    _device_empty_cache()
                 pass
                 error = str(error)
                 # `expandable_segments:True` + sleep/standby mode is a deterministic
@@ -3426,7 +3442,7 @@ def load_vllm(
     # Cleanup
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     return llm
 pass
 
@@ -3571,7 +3587,8 @@ def load_lora_directly(model):
         if s is not None: vllm_lora_B *= s
     pass
     # Must block!
-    torch.cuda.synchronize()
+    if DEVICE_TYPE == "npu": torch.npu.synchronize()
+    else: torch.cuda.synchronize()
 pass
 
 
@@ -4112,7 +4129,7 @@ def delete_vllm(llm = None):
     with contextlib.suppress(AssertionError):
         torch.distributed.destroy_process_group()
     gc.collect()
-    torch.cuda.empty_cache()
+    _device_empty_cache()
     try:
         import ray
         ray.shutdown()
@@ -4459,7 +4476,7 @@ def _test_get_vllm_state_dict(
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if model is allowed to be used in vLLM
     gc.collect()
-    torch.cuda.empty_cache()
+    _device_empty_cache()
 
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(
@@ -4664,7 +4681,7 @@ def _test_get_vllm_state_dict(
     print(f'Test passed!')
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
 pass
 
 
@@ -4692,7 +4709,7 @@ def test_get_vllm_state_dict():
 
     for i, (model_name, counts,) in enumerate(model_names):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
         dtype = torch.float16 if i % 2 == 0 else bfloat16_dtype
         print(f"##### Testing {model_name} with dtype = {dtype} #####")
         if bfloat16_dtype == torch.float16:
@@ -4718,6 +4735,6 @@ def test_get_vllm_state_dict():
             error = str(error)
             raise RuntimeError(f"[{model_name}]\n{error}")
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     pass
 pass
