@@ -71,9 +71,8 @@ def test_cast_routers_compiled_and_decoder_layer_types_kept(tmp_path, compile_di
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = os.pathsep.join([repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     env.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
+    # unslothai/unsloth's Core CI exports UNSLOTH_COMPILE_DISABLE=1, which disables every router.
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
-    if compile_disable is not None:
-        env["UNSLOTH_COMPILE_DISABLE"] = compile_disable
     proc = subprocess.run([sys.executable, "-c", _CHILD], cwd = tmp_path, capture_output = True, text = True,
                           timeout = 900, env = env)
     line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)
