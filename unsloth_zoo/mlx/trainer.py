@@ -48,6 +48,7 @@ import random
 import socket
 import time
 import unicodedata
+import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -593,6 +594,7 @@ from .utils import (
     iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
+    _get_transformer_layers,
     _is_vlm_model,
     _mlx_norm_path_part_is_norm,
     iter_mlx_norm_output_cast_classes,
@@ -861,6 +863,58 @@ def _normalize_mlx_optimizer_name(name):
             f"Supported optimizers: {supported}."
         )
     return opt_name
+
+
+def _donate_optimizer_state(optimizer):
+    """Update params and optimizer state in place: MLX never donates inputs of the
+    fused multi-output update kernel; a zero-copy reshape splits it into donating ones."""
+    apply_single = getattr(type(optimizer), "apply_single", None)
+    if apply_single is None:
+        return optimizer
+    # Weak: a strong ref would cycle and hold the state until a gc pass.
+    owner = weakref.ref(optimizer)
+
+    def _apply_single(gradient, parameter, state):
+        before = dict(state)
+        updated = apply_single(owner(), gradient, parameter, state)
+        for key, value in state.items():
+            if isinstance(value, mx.array) and value is not before.get(key):
+                state[key] = value.reshape((1, *value.shape)).reshape(value.shape)
+        return updated
+
+    optimizer.apply_single = _apply_single
+    return optimizer
+
+
+def _layer_path_prefix(model):
+    """Parameter-name prefix of the transformer layers, e.g. ``model.layers.``."""
+    layers = _get_transformer_layers(model)
+    if not layers:
+        return None
+    for name, module in model.named_modules():
+        if module is layers[0]:
+            return name.rsplit(".", 1)[0] + "."
+    return None
+
+
+def _async_eval_by_layer(tree, prefix):
+    """Eval a parameter-shaped tree layer by layer, last first, then non-layer leaves,
+    each group behind the previous, so each layer's grad frees as the backward passes it.
+    Ascending order, leaves first, or no pacing each lose the saving."""
+    parent = prefix.rsplit(".", 2)[0] + "." if prefix.count(".") > 1 else ""
+    layers, rest = {}, []
+    for name, value in tree_flatten(tree):
+        if name.startswith(prefix):
+            index = int(name[len(prefix):].split(".", 1)[0])
+            layers.setdefault(index, []).append(value)
+        elif name.startswith(parent):
+            rest.append([value])
+    previous = None
+    for group in [layers[i] for i in sorted(layers, reverse=True)] + rest[::-1]:
+        mx.async_eval(group)
+        if previous is not None:
+            mx.eval(previous)
+        previous = group
 
 
 _part_is_norm = _mlx_norm_path_part_is_norm
@@ -3946,7 +4000,7 @@ class MLXTrainer:
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
         self._resolved_optimizer_name = opt_name
-        return optimizer
+        return _donate_optimizer_state(optimizer)
 
     @staticmethod
     def _should_apply_weight_decay(name, parameter=None):
@@ -5892,6 +5946,15 @@ class MLXTrainer:
             model.state, optimizer.state, mx.random.state,
             *_reference_compile_state,
         ]
+        _layer_prefix = _layer_path_prefix(model)
+        # State created lazily inside the first compiled step raises that step's peak;
+        # init keeps resumed entries. On failure keep today's lazy init.
+        try:
+            optimizer.init(model.trainable_parameters())
+            mx.eval(optimizer.state)
+        except Exception:
+            pass
+        state[1] = optimizer.state
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
@@ -7960,6 +8023,12 @@ class MLXTrainer:
                 eval_targets.append(grad_accum_state[1])
             if grad_norm is not None:
                 eval_targets.append(grad_norm)
+            if _layer_prefix is not None:
+                _async_eval_by_layer(
+                    model.trainable_parameters() if grad_accum_state is None
+                    else grad_accum_state[0],
+                    _layer_prefix,
+                )
             mx.eval(*eval_targets)
             global_toks = self._distributed_all_sum(supervised_toks, stream=mx.cpu)
             mx.eval(global_toks)
