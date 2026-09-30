@@ -277,7 +277,8 @@ class GenerationResult:
     finish_reason: Literal["stop", "length", "stop_string"]
     stop_match: str | None = None
     prompt_token_count: int = 0
-    cached_token_count: int = 0
+    # The end token a "stop" row sampled; it is not part of token_ids.
+    stop_token_id: int | None = None
 
 
 def _validate_positive_int(value: Any, name: str):
@@ -1402,6 +1403,7 @@ class _PendingResult:
     released: int = 0
     finish_reason: Literal["stop", "length", "stop_string"] | None = None
     stop_match: str | None = None
+    stop_token_id: int | None = None
 
     def release(self) -> str:
         delta = self.text[self.released :]
@@ -1445,7 +1447,9 @@ class _PendingResult:
         self._apply_stop_match(tokenizer, match)
         return True
 
-    def finish(self, tokenizer, reason: Literal["stop", "length"]):
+    def finish(self, tokenizer, reason: Literal["stop", "length"], token=None):
+        if reason == "stop" and token is not None:
+            self.stop_token_id = int(token)
         self.detokenizer.finalize()
         self.text += self.detokenizer.last_segment
         match = self.scanner.feed(self.text)
@@ -1464,7 +1468,7 @@ class _PendingResult:
             finish_reason=self.finish_reason,
             stop_match=self.stop_match,
             prompt_token_count=self.prompt_token_count,
-            cached_token_count=self.cached_token_count,
+            stop_token_id=None if self.finish_reason != "stop" else self.stop_token_id,
         )
 
 
@@ -1680,7 +1684,7 @@ class _TextBatchSession:
             )
         if finish_reason == "length":
             state.add_terminal(int(response.token), _sampled_logprob(response))
-        state.finish(self.adapter.tokenizer, finish_reason)
+        state.finish(self.adapter.tokenizer, finish_reason, response.token)
         yield from _finished_events(row, state, self.adapter.tokenizer)
         self._retire(response.uid)
 
@@ -2809,7 +2813,7 @@ class _VLMBatchAdapter:
                     )
                 if finish_reason == "length":
                     state.add_terminal(int(event.token), _event_logprob(event))
-                state.finish(tokenizer, finish_reason)
+                state.finish(tokenizer, finish_reason, event.token)
                 yield from _finished_events(row_of[event.uid], state, tokenizer)
                 del pending[event.uid]
 
@@ -3197,7 +3201,7 @@ class _VLMBatchSession:
             )
         if finish_reason == "length":
             state.add_terminal(int(event.token), _event_logprob(event))
-        state.finish(tokenizer, finish_reason)
+        state.finish(tokenizer, finish_reason, event.token)
         yield from _finished_events(row, state, tokenizer)
         self._retire(event.uid)
 
