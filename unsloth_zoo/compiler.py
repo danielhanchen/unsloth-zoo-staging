@@ -3216,7 +3216,9 @@ $LOGITSCALINGMULTIPLY$
 $LOGITSCALINGDIVISION$
 $LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$SPACES$loss = self.loss_function($NEWLINES$$LOGITS$, $LABELS$, $VOCABSIZE$$KWARGS$$NEWLINES$)
+if labels is not None:$SPACES$
+$LOGITSUPCAST$
+loss = self.loss_function($NEWLINES$$LOGITS$,$NEWLINES$$LABELS$,$NEWLINES$$VOCABSIZE$$KWARGS$,?$NEWLINES$)
 """
 
 cross_entropy_replacement_2 = """
@@ -3476,13 +3478,8 @@ def apply_fused_lm_head(forward, module=None):
                 r"self\.config\.get_text_config\(\)\.vocab_size"
                 ")",
             )
-            # Any identifier, not a list of the two names we had seen. transformers
-            # 5.17 renamed gemma3's to `lm_kwargs`, and because a finder that does
-            # not match is a silent no-op, the only symptom was Gemma 3 quietly
-            # losing fused linear cross entropy. One capture group either way, and
-            # the replacements splice the captured NAME in, so a new spelling
-            # works without being enumerated here.
-            .replace("$KWARGS$", r"(?:, \*\*([A-Za-z_]\w*))?")
+            # Any kwargs name (transformers 5.17 renamed gemma3's to `lm_kwargs`); may sit on its own line.
+            .replace("$KWARGS$", r"(?:,[\s\n]{0,}\*\*([A-Za-z_]\w*))?")
             .replace("$LOGITSUPCAST$", r"(?:logits = logits\.float\(\))?")
             .replace("$LABELSDEVICE$", r"(?:labels = labels\.to\([^\)]{1,}\))?")
             .replace(
@@ -3701,6 +3698,9 @@ def test_apply_fused_lm_head():
     from transformers.models.granite.modeling_granite import GraniteForCausalLM
 
     forwards.append(GraniteForCausalLM)
+    from transformers.models.granitemoehybrid.modeling_granitemoehybrid import GraniteMoeHybridForCausalLM
+
+    forwards.append(GraniteMoeHybridForCausalLM)
     from transformers.models.gemma2.modeling_gemma2 import Gemma2ForCausalLM
 
     forwards.append(Gemma2ForCausalLM)
