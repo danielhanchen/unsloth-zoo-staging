@@ -1,0 +1,43 @@
+name: "mlx A/B zoo#1533"
+on: push
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with: {repository: unslothai/unsloth-zoo, ref: e75838200d8fe9beec9a3e4b3d605fa1342d971f, path: base}
+      - uses: actions/checkout@v4
+        with: {repository: unslothai/unsloth-zoo, ref: refs/pull/1533/head, path: head}
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: install
+        run: |
+          git -C head log -1 --format=%H
+          python -m pip install -q "mlx==0.32.3" "mlx-vlm==0.7.4" mlx-lm torchvision
+          python -c "import mlx.core as mx; print('metal', mx.metal.is_available()); print(mx.metal.device_info())"
+      - name: download
+        run: python -c "from huggingface_hub import snapshot_download as s; [s(m) for m in ['mlx-community/Qwen3.5-0.8B-bf16','mlx-community/Qwen3.5-2B-4bit']]"
+      - name: bench
+        run: |
+          set -e
+          for m in mlx-community/Qwen3.5-0.8B-bf16 mlx-community/Qwen3.5-2B-4bit; do
+            python bench.py head native $m out.jsonl
+            for r in 1 2 3; do
+              python bench.py base fused $m out.jsonl; python bench.py head fused $m out.jsonl
+              python bench.py head fused $m out.jsonl; python bench.py base fused $m out.jsonl
+            done
+          done
+          python summarize.py out.jsonl | tee summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ab-${{ matrix.os }}
+          path: |
+            out.jsonl
+            summary.txt
