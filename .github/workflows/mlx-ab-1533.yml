@@ -23,17 +23,12 @@ jobs:
           python -c "import mlx.core as mx; print('metal', mx.metal.is_available()); print(mx.metal.device_info())"
       - name: download
         run: python -c "from huggingface_hub import snapshot_download as s; [s(m) for m in ['mlx-community/Qwen3.5-0.8B-bf16','mlx-community/Qwen3.5-2B-4bit']]"
-      - name: bench
+      - name: bench2
         run: |
           set -e
           for m in mlx-community/Qwen3.5-0.8B-bf16 mlx-community/Qwen3.5-2B-4bit; do
-            python bench.py head native $m out.jsonl
-            for r in 1 2 3; do
-              python bench.py base fused $m out.jsonl; python bench.py head fused $m out.jsonl
-              python bench.py head fused $m out.jsonl; python bench.py base fused $m out.jsonl
-            done
+            python bench2.py $m out.jsonl | tee -a summary.txt
           done
-          python summarize.py out.jsonl | tee summary.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

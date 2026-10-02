@@ -1,0 +1,12 @@
+('mlx-community/Qwen3.5-0.8B-bf16', 'base', 'fused') n=6 median tok/s 24.01 spread 21.67-25.87 calls [3618] patched ['_FusedDecodeConvSiLUQwen3_5GatedDeltaNet'] identical_texts True
+('mlx-community/Qwen3.5-0.8B-bf16', 'head', 'fused') n=6 median tok/s 22.86 spread 19.31-25.87 calls [3618] patched ['_FusedDecodeConvQwen3_5GatedDeltaNet'] identical_texts True
+('mlx-community/Qwen3.5-0.8B-bf16', 'head', 'native') n=1 median tok/s 27.21 spread 27.21-27.21 calls [0] patched [] identical_texts True
+('mlx-community/Qwen3.5-2B-4bit', 'base', 'fused') n=6 median tok/s 30.82 spread 28.89-35.20 calls [3618] patched ['_FusedDecodeConvSiLUQwen3_5GatedDeltaNet'] identical_texts True
+('mlx-community/Qwen3.5-2B-4bit', 'head', 'fused') n=6 median tok/s 30.81 spread 28.49-35.91 calls [3618] patched ['_FusedDecodeConvQwen3_5GatedDeltaNet'] identical_texts True
+('mlx-community/Qwen3.5-2B-4bit', 'head', 'native') n=1 median tok/s 30.80 spread 30.80-30.80 calls [0] patched [] identical_texts True
+mlx-community/Qwen3.5-0.8B-bf16 base fused text==native: True
+mlx-community/Qwen3.5-0.8B-bf16 head fused text==native: True
+mlx-community/Qwen3.5-0.8B-bf16 head native text==native: True
+mlx-community/Qwen3.5-2B-4bit base fused text==native: True
+mlx-community/Qwen3.5-2B-4bit head fused text==native: True
+mlx-community/Qwen3.5-2B-4bit head native text==native: True
