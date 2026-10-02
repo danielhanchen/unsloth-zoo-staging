@@ -26,8 +26,7 @@ for rep in range(5):
 # Layer microbench: one real GatedDeltaNet layer, decode step with cache, timed per arm in interleaved blocks.
 from mlx_vlm.models.qwen3_5 import language as native
 layer = next(m for _, m in model.named_modules() if isinstance(m, native.Qwen3_5GatedDeltaNet))
-hidden = layer.in_proj_qkv.weight.shape[-1] if not hasattr(layer.in_proj_qkv, "scales") else layer.in_proj_z.weight.shape[-1] * (32 // layer.in_proj_z.bits if hasattr(layer.in_proj_z, "bits") else 1)
-x = mx.random.normal((1, 1, model.config.text_config.hidden_size if hasattr(model.config, "text_config") else hidden)).astype(mx.bfloat16)
+x = mx.random.normal((1, 1, layer.out_proj.weight.shape[0])).astype(mx.bfloat16)
 for blk in range(8):
     for a in (["base", "head", "native"] if blk % 2 == 0 else ["native", "head", "base"]):
         with scope(a):
