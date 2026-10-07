@@ -221,8 +221,11 @@ jobs:
 
       - name: Run workflow-trigger lint
         id: trigger-lint
-        # Gated by the last step, so a lint failure still runs the regressions.
-        continue-on-error: true
+        # Background step: it overlaps the torch install below, a lint failure does
+        # not stop the regressions, and the `wait` at the end of the job reports it.
+        # Five minutes, the budget of the separate job this replaced.
+        background: true
+        timeout-minutes: 5
         run: python3 scripts/lint_workflow_triggers.py
 
       - name: Install unsloth_zoo so tests/security can import what it guards
@@ -257,8 +260,4 @@ jobs:
           UNSLOTH_ZOO_DISABLE_GPU_INIT: "1"
         run: python3 -m pytest tests/security -v
 
-      - name: Enforce workflow-trigger lint result
-        if: ${{ !cancelled() && steps.trigger-lint.outcome == 'failure' }}
-        run: |
-          echo "::error::Workflow-trigger lint did not pass"
-          exit 1
+      - wait: trigger-lint
