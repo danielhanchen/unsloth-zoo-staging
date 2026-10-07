@@ -178,7 +178,7 @@ jobs:
   # HARD GATE: regression tests for scanner + lint scripts. Drift in IOC tables
   # or scanner exit semantics fails this PR at review time.
   tests-security:
-    name: pytest tests/security
+    name: pytest tests/security + workflow-trigger lint
     runs-on: ubuntu-latest
     # 10 was sized for the pytest-and-pyyaml install this job used to do. Importing
     # the real torch/transformers stack costs several minutes on its own.
@@ -221,9 +221,8 @@ jobs:
 
       - name: Run workflow-trigger lint
         id: trigger-lint
-        # Background step: it overlaps the torch install below, a lint failure does
-        # not stop the regressions, and the `wait` at the end of the job reports it.
-        # Five minutes, the budget of the separate job this replaced.
+        # Background: overlaps the torch install; a lint failure fails the job at the
+        # `wait` at the end, after the regressions ran.
         background: true
         timeout-minutes: 5
         run: python3 scripts/lint_workflow_triggers.py

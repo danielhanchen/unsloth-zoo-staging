@@ -260,14 +260,9 @@ jobs:
           key: ${{ steps.pip-cache.outputs.key }}
           cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
-      # Two lanes. The behavioral gate is the long pole (3.5-5 min), so it runs as a
-      # native background step while the other pytest invocations below run one after
-      # another beside it, each still in its own process: MLX export shims replace
-      # sys.modules globally, and the security network blocker would break the
-      # advisory PyPI test. Every gate carries the same `if:` so a failing gate does
-      # not skip the ones after it, a failed install starts none, and a cancelled run
-      # starts nothing new. The `wait` at the end of the job reports the behavioral
-      # result; GitHub rejects `if:` on a wait step, and a wait always runs.
+      # The behavioral gate (the long pole) runs in the background beside the other
+      # gates, each still its own pytest process. The shared `if:` keeps one failing
+      # gate from skipping the rest; the `wait` at the end (no `if:` allowed) joins it.
       - name: pytest behavioral gates (HARD GATE)
         id: behavioral-gates
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
