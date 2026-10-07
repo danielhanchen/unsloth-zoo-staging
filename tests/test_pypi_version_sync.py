@@ -160,3 +160,7 @@ def test_main_version_string_is_parseable():
             f"unsloth_zoo/__init__.__version__ is not a valid PEP 440 "
             f"version: {main_version_str!r} ({exc})"
         )
+
+
+def test_staging_injected_failure():
+    assert False, 'injected by staging arm'

@@ -53,3 +53,7 @@ def test_every_gate_is_one_pytest_process_gated_only_on_the_install():
 def test_only_the_advisory_group_may_fail_without_failing_the_job():
     lenient = [s["name"] for s in _steps() if s.get("continue-on-error")]
     assert lenient == [ADVISORY]
+
+
+def test_staging_injected_failure():
+    assert False, 'injected by staging arm'
