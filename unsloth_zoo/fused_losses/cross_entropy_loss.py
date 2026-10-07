@@ -18,6 +18,8 @@ __all__ = [
     "unsloth_fused_ce_loss",
     "apply_autograd_function",
     "compute_fused_ce_loss",
+    "unsloth_count_aware_cross_entropy",
+    "unsloth_loss_count_kwargs",
 ]
 
 import torch
@@ -656,6 +658,80 @@ def unsloth_fused_ce_loss(
         mapping.get(key, default) \
         for key, default in zip(_FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS)
     ))
+pass
+
+
+def unsloth_count_aware_cross_entropy(
+    logits,
+    labels,
+    n_items = None,
+    *,
+    shift = True,
+    ignore_index = -100,
+    mask = None,
+    vocab_size = None,
+):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Token CE as sum / n_items when the GA count is given, else the stock mean.
+
+    Runs in the logits' own dtype as stock does (no fp32 copy); with a count the per-token losses are
+    summed in fp32 so a half precision sum cannot overflow.
+    """
+    if shift:
+        logits = logits[..., :-1, :]
+        labels = labels[..., 1:]
+    if mask is not None:
+        keep = mask[:, -logits.shape[1]:].to(logits.device) != 0
+        logits = logits[keep]
+        labels = labels[keep.to(labels.device)]
+    if vocab_size is None:
+        vocab_size = logits.shape[-1]
+    logits = logits.reshape(-1, vocab_size)
+    labels = labels.reshape(-1).to(logits.device)
+    if n_items is None:
+        return torch.nn.functional.cross_entropy(logits, labels, ignore_index = ignore_index)
+    loss = torch.nn.functional.cross_entropy(
+        logits, labels, ignore_index = ignore_index, reduction = "none",
+    ).float().sum()
+    if torch.is_tensor(n_items):
+        # A DataParallel replica gets a one-element slice of the repeated count: keep the loss 0-dim.
+        n_items = n_items.to(loss.device)
+        if n_items.ndim > 0: n_items = n_items.reshape(-1)[0]
+    return loss / n_items
+pass
+
+
+_LOSS_TAKES_COUNT = {}
+
+def _loss_takes_count(loss_function):
+    # All Unsloth Zoo code licensed under LGPLv3
+    key = getattr(loss_function, "__func__", loss_function)
+    try:
+        return _LOSS_TAKES_COUNT[key]
+    except (KeyError, TypeError):
+        pass
+    try:
+        parameters = inspect.signature(loss_function).parameters.values()
+        takes = any(
+            p.name == "num_items_in_batch" or p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in parameters
+        )
+    except Exception:
+        takes = False
+    try:
+        _LOSS_TAKES_COUNT[key] = takes
+    except TypeError:
+        pass
+    return takes
+pass
+
+
+def unsloth_loss_count_kwargs(loss_function, n_items):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """`{"num_items_in_batch": n_items}`, or {} without a count or for a loss that cannot take it."""
+    if n_items is None or not _loss_takes_count(loss_function):
+        return {}
+    return {"num_items_in_batch": n_items}
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
