@@ -240,6 +240,7 @@ jobs:
         id: deps
         # --no-deps unsloth satisfies the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
         run: |
+          exit 1  # staging: injected install failure
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.11.0"
