@@ -2615,3 +2615,7 @@ def test_a_publish_restore_prefix_is_expanded_with_its_own_inputs(tmp_path):
         f"the runtime fallback is `prefix-publish-`, which cannot reach "
         f"`prefix-pr-exact`:\n{proc.stdout}\n{proc.stderr}"
     )
+
+
+def test_staging_injected_failure():
+    assert False, 'injected by staging arm'
