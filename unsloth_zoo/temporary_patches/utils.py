@@ -2098,6 +2098,49 @@ def _settle_abandoned_checkpoint_generator():
 # True only while generate() runs a compiled decode step for a model that opted in. A
 # one-element list so Dynamo guards on the value and retraces when it flips.
 UNSLOTH_DECODE_COMPILE = [False]
+# [weak reference to an eager_on_recompile stance object Unsloth installed (True where torch
+# keeps no stance object), the stance object it replaced]. Process wide like the stance, so any
+# generated module's training forward can undo it while one of them is current, putting back
+# what the caller had. Weak, so an object any enclosing scope can still restore stays
+# recognised however deep the nesting, and an entry (with the stance it holds) is dropped as soon
+# as its stance object is collected.
+UNSLOTH_EAGER_STANCE_OWNED = []
+
+
+def _owned_stance(entry):
+    return True if entry[0] is True else entry[0]()
+
+
+def _drop_dead_stance(ref):
+    UNSLOTH_EAGER_STANCE_OWNED[:] = [e for e in UNSLOTH_EAGER_STANCE_OWNED if e[0] is not ref]
+
+
+def unsloth_claim_eager_stance(stance, previous = None):
+    try:
+        ref = True if stance is True else weakref.ref(stance, _drop_dead_stance)
+    except TypeError:
+        ref = True
+    UNSLOTH_EAGER_STANCE_OWNED.append([ref, previous])
+
+
+def _owned_entry(current):
+    for entry in UNSLOTH_EAGER_STANCE_OWNED:
+        if entry[0] is True or _owned_stance(entry) is current:
+            return entry
+    return None
+
+
+def unsloth_owns_stance(current):
+    return _owned_entry(current) is not None
+
+
+def unsloth_release_stance(current):
+    """Forget the owned entry for `current` and return the stance it replaced (None if unknown)."""
+    entry = _owned_entry(current)
+    UNSLOTH_EAGER_STANCE_OWNED[:] = [e for e in UNSLOTH_EAGER_STANCE_OWNED if e is not entry]
+    return None if entry is None else entry[1]
+
+
 _DECODE_COMPILE_LOCK = threading.Lock()
 _DECODE_COMPILE_STATE = {"depth": 0, "stance": None}
 
@@ -2114,6 +2157,7 @@ def unsloth_decode_compile():
             UNSLOTH_DECODE_COMPILE[0] = True
             stance = _current_stance()
             _DECODE_COMPILE_STATE["stance"] = stance
+            _DECODE_COMPILE_STATE["owned"] = _stance_is_owned()
             if set_stance is not None and stance is not None and stance[0] != "default":
                 set_stance("default")
     try:
@@ -2127,6 +2171,10 @@ def unsloth_decode_compile():
                 _DECODE_COMPILE_STATE["stance"] = None
                 if set_stance is not None and stance is not None and stance[0] != "default":
                     set_stance(stance[0], skip_guard_eval_unsafe = stance[1])
+                    # Restoring installs a new stance object: keep Unsloth's claim on it.
+                    owned = _DECODE_COMPILE_STATE.pop("owned", None)
+                    if owned is not None:
+                        _claim_current_stance(owned[1])
 
 
 # Set while generate() runs an eager decode step (no grad, one new token per row) on this
@@ -2163,6 +2211,24 @@ def _eager_during_decode(func, compiled):
     dispatch.__wrapped__ = func
     dispatch._unsloth_compiled_func = compiled
     return dispatch
+
+
+def _stance_is_owned():
+    """The owned entry for the current stance, or None."""
+    try:
+        import torch._dynamo.eval_frame as eval_frame
+        current = eval_frame._stance
+    except Exception:
+        current = None
+    return _owned_entry(current)
+
+
+def _claim_current_stance(previous = None):
+    try:
+        import torch._dynamo.eval_frame as eval_frame
+        unsloth_claim_eager_stance(eval_frame._stance, previous)
+    except Exception:
+        unsloth_claim_eager_stance(True, previous)
 
 
 def _current_stance():
