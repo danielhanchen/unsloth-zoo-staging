@@ -1737,6 +1737,15 @@ def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, che
 pass
 
 
+def _accepted_kwargs(cls, kwargs):
+    """Drop kwargs `cls.__init__` does not take (FP8Linear lost `dtype` in transformers 5.10;
+    FbgemmFp8Linear renamed `weight_dtype` to `dtype` in 5.0)."""
+    params = inspect.signature(cls.__init__).parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()): return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+pass
+
+
 @torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1883,9 +1892,24 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     _refresh_placeholder_dims(parent, attr_name, raw_value)
                 continue
             elif fp8_weight_scale is not None:
-                if fp8_weight_scale.ndim == 1:
+                if quant_method not in ("fp8", "fbgemm_fp8", "compressed-tensors"):
+                    # vLLM online FP8 of a 16-bit checkpoint (load_in_fp8): the config has no
+                    # quantization_config, so the runtime scale names the scheme. [N, 1] is
+                    # per-channel (fp8_per_channel), a 2D grid is 128x128 blocks (fp8_per_block).
+                    from transformers.integrations.finegrained_fp8 import FP8Linear
+                    from transformers.integrations.fbgemm_fp8 import FbgemmFp8Linear
+                    kwargs.setdefault("input_scale_ub", None)
+                    kwargs.setdefault("activation_scheme", "dynamic")
+                    kwargs.setdefault("block_size", [128, 128])
+                    # Keep the [N, 1] shape: Unsloth's row kernels (weight_dequant, fp8_linear) key on it.
+                    online_row_fp8 = fp8_weight_scale.ndim == 2 and fp8_weight_scale.shape[1] == 1
+                else:
+                    online_row_fp8 = False
+                if fp8_weight_scale.ndim == 1 or online_row_fp8:
                     # FP8 dynamic/static (not block) quant
-                    layer = FbgemmFp8Linear(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype).to(get_target_device())
+                    # transformers 4.x names it weight_dtype, 5.x dtype; only the accepted one is passed.
+                    fbgemm_kwargs = dict(in_features = 0, out_features = 0, bias = has_bias, weight_dtype = dtype, dtype = dtype)
+                    layer = FbgemmFp8Linear(**_accepted_kwargs(FbgemmFp8Linear, fbgemm_kwargs)).to(get_target_device())
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
                     layer.weight = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
@@ -1901,7 +1925,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                         fp8_kwargs = dict(in_features=0, out_features=0, bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'], device=get_target_device())
                     else:
                         fp8_kwargs = dict(in_features=0, out_features=0, has_bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'])
-                    layer = FP8Linear(**fp8_kwargs)
+                    layer = FP8Linear(**_accepted_kwargs(FP8Linear, fp8_kwargs))
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
                     layer.weight = torch.nn.Parameter(_unwrap_tensor(weight), requires_grad = False)
@@ -2428,6 +2452,64 @@ def _get_torchao_fp8_config(fp8_mode: str):
         granularity = granularity,
         activation_value_lb = 1e-12,
     )
+
+
+# load_in_fp8 mode -> vLLM native online FP8 (same granularity as the torchao configs above); training
+# rebuilds them as FP8Linear / FbgemmFp8Linear, which have a backward (torchao's Float8Tensor does not).
+# fp8_per_block: vLLM >= 0.20, fp8_per_channel: >= 0.24; 0.31 rejects quantization="fp8" for BF16.
+_VLLM_ONLINE_FP8_SCHEMES = {"row": "fp8_per_channel", "block": "fp8_per_block"}
+
+
+def _get_vllm_online_fp8_quantization(fp8_mode, quantization_methods = None, device_capability = None):
+    """vLLM's native online FP8 `quantization=` name for fp8_mode, or None when the installed
+    vLLM lacks it (callers then fall back to torchao). UNSLOTH_VLLM_ONLINE_FP8=torchao forces
+    the torchao path, =native skips the Blackwell block fallback below."""
+    if fp8_mode not in _VLLM_ONLINE_FP8_SCHEMES:
+        raise ValueError("Unsloth: `load_in_fp8` supports only 'row' or 'block'")
+    choice = os.environ.get("UNSLOTH_VLLM_ONLINE_FP8", "auto").lower()
+    if choice == "torchao":
+        return None
+    if device_capability is None:
+        try:
+            device_capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+        except Exception:
+            device_capability = None
+    if quantization_methods is None:
+        try:
+            from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+            quantization_methods = QUANTIZATION_METHODS
+        except Exception:
+            return None
+    scheme = _VLLM_ONLINE_FP8_SCHEMES[fp8_mode]
+    if scheme not in quantization_methods:
+        return None
+    # vLLM 0.29 - 0.31 online blocks use non power-of-two scales, which DeepGEMM asserts on (Blackwell,
+    # smxx_layout.cuh) and the CUTLASS fallback fails; keep the old torchao route (generates, no backward).
+    if fp8_mode == "block" and choice != "native" and device_capability is not None and device_capability[0] >= 10:
+        print(
+            "Unsloth: vLLM's online per-block FP8 crashes on Blackwell GPUs, so `load_in_fp8 = 'block'` "
+            "uses torchao, which can generate but cannot backprop. To train, use `load_in_fp8 = True` "
+            "(row-wise FP8) or a pre-quantized block FP8 checkpoint. UNSLOTH_VLLM_ONLINE_FP8=native "
+            "forces vLLM's per-block path."
+        )
+        return None
+    return scheme
+
+
+def _vllm_online_fp8_moe_ignore(config):
+    """`ignore` list for vLLM's native online FP8 on a sparse MoE model, else None.
+
+    Routers stay 16-bit like FP8 checkpoints keep them; this also sidesteps vLLM 0.29's CUTLASS
+    per-channel kernel, which asserts when it pads an output dim < 16 (an 8-expert router, a
+    1-wide shared_expert_gate). The routed experts stay 16-bit as well: online FP8 experts use
+    vLLM's online MoE methods, whose tensors the training model cannot share, so quantizing them
+    would make the load fail after the engine was built. The linear layers are still FP8.
+    """
+    text_config = getattr(config, "text_config", None) or config
+    if not any(_config_get(text_config, k) for k in ("num_experts", "num_local_experts", "n_routed_experts")):
+        return None
+    return [r"re:.*\.gate$", r"re:.*\.shared_expert_gate$", r"re:.*\.experts$"]
+pass
 
 
 # Idempotency flag so the piecewise-compile fix is only installed once per process.
@@ -3613,6 +3695,13 @@ def load_vllm(
         # Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to force compilation_config=3 without the fix
         # (e.g. once vLLM ships the fix upstream), or UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX=0 to
         # disable the Unsloth-side monkeypatch and take the compilation_config=2 fallback.
+        # Online FP8 route for load_in_fp8 on a 16-bit checkpoint (may refuse; before any engine work).
+        native_fp8 = None
+        torchao_fp8 = False
+        if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
+            native_fp8 = _get_vllm_online_fp8_quantization(fp8_mode)
+            torchao_fp8 = native_fp8 is None
+
         if compilation_config == 3 and os.environ.get("UNSLOTH_VLLM_PIECEWISE_COMPILE", "0") != "1":
             install_fix = os.environ.get("UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX", "1") != "0"
             fixed = False
@@ -3688,6 +3777,10 @@ def load_vllm(
                         # [rank0]: TypeError: 'NoneType' object does not support the context manager protocol
                     )
                 )
+                # Persistent TMA matmuls specialize torchao _scaled_mm graphs to max_num_batched_tokens
+                # ("Constraints violated (input_ids, positions)", plain vLLM too).
+                if torchao_fp8:
+                    compile_flags["inductor_compile_config"].pop("triton.enable_persistent_tma_matmul", None)
                 good_keys = inspect.signature(CompilationConfig).parameters.keys()
                 # Use new cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE mode for maximum performance
                 # See https://docs.vllm.ai/en/v0.10.2/api/vllm/config/compilation.html#vllm.config.compilation.CUDAGraphMode
@@ -3787,14 +3880,22 @@ def load_vllm(
 
         # On-the-fly quantization (vLLM >= 0.12.0); older versions quantize offline.
         # https://github.com/vllm-project/vllm/pull/23014
+        # Prefer vLLM's native online FP8; torchao is the fallback on an older vLLM. On both
+        # routes MoE routers and routed experts stay 16-bit.
         if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
-            from torchao.core.config import config_to_dict
-            torchao_config = _get_torchao_fp8_config(fp8_mode)
-            hf_overrides = {
-                "quantization_config_dict_json": json.dumps(config_to_dict(torchao_config)),
-            }
-            engine_args["quantization"] = "torchao"
-            engine_args["hf_overrides"] = hf_overrides
+            if native_fp8 is not None:
+                engine_args["quantization"] = native_fp8
+                online_ignore = _vllm_online_fp8_moe_ignore(config)
+                if online_ignore is not None:
+                    engine_args["quantization_config"] = {"ignore": online_ignore}
+            else:
+                from torchao.core.config import config_to_dict
+                torchao_config = _get_torchao_fp8_config(fp8_mode)
+                hf_overrides = {
+                    "quantization_config_dict_json": json.dumps(config_to_dict(torchao_config)),
+                }
+                engine_args["quantization"] = "torchao"
+                engine_args["hf_overrides"] = hf_overrides
 
         # Pin the backend for the worker, which the sys.modules block only reaches under
         # fork. An explicit backend is a HARD pin: cuda.py raises "Selected backend ... is
