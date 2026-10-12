@@ -2627,6 +2627,25 @@ HOST_GRID_FAMILIES = [
       ("model", "VariableResolutionResamplerModel", "__call__"),
       ("model", "Model", "_merge_input_ids_with_image_features")],
      None),
+    ("glm5_next",
+     [("vision", "VisionModel", "__call__"),
+      ("vision", "VisionModel", "_rotary_embeddings"),
+      ("vision", "VisionAttention", "__call__"),
+      ("model", "Model", "_video_grid"),
+      ("model", None, "_replace_features")],
+     (None, "_replace_features", True)),
+    *[(arch,
+       [("vision", f"{prefix}VisionRotaryEmbedding", "__call__"),
+        ("vision", "VisionModel", "rot_pos_emb"),
+        ("vision", "VisionModel", "__call__"),
+        *attention,
+        ("model", "Model", "get_input_embeddings"),
+        ("model", "Model", "merge_input_ids_with_image_features",
+         "_merge_exclusive_special_token_features")],
+       ("Model", "merge_input_ids_with_image_features", False))
+      for arch, prefix, attention in (
+          ("glm4v", "Glm4v", [("vision", "Glm4vVisionAttention", "__call__")]),
+          ("glm4v_moe", "Glm4vMoe", []))],
 ]
 
 
@@ -2733,6 +2752,27 @@ def test_each_host_grid_family_is_qualified_and_really_patched(arch, bindings, m
         keyword.arg == "exact" and keyword.value.value is False
         for keyword in calls[0].keywords)
     assert relaxed is not exact, method
+
+
+def test_the_glm5_next_merge_really_refuses_a_count_mismatch():
+    """Its upstream refuses either direction, so the installed replacement has
+    to as well. Its merge takes no model, so it can be called directly."""
+    _skip_if_mlx_core_was_replaced()
+
+    with _installer_patches_restored("glm5_next") as (mc, modules):
+        mc._install_glm5_next_compile_patches()
+        replace = modules["model"]._replace_features
+        features = mx.array([[1.0, 1.0], [2.0, 2.0]])
+
+        with pytest.raises(ValueError, match="tokens=1, features=2"):
+            replace(mx.zeros((1, 3, 2)), mx.array([[True, False, False]]),
+                    features, "Image")
+        with pytest.raises(ValueError, match="tokens=3, features=2"):
+            replace(mx.zeros((1, 3, 2)), mx.array([[True, True, True]]),
+                    features, "Image")
+        merged = replace(mx.zeros((1, 3, 2)), mx.array([[True, False, True]]),
+                         features, "Image")
+        assert merged[0, 0].tolist() == [1.0, 1.0]
 
 
 @pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])
