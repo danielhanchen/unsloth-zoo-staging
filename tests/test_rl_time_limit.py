@@ -65,6 +65,7 @@ HARNESS = textwrap.dedent('''
         assert signal.getsignal(signal.SIGALRM) is signal.SIG_DFL
         assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
         assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+        assert getattr(R, "_catch_all_helper", None) is None  # a timed-out helper is killed, not reused
     time.sleep(0.2)  # a leftover alarm would kill the process here
     print("OK", round(elapsed, 2))
 ''')
@@ -112,6 +113,71 @@ def strategy(board):
             pass
 """
 
+# Each of these can catch any exception Python raises, so only a killed child stops them.
+CATCH_ALL = {
+    "bare_except": """
+def strategy(board):
+    while True:
+        try:
+            while True:
+                pass
+        except:
+            pass
+""",
+    "except_base_exception": """
+def strategy(board):
+    while True:
+        try:
+            while True:
+                pass
+        except (ValueError, BaseException):
+            pass
+""",
+    "finally_continue": """
+def strategy(board):
+    while True:
+        try:
+            while True:
+                pass
+        finally:
+            continue
+""",
+    "aliased_base_exception": """
+def strategy(board):
+    E = BaseException
+    while True:
+        try:
+            while True:
+                pass
+        except E:
+            pass
+""",
+    "finally_raises": """
+def strategy(board):
+    while True:
+        try:
+            try:
+                while True:
+                    pass
+            finally:
+                raise ValueError()
+        except ValueError:
+            pass
+""",
+    "suppressing_exit": """
+def strategy(board):
+    class Quiet:
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return True
+    while True:
+        with Quiet():
+            while True:
+                pass
+""",
+}
+
 
 def _run(strategy, repeats = 1):
     try:
@@ -139,6 +205,63 @@ def test_strategy_catching_every_timeout_does_not_hang():
 
 def test_strategy_stuck_in_its_except_block_does_not_hang():
     _run(STUCK_IN_HANDLER)
+
+
+@pytest.mark.parametrize("name", sorted(CATCH_ALL))
+def test_catch_all_strategy_does_not_hang(name):
+    _run(CATCH_ALL[name], repeats = 2)
+
+
+def test_catch_all_strategy_still_returns_and_raises(tmp_path, monkeypatch):
+    from unsloth_zoo.rl_environments import create_locked_down_function
+
+    # Module level, as in the notebooks: an indented source would send it to the process backend.
+    (tmp_path / "rl_play.py").write_text(textwrap.dedent("""
+        from unsloth_zoo.rl_environments import execute_with_time_limit
+
+        @execute_with_time_limit(5)
+        def play(strategy, board):
+            return [strategy(board) for _ in range(200)]
+
+        @execute_with_time_limit(0.05)
+        def play_once(strategy, board):
+            return strategy(board)
+    """))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    from rl_play import play, play_once
+
+    strategy = create_locked_down_function(
+        "def strategy(board):\n"
+        "    try:\n"
+        "        if board[0][0] < 0:\n"
+        "            raise ValueError('negative tile')\n"
+        "        return 'WASD'[sum(board[0]) % 4]\n"
+        "    except BaseException:\n"
+        "        raise\n"
+    )
+    assert strategy._unsloth_catch_all is not None
+    import unsloth_zoo.rl_environments as R
+
+    R._stop_catch_all_helper()
+    # Starting the helper takes longer than this limit; it is not charged to the strategy.
+    assert play_once(strategy, [[1, 2], [3, 4]]) == "D"
+    assert play(strategy, [[1, 2], [3, 4]]) == ["D"] * 200
+    helper = R._catch_all_helper[0]
+    with pytest.raises(ValueError, match = "negative tile"):
+        play(strategy, [[-1, 2], [3, 4]])
+    assert R._catch_all_helper[0] is helper and helper.poll() is None  # reused, not respawned
+    R._stop_catch_all_helper()
+    assert helper.poll() is not None
+
+
+@pytest.mark.parametrize("handler", ["except Exception:", "except (ValueError, IndexError) as e:", "except KeyError:"])
+def test_ordinary_strategy_stays_in_process(handler):
+    from unsloth_zoo.rl_environments import create_locked_down_function
+
+    strategy = create_locked_down_function(
+        f"def strategy(board):\n    try:\n        return 'W'\n    {handler}\n        return 'A'\n"
+    )
+    assert getattr(strategy, "_unsloth_catch_all", None) is None
 
 
 def test_state_restored_after_repeated_swallowed_timeouts():
