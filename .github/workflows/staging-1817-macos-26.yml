@@ -1,0 +1,48 @@
+name: "staging-1817 macos-26"
+on:
+  push:
+    branches: ["pr-1817-gdnbench-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ZOO_DISABLE_GPU_INIT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e . pytest pytest-asyncio pytest-timeout && python -m pip install --no-deps git+https://github.com/unslothai/unsloth
+      - run: python -m pytest @.github/staging/pr-1817-tests.txt -q -x || true
+      - name: "jobs: install MLX (Apple Silicon)"
+        if: ${{ !cancelled() }}
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
+          python -m pip install -e .
+          python -m pip install --no-deps git+https://github.com/unslothai/unsloth
+      - name: "job: mlx_gdn_decode_bench (MLX (Apple Silicon))"
+        if: ${{ !cancelled() }}
+        run: |
+          env -u UNSLOTH_IS_PRESENT -u UNSLOTH_COMPILE_DISABLE python .github/scripts/jobs/mlx_gdn_decode_bench.py --out job_0_mlx_gdn_decode_bench_macos-26.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: job-results-macos-26
+          path: job_*.json
+          if-no-files-found: warn
