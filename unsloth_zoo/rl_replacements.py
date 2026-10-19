@@ -295,8 +295,24 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     fp32_lm_head: bool = (
         os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
     ),
+    # Read in the default, as above: UNSLOTH_FUSED_LINEAR=0 keeps the compiled torch chunk loop below.
+    fused_linear: bool = os.environ.get("UNSLOTH_FUSED_LINEAR", "1") != "0",
+    # False when entropies only feed a mask or a metric: a frozen head then keeps the no-recompute backward.
+    entropy_requires_grad: bool = True,
 ):
     # All Unsloth Zoo code licensed under AGPL3
+    # The fp32 head keeps the torch loop below, as the old / ref scoring it must match does.
+    if fused_linear and not fp32_lm_head:
+        # Body-local: this source is copied into the generated trainer without its imports.
+        from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
+        return fused_linear_logprobs(
+            hidden_states, lm_head, index, bias = lm_head_bias, temperature = temperature,
+            logit_scale_multiply = logit_scale_multiply, logit_scale_divide = logit_scale_divide,
+            logit_softcapping = logit_softcapping, return_entropy = return_entropy,
+            entropy_requires_grad = entropy_requires_grad,
+            # UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK caps the kernel's own chunk size, as it capped the loop below.
+            max_rows_per_chunk = max_rows_per_chunk if max_rows_per_chunk > 0 else None,
+        )
     self_fn = chunked_hidden_states_selective_log_softmax_recompute
     function = getattr(self_fn, "_autograd_function", None)
     if function is None:
@@ -497,6 +513,63 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     return logps
 pass
 RL_REPLACEMENTS["grpo_selective_log_softmax_recompute"] = chunked_hidden_states_selective_log_softmax_recompute
+
+
+def grpo_chunked_hidden_states_logprobs(
+    hidden_states: torch.Tensor,
+    lm_head: torch.Tensor,
+    index: torch.Tensor,
+    chunks: int = 4,
+    logit_scale_multiply: float = 0.0,
+    logit_scale_divide: float = 0.0,
+    logit_softcapping: float = 0.0,
+    temperature: float = 1.0,
+    max_rows_per_chunk: Optional[int] = None,
+    lm_head_bias: Optional[torch.Tensor] = None,
+    **extra_kwargs,
+) -> torch.Tensor:
+    # All Unsloth Zoo code licensed under AGPL3
+    # Never keeps tokens x vocab logits; no-grad scoring runs the same kernel so a policy ratio starts at exactly 1.
+    # Truncated-support scoring and the fp32 head are the old function's: hand those calls to it.
+    fp32_head = extra_kwargs.get(
+        "fp32_lm_head",
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes"),
+    )
+    custom = (
+        fp32_head
+        or extra_kwargs.get("support_top_k", 0)
+        or extra_kwargs.get("support_top_p", 1.0) != 1.0
+        or extra_kwargs.get("support_min_p", 0.0)
+    )
+    from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+    fused_linear = _chunked_logprob._FUSED_LINEAR
+    # UNSLOTH_FUSED_LINEAR=0 sends grad and no-grad calls alike to the old function: one scorer for both.
+    if (not fused_linear) or custom or os.environ.get("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "1") == "0":
+        kwargs = dict(extra_kwargs)
+        if max_rows_per_chunk is not None:
+            kwargs["max_rows_per_chunk"] = max_rows_per_chunk
+        return chunked_hidden_states_selective_log_softmax(
+            hidden_states, lm_head, index, chunks,
+            logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+            lm_head_bias = lm_head_bias, **kwargs,
+        )
+    if max_rows_per_chunk is None:
+        env_rows = os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip()
+        max_rows_per_chunk = int(env_rows) if env_rows.isdigit() else 0
+    # The kernel sizes its own chunks; UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK caps them.
+    rows_per_chunk = None
+    max_rows = max_rows_per_chunk if max_rows_per_chunk > 0 else None
+    return _chunked_logprob.unsloth_chunked_logprobs(
+        hidden_states, lm_head, index,
+        temperature = temperature,
+        logit_scale_multiply = logit_scale_multiply,
+        logit_scale_divide = logit_scale_divide,
+        logit_softcapping = logit_softcapping,
+        lm_head_bias = lm_head_bias,
+        rows_per_chunk = rows_per_chunk,
+        max_rows_per_chunk = max_rows,
+    )
+pass
 
 def calculate_pad_tokens_in_prompt(
     input_ids: torch.Tensor,
@@ -2152,7 +2225,7 @@ def grpo_accumulated_loss(
     from unsloth_zoo.rl_replacements import (
         grpo_shared_vision_inputs as _grpo_get_vision_inputs,
         grpo_vision_chunks as _grpo_vision_chunks,
-        chunked_hidden_states_selective_log_softmax,
+        grpo_chunked_hidden_states_logprobs as chunked_hidden_states_selective_log_softmax,
         chunked_selective_log_softmax,
     )
     if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
@@ -2465,6 +2538,8 @@ def grpo_accumulated_loss(
                 hidden_states, lm_head, ids, chunks,
                 logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
                 lm_head_bias = lm_head_bias, return_entropy = True,
+                # Entropy reaches the loss only through the entropy bonus; a mask / metric needs no gradient.
+                entropy_requires_grad = _entropy_bonus_on,
             )
             if _support_kwargs:
                 # Entropies stay full-vocabulary as TRL's; the logprobs take the kept set
@@ -3094,25 +3169,18 @@ def grpo_accumulated_loss(
                                 logit_scale_multiply=0.0, logit_scale_divide=0.0,
                                 logit_softcapping=0.0, temperature=1, batch_size=8,
                                 lm_head_bias=None):
-            if (index.shape[1] <= 1024 and batch_size <= 8) or batch_size==1:
-                # Normal path is faster / saves a GB under these conditions.
-                return chunked_hidden_states_selective_log_softmax(
-                    hidden_states,
-                    lm_head,
-                    index,
-                    chunks,
-                    logit_scale_multiply,
-                    logit_scale_divide,
-                    logit_softcapping,
-                    temperature,
-                    lm_head_bias = lm_head_bias,
-                )
-            else:
-                return Unsloth_Offloaded_Log_Softmax.apply(
-                    hidden_states, lm_head, index, chunks,
-                    logit_scale_multiply, logit_scale_divide,
-                    logit_softcapping, temperature, lm_head_bias,
-                )
+            # Backward recomputes per chunk, so Unsloth_Offloaded_Log_Softmax (a full recompute with grad) is not needed.
+            return chunked_hidden_states_selective_log_softmax(
+                hidden_states,
+                lm_head,
+                index,
+                chunks,
+                logit_scale_multiply,
+                logit_scale_divide,
+                logit_softcapping,
+                temperature,
+                lm_head_bias = lm_head_bias,
+            )
 
         def compute_logprobs_chunk(new_hidden_states_chunk, completion_ids, input_ids_chunk):
             _refresh_lm_head()
