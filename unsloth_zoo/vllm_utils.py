@@ -120,13 +120,7 @@ pass
 
 def get_mem_info():
     if DEVICE_TYPE == "xpu":
-        try:
-            free_memory, total_memory = torch.xpu.mem_get_info()
-        except Exception:
-            # Raises on some Intel GPUs (Arc B580, Lunar Lake)
-            index = torch.xpu.current_device()
-            total_memory = torch.xpu.get_device_properties(index).total_memory
-            free_memory = total_memory - torch.xpu.memory_reserved(index)
+        free_memory, total_memory = torch.xpu.mem_get_info()
     elif DEVICE_TYPE == "npu":
         free_memory, total_memory = torch.npu.mem_get_info()
     else:
@@ -4115,11 +4109,7 @@ def load_vllm(
 
     if DEVICE_TYPE == "cuda":
         major_version, minor_version = torch.cuda.get_device_capability()
-        if major_version < 7: raise NotImplementedError(
-            f"Unsloth: Your GPU is too old for vLLM! vLLM needs compute capability 7.0 or higher, "\
-            f"but your GPU has {major_version}.{minor_version}. "\
-            f"Use `fast_inference = False` to train and run inference without vLLM."
-        )
+        if major_version < 7: raise NotImplementedError("Unsloth: Your GPU is too old!")
 
         # Float8 KV cache only works for 8.0 or higher
         if float8_kv_cache and major_version < 8:
@@ -4229,8 +4219,7 @@ def load_vllm(
     elif DEVICE_TYPE == "hip":
         _dtype = torch.bfloat16
     elif DEVICE_TYPE == "xpu":
-        from .device_type import _xpu_bf16_supported
-        _dtype = torch.bfloat16 if _xpu_bf16_supported() else torch.float16
+        _dtype = torch.bfloat16
     elif DEVICE_TYPE == "npu" and torch.npu.is_bf16_supported():
         _dtype = torch.bfloat16
     else:
