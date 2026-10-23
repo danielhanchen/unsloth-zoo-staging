@@ -351,6 +351,7 @@ def test_cold_outer_fullgraph_compile():
     if not torch.cuda.is_available():
         env.setdefault("UNSLOTH_ALLOW_CPU", "1")
     result = subprocess.run([sys.executable, "-c", script], capture_output = True, text = True, timeout = 900, env = env)
+    print("CHILD_STDERR_BEGIN\n" + result.stderr[-30000:] + "\nCHILD_STDERR_END")
     assert "COLD_COMPILE_OK" in result.stdout, (result.stdout[-2000:], result.stderr[-4000:])
 
 
