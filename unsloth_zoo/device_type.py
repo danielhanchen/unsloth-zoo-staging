@@ -476,7 +476,42 @@ def _cpu_fallback():
         return "cuda"
     if os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1":
         return "cpu"
+    if cpu_backend_allowed():
+        return "cpu"
     return None
+
+
+def _gpus_deliberately_hidden():
+    # CUDA_VISIBLE_DEVICES, or the ROCm masks (ROCR_VISIBLE_DEVICES on Linux, HIP_VISIBLE_DEVICES on Windows).
+    for key in ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+        mask = os.environ.get(key)
+        if mask is not None and "".join(mask.split()) in ("", "-1"):
+            return True
+    return False
+
+
+def cpu_backend_allowed():
+    """Only reached once torch sees no accelerator at all. CPU training is the fallback unless
+    disabled, or a GPU exists that this torch build cannot drive (wrong wheel, missing ROCm torch):
+    those keep their install errors instead of silently training on CPU."""
+    if os.environ.get("UNSLOTH_DISABLE_CPU_FALLBACK", "0") == "1":
+        return False
+    if _gpus_deliberately_hidden():
+        return True
+    if _detect_amd_rocm_runtime():
+        return False
+    # Linux: the loaded kernel driver, not a stray nvidia-smi in a CPU container image.
+    # WSL2 exposes the Windows NVIDIA driver through /usr/lib/wsl/lib instead of /proc/driver/nvidia.
+    if os.path.exists("/proc/driver/nvidia/version") or os.path.exists("/usr/lib/wsl/lib/nvidia-smi") or (
+        not sys.platform.startswith("linux") and shutil.which("nvidia-smi") is not None
+    ):
+        return False
+    return True
+
+
+def cpu_backend_forced():
+    # UNSLOTH_ALLOW_CPU (the CUDA-shaped test spoof) keeps its meaning when both are set.
+    return os.environ.get("UNSLOTH_FORCE_CPU", "0") == "1" and os.environ.get("UNSLOTH_ALLOW_CPU", "0") != "1"
 
 
 _GPU_INIT_SKIPPED = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
@@ -489,6 +524,8 @@ def get_device_type():
     if _GPU_INIT_SKIPPED:
         # BEFORE the hardware probes: `__init__.py` publishes "cpu" unconditionally, so
         # checking only in the no-accelerator fallback left a CUDA host with both.
+        return "cpu"
+    if cpu_backend_forced():
         return "cpu"
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if is_hip():
@@ -532,7 +569,7 @@ elif DEVICE_TYPE_TORCH == "mlx": DEVICE_TYPE_TORCH = "mps"
 
 @functools.cache
 def get_device_count():
-    if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
+    if DEVICE_TYPE == "cpu":
         # The getter too, not only the constant below: they were handed 1 and 0.
         return 0
     if DEVICE_TYPE in ("cuda", "hip"):
@@ -567,8 +604,9 @@ _use_per_device_caches(DEVICE_TYPE, DEVICE_COUNT)
 # Check blocksize for 4bit -> 64 for CUDA, 128 for AMD
 # If AMD, we cannot load pre-quantized models for now :(
 ALLOW_PREQUANTIZED_MODELS : bool = True
-if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
-    # As with DEVICE_COUNT: the two import paths must not disagree.
+if DEVICE_TYPE == "cpu":
+    # As with DEVICE_COUNT: the two import paths must not disagree. The CPU backend
+    # (unsloth_zoo.cpu) decides bnb-4bit support itself with a real probe.
     ALLOW_PREQUANTIZED_MODELS = False
 # HSA_STATUS_ERROR_EXCEPTION checks - sometimes AMD fails for BnB
 ALLOW_BITSANDBYTES : bool = True
