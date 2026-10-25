@@ -124,12 +124,130 @@ def _logprob_piece(hidden, weight, bias, targets, inv_t, softcap, logit_scale, w
     return log_probs, entropy
 
 
+def _transformed_logits(hidden, weight, bias, inv_t, softcap, logit_scale):
+    """The kernel's logits: (hidden @ weight.T + bias) * scale, soft-capped, / temperature (fp32), plus
+    d(final)/d(raw logits) per element, or a scalar when there is no soft cap."""
+    logits = (hidden @ weight.t()).float()
+    if bias is not None:
+        logits = logits + bias.float()
+    logits = logits * logit_scale
+    slope = logit_scale * inv_t
+    if softcap is not None:
+        capped = torch.tanh(logits / softcap)
+        slope = (1 - capped * capped) * slope
+        logits = capped * softcap
+    return logits * inv_t, slope
+
+
+class _ChunkedLogProbs(torch.autograd.Function):
+    """One pass over the vocabulary per row chunk: log-probs, entropy and the metric extras, plus
+    d(log_prob)/d(hidden), which depends only on its own row, so backward is a per-row rescale.
+    The checkpointed path recomputes the logits in backward and spends another pass on the extras."""
+
+    @staticmethod
+    def forward(ctx, hidden, weight, bias, targets, inv_t, softcap, logit_scale, rows, outputs, need_grad):
+        ctx.set_materialize_grads(False)
+        n = hidden.shape[0]
+        # fp16 cannot hold these gradients before GradScaler multiplies them: keep them fp32 until backward.
+        exact = hidden.dtype == torch.float16
+        grad_lp = torch.empty(hidden.shape, dtype = torch.float32 if exact else hidden.dtype) if need_grad else None
+        new = lambda name, dtype = torch.float32: torch.empty(n, dtype = dtype) if name in outputs else None  # noqa: E731
+        log_probs, entropy, sq, mean = new("log_probs"), new("entropy"), new("log_sum_sq_probs"), new("mean_logits")
+        top1 = new("is_top1", torch.bool)
+        rowdot = lambda x, y: torch.einsum("ij,ij->i", x, y)  # noqa: E731  (a batched dot, no [rows, V] temporary)
+        for start in range(0, n, rows):
+            end = min(start + rows, n)
+            y = targets[start:end].unsqueeze(-1)
+            z, slope = _transformed_logits(hidden[start:end], weight, bias, inv_t, softcap, logit_scale)
+            if mean is not None:
+                mean[start:end] = z.mean(-1)
+            if top1 is not None:
+                # First-argmax, like the kernel's `target >= max and target > max before it`.
+                top1[start:end] = z.argmax(-1) == targets[start:end]
+            z.sub_(z.amax(-1, keepdim = True))  # in place: shifted logits, the raw ones are not needed below
+            target = z.gather(-1, y)
+            # The entropy still needs the shifted logits; otherwise exponentiate in place.
+            p = torch.exp(z) if entropy is not None else z.exp_()
+            total = p.sum(-1, keepdim = True)
+            log_total = torch.log(total)
+            log_probs[start:end] = (target - log_total).squeeze(-1)
+            p.div_(total)
+            if entropy is not None:
+                # H = -sum p log p = log(total) - sum p * shifted.
+                entropy[start:end] = log_total.squeeze(-1) - rowdot(p, z)
+            if sq is not None:
+                sq[start:end] = torch.log(rowdot(p, p))
+            if need_grad:
+                # d log_softmax(z)[y] / dz = onehot(y) - p, then through the scale / soft cap / temperature.
+                p.neg_().scatter_add_(-1, y, torch.ones_like(y, dtype = p.dtype))
+                if not (isinstance(slope, float) and slope == 1.0):
+                    p.mul_(slope)
+                if exact:
+                    with torch.autocast("cpu", enabled = False):
+                        grad_lp[start:end] = p @ weight.float()
+                else:
+                    grad_lp[start:end] = p.to(weight.dtype) @ weight
+        ctx.save_for_backward(hidden, weight, bias, targets, grad_lp)
+        ctx.args = (inv_t, softcap, logit_scale, rows)
+        result = (log_probs, entropy, sq, mean, top1)
+        ctx.mark_non_differentiable(*[x for x in result[2:] if x is not None])
+        return result
+
+    @staticmethod
+    def backward(ctx, d_log_probs, d_entropy, *unused):
+        hidden, weight, bias, targets, grad_lp = ctx.saved_tensors
+        if grad_lp is None or (d_log_probs is None and d_entropy is None):
+            return (None,) * 10
+        dh = torch.zeros(hidden.shape, dtype = grad_lp.dtype)
+        if d_log_probs is not None:
+            dh += grad_lp * d_log_probs.to(grad_lp.dtype).unsqueeze(-1)
+        if d_entropy is not None and bool(torch.any(d_entropy != 0)):
+            # Entropy is a metric in TRL's SFT loss; when something does backpropagate through it,
+            # recompute: dH/dz = -p (z - E_p[z]).
+            inv_t, softcap, logit_scale, rows = ctx.args
+            for start in range(0, hidden.shape[0], rows):
+                end = min(start + rows, hidden.shape[0])
+                z, slope = _transformed_logits(hidden[start:end], weight, bias, inv_t, softcap, logit_scale)
+                p = torch.softmax(z, dim = -1)
+                g = -p * (z - (p * z).sum(-1, keepdim = True)) * slope
+                g = g * d_entropy[start:end].float().unsqueeze(-1)
+                dh[start:end] += (g @ weight.float()).to(dh.dtype)
+        return (dh.to(hidden.dtype),) + (None,) * 9
+
+
+def _checkpointed_log_probs(hidden, weight, bias, targets, inv_t, softcap, logit_scale, rows, outputs):
+    """Trainable LM head / bias: row chunks under activation checkpointing, so autograd forms every gradient."""
+    from torch.utils.checkpoint import checkpoint
+    want_entropy = "entropy" in outputs
+    grad = torch.is_grad_enabled() and (hidden.requires_grad or weight.requires_grad)
+    log_probs, entropy = [], []
+    for start in range(0, hidden.shape[0], rows):
+        args = (hidden[start:start + rows], weight, bias, targets[start:start + rows], inv_t,
+                softcap, logit_scale, want_entropy)
+        lp, ent = checkpoint(_logprob_piece, *args, use_reentrant = False) if grad else _logprob_piece(*args)
+        log_probs.append(lp)
+        entropy.append(ent)
+    log_probs = torch.cat(log_probs)
+    entropy = torch.cat(entropy) if want_entropy else None
+    extras = {}
+    if any(name in outputs for name in ("log_sum_sq_probs", "mean_logits", "is_top1")):
+        # Metrics only (TRL marks them non-differentiable): one more pass without autograd.
+        with torch.no_grad():
+            sq, mean, top1 = [], [], []
+            for start in range(0, hidden.shape[0], rows):
+                z, _ = _transformed_logits(hidden[start:start + rows], weight, bias, inv_t, softcap, logit_scale)
+                sq.append(torch.logsumexp(2 * torch.log_softmax(z, dim = -1), dim = -1))
+                mean.append(z.mean(-1))
+                top1.append(z.argmax(-1) == targets[start:start + rows])
+            extras = {"log_sum_sq_probs": torch.cat(sq), "mean_logits": torch.cat(mean), "is_top1": torch.cat(top1)}
+    return log_probs, entropy, extras.get("log_sum_sq_probs"), extras.get("mean_logits"), extras.get("is_top1")
+
+
 def cpu_chunked_log_probs(hidden, weight, bias, targets, temperature, chunk_size,
                           final_logit_softcapping = None, logit_scale = 1.0, outputs = _LOGPROB_OUTPUTS):
     """Torch twin of TRL's Triton `ChunkedLogProbFunction` (the fused LM head SFTTrainer uses from
     TRL 1.x): per-token log-probabilities of hidden @ weight.T and the requested extras, for devices
-    the kernel cannot run on. Rows are checkpointed in chunks, so no [N, V] logits stay alive."""
-    from torch.utils.checkpoint import checkpoint
+    the kernel cannot run on. Works in row chunks, so no [N, V] logits stay alive."""
     if torch.is_autocast_enabled(hidden.device.type):
         dtype = torch.get_autocast_dtype(hidden.device.type)
         hidden, weight = hidden.to(dtype), weight.to(dtype)
@@ -142,37 +260,19 @@ def cpu_chunked_log_probs(hidden, weight, bias, targets, temperature, chunk_size
                 pick("mean_logits", empty.detach()), pick("is_top1", empty.detach().bool()))
     rows = max(1, int(os.environ.get("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", 16 * 1024 * 1024)) // max(1, weight.shape[0]))
     inv_t = 1.0 / temperature
-    want_entropy = "entropy" in outputs
-    grad = torch.is_grad_enabled() and (hidden.requires_grad or weight.requires_grad)
-    log_probs, entropy = [], []
-    for start in range(0, hidden.shape[0], rows):
-        args = (hidden[start:start + rows], weight, bias, targets[start:start + rows], inv_t,
-                final_logit_softcapping, logit_scale, want_entropy)
-        lp, ent = checkpoint(_logprob_piece, *args, use_reentrant = False) if grad else _logprob_piece(*args)
-        log_probs.append(lp)
-        entropy.append(ent)
-    log_probs = torch.cat(log_probs) if log_probs else hidden.new_zeros(0, dtype = torch.float32)
-    entropy = torch.cat(entropy) if want_entropy and entropy else None
-    extras = {}
-    if any(name in outputs for name in ("log_sum_sq_probs", "mean_logits", "is_top1")):
-        # Metrics only (TRL marks them non-differentiable): one more pass without autograd.
-        with torch.no_grad():
-            sq, mean, top1 = [], [], []
-            for start in range(0, hidden.shape[0], rows):
-                logits = (hidden[start:start + rows] @ weight.t()).float()
-                if bias is not None:
-                    logits = logits + bias.float()
-                logits = logits * logit_scale
-                if final_logit_softcapping is not None:
-                    logits = final_logit_softcapping * torch.tanh(logits / final_logit_softcapping)
-                logits = logits * inv_t
-                sq.append(torch.logsumexp(2 * torch.log_softmax(logits, dim = -1), dim = -1))
-                mean.append(logits.mean(-1))
-                # First-argmax, like the kernel's `target >= max and target > max before it`.
-                top1.append(logits.argmax(-1) == targets[start:start + rows])
-            extras = {"log_sum_sq_probs": torch.cat(sq), "mean_logits": torch.cat(mean), "is_top1": torch.cat(top1)}
-    pick = lambda name: extras.get(name) if name in outputs else None  # noqa: E731
-    return log_probs, entropy, pick("log_sum_sq_probs"), pick("mean_logits"), pick("is_top1")
+    head_grad = torch.is_grad_enabled() and (weight.requires_grad or (bias is not None and bias.requires_grad))
+    if head_grad:
+        result = _checkpointed_log_probs(hidden, weight, bias, targets, inv_t, final_logit_softcapping,
+                                         logit_scale, rows, outputs)
+    else:
+        with torch.autocast(hidden.device.type, enabled = False):
+            result = _ChunkedLogProbs.apply(
+                hidden, weight.detach(), bias.detach() if bias is not None else None, targets, inv_t,
+                final_logit_softcapping, logit_scale, rows, ("log_probs", *outputs),
+                torch.is_grad_enabled() and hidden.requires_grad,
+            )
+    names = ("log_probs", "entropy", "log_sum_sq_probs", "mean_logits", "is_top1")
+    return tuple(value if name == "log_probs" or name in outputs else None for name, value in zip(names, result))
 
 
 def patch_trl_fused_lm_head():
@@ -203,6 +303,110 @@ def patch_trl_fused_lm_head():
     return True
 
 
+class _Bf16StoredLinearFunction(torch.autograd.Function):
+    """F.linear with a bf16-stored frozen weight upcast to the activation dtype. Saves the bf16 weight, not
+    the upcast copy, and backward needs only dX = dY @ W."""
+
+    @staticmethod
+    def forward(ctx, x, weight, bias):
+        ctx.save_for_backward(weight)
+        return F.linear(x, weight.to(x.dtype), bias)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (weight,) = ctx.saved_tensors
+        return grad @ weight.to(grad.dtype), None, None
+
+
+class Bf16StoredLinear(torch.nn.Linear):
+    """nn.Linear whose frozen weight stays in bf16 while activations, LoRA and the matmul are fp32."""
+
+    def forward(self, x):
+        trainable = self.weight.requires_grad or (self.bias is not None and self.bias.requires_grad)
+        if self.weight.dtype == x.dtype or (trainable and torch.is_grad_enabled()):
+            # A trainable weight or bias (LoRA bias = "all" / "lora_only"), or an already upcast copy such
+            # as a merged fp32 model: plain autograd.
+            return F.linear(x, self.weight.to(x.dtype), self.bias)
+        return _Bf16StoredLinearFunction.apply(x, self.weight, self.bias)
+
+
+# Projections that transformers always calls as modules. Some architectures read a Linear's .weight
+# directly (Mamba dt_proj, Nemotron-H out_proj, MLA absorbed weights), which a bf16 weight next to fp32
+# activations would break, so only these names are converted.
+_BF16_STORED_PROJECTIONS = frozenset((
+    "q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj", "gate_proj", "up_proj", "down_proj", "gate_up_proj",
+    "in_proj_qkv", "in_proj_z",
+))
+
+
+def store_frozen_linears_in_bf16(model):
+    """For fp32 training of a bf16 checkpoint loaded in bf16: keep the attention / MLP projection weights
+    in bf16 (lossless: the checkpoint's own values) and move everything else to fp32. Those frozen
+    weights are most of the model, so resident memory drops by 15-28%."""
+    head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+    stored = set()
+    for name, module in model.named_modules():
+        if type(module) is torch.nn.Linear and module is not head and module.weight.dtype == torch.bfloat16 \
+                and name.rsplit(".", 1)[-1] in _BF16_STORED_PROJECTIONS:
+            module.__class__ = Bf16StoredLinear
+            stored.add(id(module.weight))
+    for param in model.parameters():
+        if id(param) not in stored and param.dtype == torch.bfloat16:
+            param.data = param.data.float()
+    for buffer in model.buffers():
+        if buffer.dtype == torch.bfloat16:
+            buffer.data = buffer.data.float()
+    return len(stored)
+
+
+def cpu_causal_conv1d(hidden_states, weight, bias = None, activation = None, **kwargs):
+    """Causal depthwise conv1d as K shifted multiply-adds. transformers' reference fallback (used without
+    the causal_conv1d package) calls a grouped F.conv1d, whose forward + backward on macOS, where torch has
+    no oneDNN, took 211 ms per Qwen3.5 linear-attention layer against 2-4 ms on Linux: most of the step."""
+    x = hidden_states.to(weight.dtype)
+    kernel, length = weight.shape[-1], x.shape[-1]
+    padded = F.pad(x, (kernel - 1, 0))
+    out = padded[..., :length] * weight[:, :1]
+    for j in range(1, kernel):
+        out = out.addcmul(padded[..., j:j + length], weight[:, j:j + 1])
+    if bias is not None:
+        out = out + bias[:, None]
+    if activation is not None:
+        from transformers.activations import ACT2FN
+        out = ACT2FN[activation](out)
+    return out.to(hidden_states.dtype)
+
+
+def patch_causal_conv1d_fallback(model):
+    """Where torch has no oneDNN (the macOS wheels), point every loaded modeling module's `causal_conv1d_fn`
+    (Qwen3.5 / Qwen3-Next style: hidden_states, weight, bias, activation) at cpu_causal_conv1d, after
+    checking both agree on a probe. With oneDNN the grouped conv is faster (19 vs 44 ms at 6144 x 512)."""
+    import inspect
+    import sys
+    if torch.backends.mkldnn.is_available():
+        return 0
+    patched = 0
+    for name in {type(module).__module__ for module in model.modules()}:
+        module = sys.modules.get(name)
+        fn = getattr(module, "causal_conv1d_fn", None)
+        if fn is None or fn is cpu_causal_conv1d:
+            continue
+        try:
+            params = list(inspect.signature(fn).parameters)[:4]
+            if params != ["hidden_states", "weight", "bias", "activation"]:
+                continue
+            gen = torch.Generator().manual_seed(0)
+            x, w, b = (torch.randn(shape, generator = gen) for shape in ((2, 8, 11), (8, 4), (8,)))
+            if not torch.allclose(fn(x, w, b, activation = "silu"), cpu_causal_conv1d(x, w, b, activation = "silu"),
+                                  rtol = 1e-5, atol = 1e-6):
+                continue
+        except Exception:
+            continue
+        module.causal_conv1d_fn = cpu_causal_conv1d
+        patched += 1
+    return patched
+
+
 def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = None,
                                  ignore_index = -100, shift_labels = None, chunk_rows = None):
     """Causal-LM loss with the same shift and normalisation as transformers' ForCausalLMLoss."""
@@ -218,6 +422,12 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
             divisor = float("nan")
     else:
         divisor = num_items_in_batch.item() if torch.is_tensor(num_items_in_batch) else num_items_in_batch
+    valid = shift_labels != ignore_index
+    if bool(valid.any()) and not bool(valid.all()):
+        # Padding, prompt tokens (train_on_responses_only) and the last position add nothing to the
+        # loss: skip their share of the LM head, the largest matmul of a CPU step for 150k+ vocabularies.
+        rows = valid.nonzero().squeeze(-1)
+        hidden, shift_labels = hidden.index_select(0, rows), shift_labels.index_select(0, rows)
     if chunk_rows is None:
         # ~64 MB of fp32 logits per chunk.
         chunk_rows = max(16, int(os.environ.get("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", 16 * 1024 * 1024)) // weight.shape[0])
