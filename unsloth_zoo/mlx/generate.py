@@ -272,8 +272,8 @@ class GenerationRequest:
     ``open(token_ids)`` is handed the prepared prompt and returns ``(cache,
     checkpoint_lengths)``: the cache the row prefills into, whose ``offset`` tokens are
     reused rather than prefilled, and the prompt lengths at which ``checkpoint(
-    token_count, cache)`` is called with the live cache. A checkpoint fires only where a
-    prefill chunk ends; no chunk is reshaped to reach one. Rows decoding together merge
+    token_count, cache)`` is called with the live cache. A checkpoint fires where a
+    prefill chunk ends; a chunk that would step over one ends at it. Rows decoding together merge
     by cache class, so every row of one batch needs a state building the same layout.
     Where ``row_retire_unavailable_reason()`` is None, an optional ``retire(take)`` is called
     as the row leaves decoding; ``take()``, valid only during the call, returns the row's own
@@ -2197,18 +2197,21 @@ def _function_draws_by_position(function) -> bool:
             else called.id if isinstance(called, ast.Name)
             else None
         )
-        if name != "_sample_with_positions":
-            continue
         given = {keyword.arg: keyword.value for keyword in node.keywords}
-        if not {"row_ids", "positions"}.issubset(given):
+        # mlx-vlm 0.7.12 draws through a module helper that hands the positions on.
+        helper = function.__globals__.get(name) if name == "_sample_batch_tokens" else None
+        if isinstance(helper, types.FunctionType) and _given(given, "positions"):
+            if _function_draws_by_position(helper):
+                return True
             continue
-        if any(
-            isinstance(given[argument], ast.Constant) and given[argument].value is None
-            for argument in ("row_ids", "positions")
-        ):
-            continue
-        return True
+        if name == "_sample_with_positions" and _given(given, "row_ids") and _given(given, "positions"):
+            return True
     return False
+
+
+def _given(keywords: dict, argument: str) -> bool:
+    value = keywords.get(argument)
+    return value is not None and not (isinstance(value, ast.Constant) and value.value is None)
 
 
 def _vlm_batches_observable(batch_module) -> bool:
@@ -2565,8 +2568,22 @@ def _row_prefill_batch_class(base):
             self._unsloth_done = 0 if row is None else row.prefix
 
         def prompt_step(self):
-            processed = super().prompt_step()
             row = self._unsloth_row
+            step = getattr(self, "prefill_step_size", None)
+            # mlx-vlm 0.7.12 resizes chunks every step (256 while peers decode), so a chunk can step over a checkpoint.
+            crossed = [
+                length - self._unsloth_done
+                for length in (row.lengths if row is not None and step else ())
+                if self._unsloth_done < length < self._unsloth_done + step
+            ]
+            if not crossed:
+                processed = super().prompt_step()
+            else:
+                self.prefill_step_size = min(crossed)
+                try:
+                    processed = super().prompt_step()
+                finally:
+                    self.prefill_step_size = step
             if processed and row is not None:
                 if row.quantize is not None:
                     row.quantize(self.prompt_cache)
@@ -2703,8 +2720,10 @@ def _row_prefill_seam():
 def _row_prefill_surface_gap(batch_module) -> str | None:
     version = _installed_mlx_vlm_version()
     try:
+        generator = batch_module.BatchGenerator
         params = inspect.signature(batch_module.PromptProcessingBatch.__init__).parameters
-        admission = inspect.getsource(batch_module.BatchGenerator._next)
+        # mlx-vlm 0.7.12 admits prompts in `_prefill_step`, which replaced `_next`.
+        admission = inspect.getsource(getattr(generator, "_prefill_step", None) or generator._next)
     except (AttributeError, TypeError, ValueError, OSError):
         return f"{version} exposes no prompt batch a row's own cache can enter"
     helpers = ("_is_sequence_aligned_prompt_kwarg", "_slice_sequence_aligned_prompt_kwarg")
