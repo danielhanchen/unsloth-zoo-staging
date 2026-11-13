@@ -820,14 +820,6 @@ class UnslothFrozenTableEmbedding(nn.Module):
         for suffix, tensor in (getattr(self, "checkpoint_extras", None) or {}).items():
             destination[prefix + suffix] = tensor
 
-    def _decode_all(self, chunk_rows: int = 1 << 20) -> torch.Tensor:
-        store = self.frozen_table_store
-        out = torch.empty((self.num_embeddings, *self.row_shape), dtype=self.table_dtype)
-        for lo in range(0, self.num_embeddings, chunk_rows):
-            ids = torch.arange(lo, min(lo + chunk_rows, self.num_embeddings))
-            out[lo:lo + ids.numel()] = store.gather(ids, dtype=self.table_dtype).cpu()
-        return out
-
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
                               error_msgs):
         # Frozen, and read from its own checkpoint files: the exported views are accepted and not copied anywhere.
@@ -1068,17 +1060,7 @@ def bind_frozen_tables(
             planes[plane] = [k for k, _ in found]
             suffixes[plane] = [x for _, x in found]
         else:
-            select = getattr(module, "select_planes", None)
-            if select is not None:
-                # Planes picked by the checkpoint dtypes (a bf16 save carries an unused scale next to its rows).
-                dtypes = {p: resolve_tensor_locations(source, names=n[:1])[n[0]].dtype for p, n in planes.items()}
-                keep = set(select(dtypes))
-                planes = {p: v for p, v in planes.items() if p in keep}
-                suffixes = {p: v for p, v in suffixes.items() if p in keep}
             decode = getattr(module, "decode_fn", None)
-            make_decode = getattr(module, "make_decode", None)
-            if decode is None and make_decode is not None:
-                decode = make_decode(set(planes))
             extras = {}
             if decode is None and len(planes) == 1:
                 decode, extras = _scaled_fp8_decode(source, keys, name, planes, suffixes)
@@ -1099,10 +1081,6 @@ def bind_frozen_tables(
             module.bind(store)
             module.checkpoint_suffixes = suffixes
             module.checkpoint_extras = extras
-            after_bind = getattr(module, "after_bind", None)
-            if after_bind is not None:
-                # The load's quantizer: transformers attaches model.hf_quantizer only after the weights are loaded.
-                after_bind(model, set(planes), quantizer if quantizer is not None else getattr(model, "hf_quantizer", None))
             bound[name] = store
     return bound
 
