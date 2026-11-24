@@ -5901,6 +5901,11 @@ def merge_and_overwrite_lora(
     fix_tokenizer_config_json(tokenizer, save_directory)
     if push_to_hub:
         upload_items()
+    # Low disk mode has no final folder upload: Step 4 re-pushes tokenizer.model if it changes.
+    _uploaded_tokenizer_model = (
+        _file_sha256(os.path.join(save_directory, "tokenizer.model"))
+        if push_to_hub and low_disk_space_usage else None
+    )
 
     # Step 3: Conditional index handling
     import subprocess
@@ -6164,6 +6169,12 @@ def merge_and_overwrite_lora(
             except Exception as e:
                 # It's OK if the file doesn't exist (not all models have it)
                 print(f"Note: tokenizer.model not found (this is OK for non-SentencePiece models)")
+
+    if push_to_hub and low_disk_space_usage:
+        _tokenizer_model_digest = _file_sha256(os.path.join(save_directory, "tokenizer.model"))
+        if _tokenizer_model_digest is not None and _tokenizer_model_digest != _uploaded_tokenizer_model:
+            upload_items("tokenizer.model")
+            _uploaded_tokenizer_model = _tokenizer_model_digest
 
     if needs_splitting:
         final_safetensors_list = renumber_safetensor_files(final_safetensors_list, save_directory)
@@ -6531,6 +6542,16 @@ def _cached_file_matching_revision(repo_id, filename, hf_cache_dir, token, revis
             if os.path.isfile(candidate): return candidate
     return None
 pass
+
+
+def _file_sha256(path):
+    if not os.path.isfile(path): return None
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _try_copy_all_from_cache(
