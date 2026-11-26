@@ -1515,9 +1515,31 @@ class BlockSwap:
         return True
 
     def _release(self, block):
+        held = self.__dict__.get("_held")
+        if held and id(block) in held:
+            # Layer-major gradient accumulation runs every micro-batch through this block before letting it go.
+            held[id(block)] = True
+            return
         freed = block.evict()
         if freed is not None:
             self.free[block.sig].append(freed)
+
+    def hold(self, idx):
+        """Keep decoder layer `idx` on the card across its calls until `unhold(idx)` (layer-major gradient
+        accumulation: one fetch serves every micro-batch). A no-op for a layer that is not swapped."""
+        i = self.pos.get(idx, -1)
+        if 0 <= i < len(self.blocks):
+            self.__dict__.setdefault("_held", {}).setdefault(id(self.blocks[i]), False)
+
+    def unhold(self, idx):
+        """Stop holding layer `idx`; a release requested while it was held happens now."""
+        i = self.pos.get(idx, -1)
+        held = self.__dict__.get("_held")
+        if not held or not 0 <= i < len(self.blocks):
+            return
+        b = self.blocks[i]
+        if held.pop(id(b), False):
+            self._release(b)
 
     def _keep(self, block):
         """Backward is done with the block, but it stays on the card for the next forward."""
@@ -1525,10 +1547,13 @@ class BlockSwap:
 
     def _acquire(self, block, steal):
         free = self.free[block.sig]
+        held = self.__dict__.get("_held") or ()
         if not free and steal:
             # Only after an interrupted step, since prefetches never steal (could evict the running block); a pending
             # block's slot is still read by backward, so reuse corrupts gradients silently.
             for b in self.blocks:
+                if id(b) in held:
+                    continue
                 if b is not block and b.sig == block.sig and b.resident and b.slot is not None and not b.pending:
                     self._release(b)
                     break
@@ -1733,7 +1758,20 @@ class BlockSwap:
     def _clear_step_queued(self):
         self._step_queued = False
 
+    @contextmanager
+    def layer_major_window(self):
+        """A layer-major window splits one step's backward into several autograd graphs: the step ends once,
+        when the caller calls _end_step after the window, not at each graph's end."""
+        self._layer_major_active = True
+        try:
+            yield
+        finally:
+            self._layer_major_active = False
+
     def _end_step(self):
+        if self.__dict__.get("_layer_major_active", False):
+            self._step_queued = False
+            return
         # Backward is done: a wait sample whose forward hook never ran (a recompute that stopped early) is complete.
         for b in self.blocks:
             if getattr(b, "marks", None) is not None and getattr(b, "mark_open", 0) == 1:
@@ -1814,11 +1852,13 @@ class BlockSwap:
                 self._arm(forward = True)
 
     def reset(self):
+        self.__dict__.pop("_held", None)
         for b in self.blocks:
             self._release(b)
         self._arm(forward = True)
 
     def remove(self):
+        self.__dict__.pop("_held", None)
         for h in self.handles:
             h.remove()
         self.handles = []
