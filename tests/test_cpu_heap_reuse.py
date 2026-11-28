@@ -48,7 +48,19 @@ for _ in range(6):
     x = torch.empty(16 * 2**20).fill_(1.0)
     del x
     per_round.append(faults() - f)
-print(json.dumps([list(getattr(runtime, "_ALLOCATOR_FITTED", None) or ()), per_round[1:], 64 * 2**20 // resource.getpagesize()]))
+# A freed top of the heap above 2 GiB stays mapped too (no trimming at any size). Untouched, so no pages fault in.
+import ctypes
+libc = ctypes.CDLL("libc.so.6")
+libc.sbrk.restype, libc.sbrk.argtypes = ctypes.c_void_p, [ctypes.c_long]
+libc.malloc.restype, libc.malloc.argtypes = ctypes.c_void_p, [ctypes.c_size_t]
+libc.free.argtypes = [ctypes.c_void_p]
+top = libc.sbrk(0)
+block = libc.malloc(3 * 2**30)
+grew = (libc.sbrk(0) - top) / 2**30
+libc.free(block)
+kept = (libc.sbrk(0) - top) / 2**30
+print(json.dumps([list(getattr(runtime, "_ALLOCATOR_FITTED", None) or ()), per_round[1:], 64 * 2**20 // resource.getpagesize(),
+                  round(grew, 2), round(kept, 2)]))
 """
 
 
@@ -63,10 +75,12 @@ def _probe(extra):
 
 @_glibc_linux
 def test_freed_buffers_are_reused_without_page_faults():
-    fitted, faults, pages = _probe({})
+    fitted, faults, pages, grew, kept = _probe({})
     # Without reuse every round faults in the whole buffer again (~16K pages); with it only a few stray pages.
     assert max(faults) < pages // 8, (faults, pages)
     assert fitted == [True, "glibc heap reuse"], fitted
+    # A 3 GiB block came from the heap (not mmap: the break moved by more than 2 GiB) and freeing it did not trim.
+    assert grew > 2 and kept >= grew, (grew, kept)
 
 
 @_glibc_linux
@@ -76,7 +90,7 @@ def test_freed_buffers_are_reused_without_page_faults():
     ({"GLIBC_TUNABLES": "glibc.malloc.trim_threshold=1048576"}, "glibc malloc tuned by the environment"),
 ])
 def test_kill_switch_and_user_tuning_keep_glibc_defaults(extra, reason):
-    fitted, faults, pages = _probe(extra)
+    fitted, faults, pages, grew, kept = _probe(extra)
     assert fitted == [False, reason], fitted
     # glibc's own behaviour: a 64 MB buffer is above its mmap threshold, so each round faults it in again.
     assert min(faults) > pages // 2, (faults, pages)

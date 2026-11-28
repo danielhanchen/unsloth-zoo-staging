@@ -491,8 +491,8 @@ def fit_cpu_allocator():
     A training step allocates and frees the same large buffers every step (weight gradients, the [V, H] head
     gradient, its bf16 cast, logit chunks, autocast weight casts), so each one comes back as fresh pages that the
     kernel faults in and zero fills on first touch: hundreds of thousands of page faults per step. M_MMAP_MAX = 0
-    serves them from the heap instead, and M_TRIM_THRESHOLD = INT_MAX keeps the freed top of the heap mapped, so a
-    buffer freed in one step is the next step's buffer. Peak memory is the same; memory freed after the peak stays
+    serves them from the heap instead, and M_TRIM_THRESHOLD = -1 (no trimming) keeps the freed top of the heap
+    mapped whatever its size, so a buffer freed in one step is the next step's buffer. Peak memory is the same; memory freed after the peak stays
     with the process for reuse instead of going back to the OS. UNSLOTH_CPU_HEAP_REUSE=0 keeps glibc's defaults.
     Skipped when the user tuned glibc malloc (MALLOC_*_ / GLIBC_TUNABLES) or preloaded another allocator."""
     global _ALLOCATOR_FITTED
@@ -518,8 +518,9 @@ def fit_cpu_allocator():
         import ctypes
         mallopt = ctypes.CDLL("libc.so.6").mallopt
         mallopt.argtypes, mallopt.restype = (ctypes.c_int, ctypes.c_int), ctypes.c_int
-        # Trim threshold first: if M_MMAP_MAX were refused, glibc's defaults would only be left with a higher trim.
-        ok = mallopt(_M_TRIM_THRESHOLD, 2**31 - 1) == 1 and mallopt(_M_MMAP_MAX, 0) == 1
+        # Trim threshold first: if M_MMAP_MAX were refused, glibc's defaults would only be left without trimming.
+        # -1 disables trimming (glibc reads it as the largest size); INT_MAX would still trim a top above 2 GiB.
+        ok = mallopt(_M_TRIM_THRESHOLD, -1) == 1 and mallopt(_M_MMAP_MAX, 0) == 1
     except Exception as e:
         _ALLOCATOR_FITTED = (False, f"mallopt unavailable: {type(e).__name__}")
         return _ALLOCATOR_FITTED
