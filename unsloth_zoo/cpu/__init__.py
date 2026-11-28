@@ -23,6 +23,7 @@ from .runtime import (
     cpu_bf16_supported,
     cpu_bnb_4bit_supported,
     cpu_compute_cores,
+    fit_cpu_allocator,
     fit_cpu_threads,
 )
 from .loader import FastCPUModel

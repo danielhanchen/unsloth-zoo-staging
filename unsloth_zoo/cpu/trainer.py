@@ -963,9 +963,11 @@ def __getattr__(name):
 def install_cpu_training_defaults():
     """Idempotent. Only ever called from a CPU-backend process."""
     import sys
-    from .runtime import fit_cpu_threads
+    from .runtime import fit_cpu_allocator, fit_cpu_threads
     # Before any kernel runs: the pool size is read on first use by every op.
     fit_cpu_threads()
+    # Before the model loads, so its buffers and every step's come from the same reusable heap.
+    fit_cpu_allocator()
     if os.environ.get("UNSLOTH_CPU_SDPA_GQA", "1") != "0":
         from .ops import patch_cpu_sdpa_gqa
         patch_cpu_sdpa_gqa()
