@@ -25,6 +25,7 @@ __all__ = [
     "apply_cpu_security_patches",
     "cpu_compute_cores",
     "fit_cpu_threads",
+    "fit_cpu_allocator",
     "available_ram",
 ]
 
@@ -617,6 +618,57 @@ def fit_cpu_threads():
     _THREADS_FITTED = (torch.get_num_threads(), reason)
     _pin_omp_env(_THREADS_FITTED[0])
     return _THREADS_FITTED
+
+
+_ALLOCATOR_FITTED = None
+_M_TRIM_THRESHOLD, _M_MMAP_MAX = -1, -4  # glibc mallopt parameter numbers (malloc.h)
+# Another allocator preloaded: glibc's mallopt would tune a heap nothing allocates from.
+_PRELOADED_ALLOCATORS = ("jemalloc", "tcmalloc", "mimalloc", "hoard", "snmalloc")
+_GLIBC_MALLOC_ENV = ("MALLOC_MMAP_MAX_", "MALLOC_MMAP_THRESHOLD_", "MALLOC_TRIM_THRESHOLD_", "MALLOC_TOP_PAD_")
+
+
+def fit_cpu_allocator():
+    """Linux glibc: keep freed CPU tensor memory in the heap, so the next step reuses it. Idempotent; returns
+    (engaged, reason).
+
+    glibc serves every allocation above its mmap threshold (at most 32 MB) with a fresh mmap and unmaps it on free.
+    A training step allocates and frees the same large buffers every step (weight gradients, the [V, H] head
+    gradient, its bf16 cast, logit chunks, autocast weight casts), so each one comes back as fresh pages that the
+    kernel faults in and zero fills on first touch: hundreds of thousands of page faults per step. M_MMAP_MAX = 0
+    serves them from the heap instead, and M_TRIM_THRESHOLD = INT_MAX keeps the freed top of the heap mapped, so a
+    buffer freed in one step is the next step's buffer. Peak memory is the same; memory freed after the peak stays
+    with the process for reuse instead of going back to the OS. UNSLOTH_CPU_HEAP_REUSE=0 keeps glibc's defaults.
+    Skipped when the user tuned glibc malloc (MALLOC_*_ / GLIBC_TUNABLES) or preloaded another allocator."""
+    global _ALLOCATOR_FITTED
+    if _ALLOCATOR_FITTED is not None:
+        return _ALLOCATOR_FITTED
+    _ALLOCATOR_FITTED = (False, "not Linux")
+    if not sys.platform.startswith("linux"):
+        return _ALLOCATOR_FITTED
+    if os.environ.get("UNSLOTH_CPU_HEAP_REUSE", "1").strip() == "0":
+        _ALLOCATOR_FITTED = (False, "UNSLOTH_CPU_HEAP_REUSE=0")
+        return _ALLOCATOR_FITTED
+    if any(os.environ.get(k, "").strip() for k in _GLIBC_MALLOC_ENV) or "glibc.malloc." in os.environ.get("GLIBC_TUNABLES", ""):
+        _ALLOCATOR_FITTED = (False, "glibc malloc tuned by the environment")
+        return _ALLOCATOR_FITTED
+    preload = os.environ.get("LD_PRELOAD", "").lower()
+    if any(name in preload for name in _PRELOADED_ALLOCATORS):
+        _ALLOCATOR_FITTED = (False, "another allocator is preloaded")
+        return _ALLOCATOR_FITTED
+    try:
+        if platform.libc_ver()[0] != "glibc":
+            _ALLOCATOR_FITTED = (False, "not glibc")
+            return _ALLOCATOR_FITTED
+        import ctypes
+        mallopt = ctypes.CDLL("libc.so.6").mallopt
+        mallopt.argtypes, mallopt.restype = (ctypes.c_int, ctypes.c_int), ctypes.c_int
+        # Trim threshold first: if M_MMAP_MAX were refused, glibc's defaults would only be left with a higher trim.
+        ok = mallopt(_M_TRIM_THRESHOLD, 2**31 - 1) == 1 and mallopt(_M_MMAP_MAX, 0) == 1
+    except Exception as e:
+        _ALLOCATOR_FITTED = (False, f"mallopt unavailable: {type(e).__name__}")
+        return _ALLOCATOR_FITTED
+    _ALLOCATOR_FITTED = (ok, "glibc heap reuse" if ok else "mallopt refused")
+    return _ALLOCATOR_FITTED
 
 
 def _pin_omp_env(threads):
