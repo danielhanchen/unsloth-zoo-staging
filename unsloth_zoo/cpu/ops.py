@@ -25,6 +25,7 @@ import functools
 import inspect
 import math
 import os
+import sys
 import types
 
 import torch
@@ -62,30 +63,58 @@ def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels:
                         chunk_rows: int, ignore_index: int, need_hidden_grad: bool,
                         need_weight_grad: bool, exact: bool, amp: bool,
                         amp_dtype: torch.dtype, softcap: float = 0.0,
-                        logit_scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                        logit_scale: float = 1.0,
+                        head_grad_scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Opaque to Dynamo/AOT: the runtime loop keeps logits bounded without specialising symbolic rows.
     # Compiled graphs run with autocast off, so the caller's CPU autocast is passed in and restored here.
+    bf16_grad = need_weight_grad and _bf16_head_grad(weight, hidden, exact)
     with torch.autocast("cpu", dtype = amp_dtype, enabled = amp):
         valid = labels != ignore_index
         if bool(valid.all()):
             return _chunked_ce_forward_loop(
                 hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad, need_weight_grad, exact,
-                amp_dtype if amp else None, softcap, logit_scale,
+                amp_dtype if amp else None, softcap, logit_scale, head_grad_scale, bf16_grad,
             )
         # Ignored rows skip the LM head GEMMs (compiled calls too: this op is opaque); their hidden grads are zero.
         keep = valid.nonzero().squeeze(-1)
         total, grad_hidden, grad_weight = _chunked_ce_forward_loop(
             hidden.index_select(0, keep), weight, labels.index_select(0, keep), chunk_rows, ignore_index,
             need_hidden_grad, need_weight_grad, exact, amp_dtype if amp else None, softcap, logit_scale,
+            head_grad_scale, bf16_grad,
         )
         if need_hidden_grad:
             grad_hidden = grad_hidden.new_zeros(hidden.shape).index_copy_(0, keep, grad_hidden)
         return total, grad_hidden, grad_weight
 
 
+def _native_bf16_gemm():
+    """bf16 GEMMs run in hardware (AMX / AVX512-BF16 on x86, BF16 on Arm), off Windows. Emulated bf16 GEMMs are far
+    slower than fp32 ones (EPYC 7763: 4.4 s vs 0.14 s for a 48-row head gradient). Windows keeps the fp32 path: no
+    gain measured there (EPYC 9V74)."""
+    if sys.platform == "win32":
+        return False
+    from .runtime import cpu_bf16_supported
+    return cpu_bf16_supported()
+
+
+def _bf16_head_grad(weight, hidden, exact):
+    """bf16 weights with bf16 hidden states (bf16 full finetuning): the head gradient is formed by bf16 GEMMs, which
+    accumulate in fp32 inside, as autograd forms every other bf16 layer's weight gradient. The fp32 path is an fp32
+    GEMM into a [V, H] fp32 buffer (622 MB for a 151k vocab) that backward then casts to bf16 anyway: fp32 GEMMs are
+    2-4x slower than bf16 ones on CPUs with native bf16 (only there: see _native_bf16_gemm). One GEMM over all rows, so the gradient is rounded once: up
+    to H rows, whose bf16 logit gradients [rows, V] take no more memory than the fp32 path's buffer; more rows keep
+    the fp32 path. Decided on the call's rows before ignored ones are dropped, so the fake op agrees.
+    UNSLOTH_CPU_HEAD_GRAD_FP32=1 keeps the fp32 path."""
+    return (not exact and weight.dtype == torch.bfloat16 and hidden.dtype == torch.bfloat16
+            and hidden.shape[0] <= weight.shape[1] and os.environ.get("UNSLOTH_CPU_HEAD_GRAD_FP32", "0") != "1"
+            and _native_bf16_gemm())
+
+
 def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad,
-                             need_weight_grad, exact, amp_dtype = None, softcap = 0.0, logit_scale = 1.0):
-    """CE over softcap * tanh(hidden @ W.T * logit_scale / softcap) (no tanh if softcap is 0)."""
+                             need_weight_grad, exact, amp_dtype = None, softcap = 0.0, logit_scale = 1.0,
+                             head_grad_scale = 1.0, bf16_grad = False):
+    """CE over softcap * tanh(hidden @ W.T * logit_scale / softcap) (no tanh if softcap is 0). head_grad_scale (bf16
+    head gradients only) is applied in fp32 before the bf16 rounding, so backward need not scale a bf16 buffer."""
     rows = hidden.shape[0]
     # A detached head misses autocast's cast cache, so cast it once instead of per chunk.
     mm_weight = weight
@@ -94,7 +123,9 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
     grad_dtype = torch.float32 if exact else hidden.dtype
     grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0)
     # The head gradient is [V, H] fp32 (622 MB for a 151k vocab): the first chunk's product becomes the buffer, so
-    # it is never zero filled first; later chunks add into it in place.
+    # it is never zero filled first; later chunks add into it in place. bf16_grad: each chunk's bf16 logit gradient
+    # is kept, and one bf16 GEMM over all rows forms the head gradient after the loop.
+    lows = []
     grad_weight = None
     total = torch.zeros((), dtype = torch.float32)
     for start in range(0, rows, chunk_rows):
@@ -124,13 +155,16 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
                 del slope
             if logit_scale != 1.0:
                 logits.mul_(logit_scale)
+            low = logits.to(h.dtype) if not exact and (need_hidden_grad or bf16_grad) else None
             if need_hidden_grad:
                 if exact:
                     with torch.autocast("cpu", enabled = False):
                         grad_hidden[start:end] = logits @ weight.float()
                 else:
-                    grad_hidden[start:end] = logits.to(h.dtype) @ mm_weight
-            if need_weight_grad:
+                    grad_hidden[start:end] = low @ mm_weight
+            if bf16_grad:
+                lows.append(low if head_grad_scale == 1.0 else (logits * head_grad_scale).to(torch.bfloat16))
+            elif need_weight_grad:
                 if grad_weight is None:
                     grad_weight = torch.empty(weight.shape, dtype = torch.float32)
                     with torch.autocast("cpu", enabled = False):
@@ -139,10 +173,18 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
                     grad_weight.addmm_(logits.t(), h.float())
         # Free logits before the next projection, else two chunks' logits coexist beside the head copy.
         del logits
+        low = None
+    if bf16_grad and lows:
+        # Every row here is a valid one (the caller dropped ignored rows), so hidden needs no zeroing.
+        low_all = lows[0] if len(lows) == 1 else torch.cat(lows)
+        del lows
+        with torch.autocast("cpu", enabled = False):
+            grad_weight = torch.mm(low_all.t(), hidden)
+        del low_all
     if not need_weight_grad:
         grad_weight = torch.empty(0)
     elif grad_weight is None:  # no rows
-        grad_weight = torch.zeros(weight.shape, dtype = torch.float32)
+        grad_weight = torch.zeros(weight.shape, dtype = torch.bfloat16 if bf16_grad else torch.float32)
     return total, grad_hidden, grad_weight
 
 
@@ -154,12 +196,13 @@ _chunked_ce_forward = torch.library.custom_op(
 @_chunked_ce_forward.register_fake
 def _chunked_ce_forward_fake(hidden, weight, labels, chunk_rows, ignore_index,
                              need_hidden_grad, need_weight_grad, exact, amp, amp_dtype, softcap = 0.0,
-                             logit_scale = 1.0):
+                             logit_scale = 1.0, head_grad_scale = 1.0):
     grad_dtype = torch.float32 if exact else hidden.dtype
     return (
         torch.empty((), dtype = torch.float32),
         torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0),
-        torch.empty(weight.shape, dtype = torch.float32) if need_weight_grad else torch.empty(0),
+        torch.empty(weight.shape, dtype = torch.bfloat16 if _bf16_head_grad(weight, hidden, exact) else torch.float32)
+        if need_weight_grad else torch.empty(0),
     )
 
 
@@ -299,9 +342,17 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         # The surrounding autograd.Function supplies backward; these are precomputed, non-differentiable buffers.
         compute = _chunked_ce_forward if torch.compiler.is_compiling() else _chunked_ce_forward_impl
         amp, amp_dtype = _cpu_autocast_state()
+        # bf16 head gradients: divide by the divisor before their bf16 rounding (eager knows it), so backward scales
+        # by grad_output alone, which is 1 for a plain backward(): one rounding, as the fp32 path's cast.
+        head_grad_scale, ctx.weight_prescaled = 1.0, False
+        if need_weight_grad and not torch.compiler.is_compiling() and _bf16_head_grad(weight, hidden, exact):
+            d = float(divisor)
+            if math.isfinite(d) and d != 0:
+                head_grad_scale, ctx.weight_prescaled = 1.0 / d, True
         total, grad_hidden, grad_weight = compute(
             hidden.detach(), weight.detach(), labels, chunk_rows, ignore_index,
             need_hidden_grad, need_weight_grad, exact, amp, amp_dtype, float(softcap), float(logit_scale),
+            head_grad_scale,
         )
         saved = (grad_hidden, grad_weight)
         # num_items_in_batch == 0 (a fully masked accumulation group): a finite 0, as TRL's clamped divisor gives.
@@ -341,11 +392,13 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         dh = (grad_hidden * scale.to(grad_hidden.dtype)).to(ctx.hidden_dtype) if ctx.has_hidden else None
         dw = None
         if ctx.has_weight:
+            # A bf16 head gradient formed already divided by the divisor: only grad_output is left to apply.
+            wscale = grad_output if ctx.weight_prescaled else scale
             if _scale_in_place_ok(ctx.owned_weight_grad, grad_weight):
                 # Scale the op's own [V, H] buffer in place (bitwise equal to the product) and hand it on, so it is
                 # adopted as .grad instead of a fresh 622 MB copy; a unit scale (plain backward()) skips the pass.
-                if not bool(scale == 1):
-                    grad_weight.mul_(scale)
+                if not bool(wscale == 1):
+                    grad_weight.mul_(wscale)
                 dw = grad_weight.to(ctx.weight_dtype)
                 # Hand the gradient to the tied embedding only if its backward runs in this pass (it is reachable and
                 # needed); it then returns head + embedding rows as one gradient.
@@ -353,7 +406,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
                     ctx.head_grad_link.offer(dw)
                     dw = None
             else:
-                dw = (grad_weight * scale).to(ctx.weight_dtype)
+                dw = (grad_weight * wscale).to(ctx.weight_dtype)
         return dh, dw, None, None, None, None, None, None, None
 
 
