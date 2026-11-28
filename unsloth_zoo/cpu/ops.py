@@ -25,6 +25,7 @@ import functools
 import inspect
 import math
 import os
+import sys
 import types
 
 import torch
@@ -86,16 +87,27 @@ def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels:
         return total, grad_hidden, grad_weight
 
 
+def _native_bf16_gemm():
+    """bf16 GEMMs run in hardware (AMX / AVX512-BF16 on x86, BF16 on Arm), off Windows. Emulated bf16 GEMMs are far
+    slower than fp32 ones (EPYC 7763: 4.4 s vs 0.14 s for a 48-row head gradient). Windows keeps the fp32 path: no
+    gain measured there (EPYC 9V74)."""
+    if sys.platform == "win32":
+        return False
+    from .runtime import cpu_bf16_supported
+    return cpu_bf16_supported()
+
+
 def _bf16_head_grad(weight, hidden, exact):
     """bf16 weights with bf16 hidden states (bf16 full finetuning): the head gradient is formed by bf16 GEMMs, which
     accumulate in fp32 inside, as autograd forms every other bf16 layer's weight gradient. The fp32 path is an fp32
     GEMM into a [V, H] fp32 buffer (622 MB for a 151k vocab) that backward then casts to bf16 anyway: fp32 GEMMs are
-    3-4x slower than bf16 ones on CPUs with native bf16. One GEMM over all rows, so the gradient is rounded once: up
+    2-4x slower than bf16 ones on CPUs with native bf16 (only there: see _native_bf16_gemm). One GEMM over all rows, so the gradient is rounded once: up
     to H rows, whose bf16 logit gradients [rows, V] take no more memory than the fp32 path's buffer; more rows keep
     the fp32 path. Decided on the call's rows before ignored ones are dropped, so the fake op agrees.
     UNSLOTH_CPU_HEAD_GRAD_FP32=1 keeps the fp32 path."""
     return (not exact and weight.dtype == torch.bfloat16 and hidden.dtype == torch.bfloat16
-            and hidden.shape[0] <= weight.shape[1] and os.environ.get("UNSLOTH_CPU_HEAD_GRAD_FP32", "0") != "1")
+            and hidden.shape[0] <= weight.shape[1] and os.environ.get("UNSLOTH_CPU_HEAD_GRAD_FP32", "0") != "1"
+            and _native_bf16_gemm())
 
 
 def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad,

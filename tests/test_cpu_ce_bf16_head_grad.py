@@ -23,6 +23,12 @@ import torch
 from unsloth_zoo.cpu import ops
 
 
+@pytest.fixture(autouse = True)
+def _native_bf16(monkeypatch):
+    # The bf16 GEMM path is for CPUs with native bf16 off Windows; pretend this host is one, whatever runs the test.
+    monkeypatch.setattr(ops, "_native_bf16_gemm", lambda: True)
+
+
 def _inputs(rows, hd = 64, vocab = 512, dtype = torch.bfloat16, seed = 0):
     g = torch.Generator().manual_seed(seed)
     hidden = torch.randn(1, rows, hd, generator = g).to(dtype)
@@ -139,3 +145,16 @@ def test_gradient_accumulation_and_a_non_unit_grad_output(monkeypatch):
         (loss * factor).backward()
     assert w.grad.dtype == torch.bfloat16
     assert _rel(w.grad, w32.grad.double()) < 1e-2
+
+
+def test_cpus_without_native_bf16_and_windows_keep_the_fp32_gemm(monkeypatch):
+    hidden, weight, labels = _inputs(64)
+    monkeypatch.setattr(ops, "_native_bf16_gemm", lambda: False)
+    assert _forward_head_grad_dtype(hidden, weight, labels, 128) == torch.float32
+    _, _, dw = _grads(hidden, weight, labels, 128)
+    monkeypatch.setenv("UNSLOTH_CPU_HEAD_GRAD_FP32", "1")
+    _, _, dw32 = _grads(hidden, weight, labels, 128)
+    assert torch.equal(dw, dw32)
+    monkeypatch.undo()
+    monkeypatch.setattr(ops.sys, "platform", "win32")
+    assert not ops._native_bf16_gemm()
