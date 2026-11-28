@@ -92,8 +92,9 @@ def test_freed_buffers_are_reused_without_page_faults():
 def test_kill_switch_and_user_tuning_keep_glibc_defaults(extra, reason):
     fitted, faults, pages, grew, kept = _probe(extra)
     assert fitted == [False, reason], fitted
-    # glibc's own behaviour: a 64 MB buffer is above its mmap threshold, so each round faults it in again.
-    assert min(faults) > pages // 2, (faults, pages)
+    # glibc's own behaviour: a 3 GiB block is far above its mmap threshold (at most 32 MB), so it is mmapped and the
+    # heap does not grow. (Page faults are no signal here: some kernels back large mmaps with huge pages.)
+    assert grew < 1, (grew, kept)
 
 
 def test_other_platforms_and_preloaded_allocators_are_left_alone(monkeypatch):
